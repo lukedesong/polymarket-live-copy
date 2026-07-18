@@ -18,7 +18,7 @@ outputs/
 sim/
 
 # Local dependency environments
-work/polymarket-api-py312-venv/
+work/polymarket-api-py312-venv
 work/polymarket-api-js/node_modules/
 work/CloddsBot/node_modules/
 
