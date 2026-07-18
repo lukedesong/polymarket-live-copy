@@ -34,6 +34,10 @@ CANCEL_CREDENTIAL_NAMES = (
     "POLYMARKET_API_SECRET",
     "POLYMARKET_API_PASSPHRASE",
     "POLYMARKET_SIGNATURE_TYPE",
+)
+FUNDER_ADDRESS_NAMES = (
+    "POLYMARKET_WALLET_ADDRESS",
+    "DEPOSIT_WALLET_ADDRESS",
     "POLYMARKET_FUNDER_ADDRESS",
 )
 POLYGON_CHAIN_ID = 137  # official external chain constraint
@@ -183,6 +187,9 @@ def make_order_control(*, cancel_enabled: bool, env: Mapping[str, str]):
     if not cancel_enabled:
         return RecordingOrderControl()
     missing = [name for name in CANCEL_CREDENTIAL_NAMES if not env.get(name)]
+    funder = next((env[name] for name in FUNDER_ADDRESS_NAMES if env.get(name)), None)
+    if funder is None:
+        missing.append("POLYMARKET_WALLET_ADDRESS")
     if missing:
         raise RuntimeError(f"missing_cancel_credentials:{','.join(missing)}")
     creds = ApiCreds(
@@ -196,7 +203,7 @@ def make_order_control(*, cancel_enabled: bool, env: Mapping[str, str]):
         key=env["POLYMARKET_PRIVATE_KEY"],
         creds=creds,
         signature_type=int(env["POLYMARKET_SIGNATURE_TYPE"]),
-        funder=env["POLYMARKET_FUNDER_ADDRESS"],
+        funder=funder,
         use_server_time=True,
     )
     return AuthenticatedOrderControl(client)

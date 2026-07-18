@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from .models import (
     EligibleMarket,
@@ -32,12 +32,20 @@ class GammaClient:
             {
                 "active": "true",
                 "closed": "false",
+                "tag_slug": "fifa-world-cup",
                 "order": "liquidity",
                 "ascending": "false",
                 "offset": offset,
             }
         )
-        with urlopen(f"{GAMMA_EVENTS_URL}?{query}") as response:
+        request = Request(
+            f"{GAMMA_EVENTS_URL}?{query}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "world-cup-mm/0.1",
+            },
+        )
+        with urlopen(request) as response:
             payload = json.load(response)
         if not isinstance(payload, list):
             raise DiscoveryError("gamma_response_not_list")

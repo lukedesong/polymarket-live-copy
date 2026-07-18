@@ -236,3 +236,25 @@ def test_cancel_enabled_requires_runtime_credentials_only():
 
     recording = make_order_control(cancel_enabled=False, env={})
     assert recording.cancel_market_orders("condition-a")["status"] == "recorded"
+
+
+def test_cancel_client_accepts_existing_wallet_address_name(monkeypatch):
+    captured = {}
+
+    class FakeClobClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("world_cup_mm.cli.ClobClient", FakeClobClient)
+    env = {
+        "POLYMARKET_PRIVATE_KEY": "private",
+        "POLYMARKET_API_KEY": "key",
+        "POLYMARKET_API_SECRET": "secret",
+        "POLYMARKET_API_PASSPHRASE": "passphrase",
+        "POLYMARKET_SIGNATURE_TYPE": "3",
+        "POLYMARKET_WALLET_ADDRESS": "0xwallet",
+    }
+
+    make_order_control(cancel_enabled=True, env=env)
+
+    assert captured["funder"] == "0xwallet"

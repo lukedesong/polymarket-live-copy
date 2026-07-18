@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from world_cup_mm.discovery import (
     DiscoveryError,
+    GammaClient,
     classify_events,
     fetch_all_events,
     liquidity_volume_frontier,
@@ -57,6 +59,37 @@ def candidate(market_id: str, liquidity: str, volume: str) -> EligibleMarket:
         liquidity=Decimal(liquidity),
         volume_24h=Decimal(volume),
     )
+
+
+class JsonResponse:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self):
+        return self.payload
+
+
+def test_gamma_client_identifies_itself_and_requests_json(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request):
+        captured["request"] = request
+        return JsonResponse(b'[{"id":"event-a"}]')
+
+    monkeypatch.setattr("world_cup_mm.discovery.urlopen", fake_urlopen)
+
+    assert GammaClient().fetch_page(0) == [{"id": "event-a"}]
+    assert captured["request"].get_header("User-agent") == "world-cup-mm/0.1"
+    assert captured["request"].get_header("Accept") == "application/json"
+    assert parse_qs(urlparse(captured["request"].full_url).query)["tag_slug"] == [
+        "fifa-world-cup"
+    ]
 
 
 def test_fetch_all_events_stops_on_empty_page_and_advances_by_received_count():
