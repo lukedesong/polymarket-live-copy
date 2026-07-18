@@ -33,6 +33,47 @@ def quote(paper: PaperEngine, *, state=RiskState.PREMATCH_OPEN):
     )
 
 
+def queue_quote(
+    paper: PaperEngine,
+    *,
+    bid="0.49",
+    bid_size="10",
+    ask="0.51",
+    ask_size="10",
+    timestamp="1000",
+):
+    paper.on_book(
+        asset_id="asset-a",
+        best_bid=Decimal(bid),
+        best_bid_size=Decimal(bid_size),
+        best_ask=Decimal(ask),
+        best_ask_size=Decimal(ask_size),
+        book_timestamp=timestamp,
+        risk_state=RiskState.PREMATCH_OPEN,
+        now=NOW,
+    )
+
+
+def queue_trade(
+    paper: PaperEngine,
+    *,
+    price="0.49",
+    side="SELL",
+    size="1",
+    event_hash="trade-a",
+):
+    return paper.on_trade(
+        asset_id="asset-a",
+        trade_price=Decimal(price),
+        trade_side=side,
+        trade_quantity=Decimal(size),
+        trigger_event_hash=event_hash,
+        best_bid=Decimal("0.49"),
+        risk_state=RiskState.PREMATCH_OPEN,
+        now=NOW,
+    )
+
+
 def trade(paper: PaperEngine, price: str, event_hash: str, *, state=RiskState.PREMATCH_OPEN):
     return paper.on_trade(
         asset_id="asset-a",
@@ -128,3 +169,92 @@ def test_repeated_trade_event_cannot_fill_twice(tmp_path):
     quote(paper)
     assert trade(paper, "0.48", "same-event") == []
     assert store.paper_fill_count() == 1
+
+
+def test_queue_mode_keeps_same_price_order_and_original_queue_ahead(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid_size="10", timestamp="1000")
+    first = store.open_paper_orders("asset-a")[0]
+
+    queue_quote(paper, bid_size="20", timestamp="1001")
+    second = store.open_paper_orders("asset-a")[0]
+
+    assert second.order_id == first.order_id
+    assert second.queue_ahead_initial == Decimal("10")
+    assert second.queue_ahead_remaining == Decimal("10")
+
+
+def test_queue_mode_does_not_treat_unmatched_size_decrease_as_front_cancel(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid_size="10")
+
+    queue_quote(paper, bid_size="4", timestamp="1001")
+
+    assert store.open_paper_orders("asset-a")[0].queue_ahead_remaining == Decimal("10")
+
+
+def test_queue_mode_at_price_trade_consumes_ahead_then_partially_fills(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid_size="10")
+
+    fills = queue_trade(paper, size="12")
+
+    order = store.open_paper_orders("asset-a")[0]
+    assert fills == [order.order_id]
+    assert order.queue_ahead_remaining == Decimal("0")
+    assert order.remaining_quantity == Decimal("3")
+    assert store.paper_position("asset-a").quantity == Decimal("2")
+    row = store.paper_fill_rows()[0]
+    assert row["quantity_text"] == "2"
+    assert row["official_trade_quantity_text"] == "12"
+    assert row["queue_consumed_text"] == "10"
+    assert row["proof_type"] == "AT_PRICE_QUEUE"
+
+
+def test_queue_mode_partial_order_finishes_without_overfilling_or_replay(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid_size="0")
+    queue_trade(paper, size="2", event_hash="partial")
+    assert store.open_paper_orders("asset-a")[0].remaining_quantity == Decimal("3")
+
+    assert queue_trade(paper, size="10", event_hash="finish")
+    assert queue_trade(paper, size="10", event_hash="finish") == []
+
+    assert store.paper_order_status(1) == "FILLED"
+    assert store.paper_position("asset-a").quantity == Decimal("5")
+    assert store.paper_fill_count() == 2
+
+
+def test_queue_mode_wrong_trade_side_cannot_consume_buy_queue(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid_size="10")
+
+    assert queue_trade(paper, side="BUY", size="20") == []
+
+    assert store.paper_fill_count() == 0
+    assert store.open_paper_orders("asset-a")[0].queue_ahead_remaining == Decimal("10")
+
+
+def test_queue_mode_price_change_requeues_at_new_displayed_size(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid="0.49", bid_size="10")
+    first = store.open_paper_orders("asset-a")[0]
+
+    queue_quote(paper, bid="0.48", bid_size="7", timestamp="1001")
+    second = store.open_paper_orders("asset-a")[0]
+
+    assert second.order_id != first.order_id
+    assert store.paper_order_status(first.order_id) == "CANCELLED"
+    assert second.price == Decimal("0.48")
+    assert second.queue_ahead_remaining == Decimal("7")
+
+
+def test_queue_mode_trade_through_fills_valid_remainder(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid_size="100")
+
+    fills = queue_trade(paper, price="0.48", side="SELL", size="1")
+
+    assert fills == [1]
+    assert store.paper_position("asset-a").quantity == Decimal("5")
+    assert store.paper_fill_rows()[0]["proof_type"] == "TRADE_THROUGH"

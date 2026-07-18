@@ -206,6 +206,10 @@ CREATE TABLE IF NOT EXISTS paper_queue_events (
     created_at TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS paper_queue_trade_event_once
+ON paper_queue_events(trigger_event_hash)
+WHERE trigger_event_hash IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS paper_inventory_marks (
     mark_id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset_id TEXT NOT NULL,
@@ -877,8 +881,10 @@ class Store:
                 """
                 INSERT INTO paper_orders(
                     condition_id,market_id,asset_id,outcome,side,price_text,quantity_text,
-                    maker_fee_bps,quote_book_timestamp,status,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,'OPEN',?)
+                    original_quantity_text,remaining_quantity_text,
+                    queue_ahead_initial_text,queue_ahead_remaining_text,
+                    maker_fee_bps,quote_book_timestamp,last_book_timestamp,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?)
                 """,
                 (
                     condition_id,
@@ -888,12 +894,127 @@ class Store:
                     side,
                     str(price),
                     str(quantity),
+                    str(quantity),
+                    str(quantity),
+                    "0",
+                    "0",
                     maker_fee_bps,
+                    quote_book_timestamp,
                     quote_book_timestamp,
                     timestamp,
                 ),
             )
         return int(cursor.lastrowid)
+
+    def open_queue_paper_order(
+        self,
+        *,
+        condition_id: str,
+        market_id: str,
+        asset_id: str,
+        outcome: str,
+        side: str,
+        price: Decimal,
+        quantity: Decimal,
+        queue_ahead: Decimal,
+        maker_fee_bps: int,
+        quote_book_timestamp: str | None,
+        created_at: datetime,
+    ) -> int:
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("invalid_paper_side")
+        if price <= 0 or quantity <= 0 or queue_ahead < 0:
+            raise ValueError("invalid_queue_paper_order_value")
+        if maker_fee_bps != 0:
+            raise ValueError("paper_nonzero_maker_fee_unsupported")
+        timestamp = _iso(created_at)
+        current = self.connection.execute(
+            """
+            SELECT * FROM paper_orders
+            WHERE asset_id=? AND side=? AND status='OPEN'
+            ORDER BY order_id DESC LIMIT 1
+            """,
+            (asset_id, side),
+        ).fetchone()
+        if current is not None and Decimal(current["price_text"]) == price:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE paper_orders SET last_book_timestamp=? WHERE order_id=?",
+                    (quote_book_timestamp, current["order_id"]),
+                )
+            return int(current["order_id"])
+        with self.connection:
+            if current is not None:
+                self.connection.execute(
+                    """
+                    UPDATE paper_orders
+                    SET status='CANCELLED',cancelled_at=?,cancel_reason='best_price_changed',
+                        requeue_reason='best_price_changed'
+                    WHERE order_id=?
+                    """,
+                    (timestamp, current["order_id"]),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO paper_queue_events(
+                        order_id,event_type,queue_before_text,queue_after_text,
+                        order_remaining_before_text,order_remaining_after_text,created_at
+                    ) VALUES(?,'BEST_PRICE_CHANGED',?,?,?,?,?)
+                    """,
+                    (
+                        current["order_id"],
+                        current["queue_ahead_remaining_text"],
+                        current["queue_ahead_remaining_text"],
+                        current["remaining_quantity_text"],
+                        current["remaining_quantity_text"],
+                        timestamp,
+                    ),
+                )
+            cursor = self.connection.execute(
+                """
+                INSERT INTO paper_orders(
+                    condition_id,market_id,asset_id,outcome,side,price_text,quantity_text,
+                    original_quantity_text,remaining_quantity_text,
+                    queue_ahead_initial_text,queue_ahead_remaining_text,
+                    maker_fee_bps,quote_book_timestamp,last_book_timestamp,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'OPEN',?)
+                """,
+                (
+                    condition_id,
+                    market_id,
+                    asset_id,
+                    outcome,
+                    side,
+                    str(price),
+                    str(quantity),
+                    str(quantity),
+                    str(quantity),
+                    str(queue_ahead),
+                    str(queue_ahead),
+                    maker_fee_bps,
+                    quote_book_timestamp,
+                    quote_book_timestamp,
+                    timestamp,
+                ),
+            )
+            order_id = int(cursor.lastrowid)
+            self.connection.execute(
+                """
+                INSERT INTO paper_queue_events(
+                    order_id,event_type,queue_before_text,queue_after_text,
+                    order_remaining_before_text,order_remaining_after_text,created_at
+                ) VALUES(?,'ENQUEUED',?,?,?,?,?)
+                """,
+                (
+                    order_id,
+                    str(queue_ahead),
+                    str(queue_ahead),
+                    str(quantity),
+                    str(quantity),
+                    timestamp,
+                ),
+            )
+        return order_id
 
     def open_paper_orders(self, asset_id: str | None = None) -> list[PaperOrder]:
         clause = "AND asset_id=?" if asset_id else ""
@@ -1038,9 +1159,181 @@ class Store:
             self._insert_paper_account_snapshot(timestamp)
         return True
 
+    def consume_paper_trade(
+        self,
+        order_id: int,
+        *,
+        trigger_event_hash: str,
+        trigger_price: Decimal,
+        official_trade_quantity: Decimal,
+        proof_type: str,
+        filled_at: datetime,
+        best_bid: Decimal,
+    ) -> Decimal:
+        if proof_type not in {"AT_PRICE_QUEUE", "TRADE_THROUGH"}:
+            raise ValueError("invalid_paper_fill_proof")
+        if official_trade_quantity <= 0:
+            raise ValueError("invalid_official_trade_quantity")
+        timestamp = _iso(filled_at)
+        with self.connection:
+            if self.paper_trigger_seen(trigger_event_hash):
+                return Decimal("0")
+            row = self.connection.execute(
+                "SELECT * FROM paper_orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("paper_order_not_found")
+            if row["status"] != "OPEN":
+                return Decimal("0")
+            queue_before = Decimal(row["queue_ahead_remaining_text"])
+            order_before = Decimal(row["remaining_quantity_text"])
+            if proof_type == "AT_PRICE_QUEUE":
+                queue_consumed = min(queue_before, official_trade_quantity)
+                queue_after = queue_before - queue_consumed
+                fill_capacity = official_trade_quantity - queue_consumed
+            else:
+                queue_consumed = queue_before
+                queue_after = Decimal("0")
+                fill_capacity = order_before
+            position_row = self.connection.execute(
+                "SELECT * FROM paper_positions WHERE asset_id=?", (row["asset_id"],)
+            ).fetchone()
+            current_quantity = (
+                Decimal(position_row["quantity_text"])
+                if position_row is not None
+                else Decimal("0")
+            )
+            if row["side"] == "SELL":
+                fill_capacity = min(fill_capacity, current_quantity)
+            fill_quantity = min(order_before, fill_capacity)
+            order_after = order_before - fill_quantity
+            self.connection.execute(
+                """
+                UPDATE paper_orders
+                SET queue_ahead_remaining_text=?,remaining_quantity_text=?,
+                    status=CASE WHEN ?='0' THEN 'FILLED' ELSE 'OPEN' END,
+                    filled_at=CASE WHEN ?='0' THEN ? ELSE filled_at END
+                WHERE order_id=?
+                """,
+                (
+                    str(queue_after),
+                    str(order_after),
+                    str(order_after),
+                    str(order_after),
+                    timestamp,
+                    order_id,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO paper_queue_events(
+                    order_id,event_type,trigger_event_hash,official_trade_quantity_text,
+                    queue_before_text,queue_after_text,order_remaining_before_text,
+                    order_remaining_after_text,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    order_id,
+                    proof_type,
+                    trigger_event_hash,
+                    str(official_trade_quantity),
+                    str(queue_before),
+                    str(queue_after),
+                    str(order_before),
+                    str(order_after),
+                    timestamp,
+                ),
+            )
+            if fill_quantity == 0:
+                return Decimal("0")
+            price = Decimal(row["price_text"])
+            gross = price * fill_quantity
+            fee = Decimal("0")
+            current_cost = (
+                Decimal(position_row["cost_basis_text"])
+                if position_row is not None
+                else Decimal("0")
+            )
+            realized = (
+                Decimal(position_row["realized_profit_text"])
+                if position_row is not None
+                else Decimal("0")
+            )
+            if row["side"] == "BUY":
+                next_quantity = current_quantity + fill_quantity
+                next_cost = current_cost + gross
+            else:
+                if fill_quantity > current_quantity:
+                    raise ValueError("paper_short_not_allowed")
+                average = current_cost / current_quantity if current_quantity else Decimal("0")
+                removed_cost = average * fill_quantity
+                next_quantity = current_quantity - fill_quantity
+                next_cost = current_cost - removed_cost
+                realized += gross - fee - removed_cost
+            self.connection.execute(
+                """
+                INSERT INTO paper_positions(
+                    asset_id,condition_id,market_id,outcome,quantity_text,cost_basis_text,
+                    realized_profit_text,mark_price_text,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    quantity_text=excluded.quantity_text,
+                    cost_basis_text=excluded.cost_basis_text,
+                    realized_profit_text=excluded.realized_profit_text,
+                    mark_price_text=excluded.mark_price_text,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    row["asset_id"],
+                    row["condition_id"],
+                    row["market_id"],
+                    row["outcome"],
+                    str(next_quantity),
+                    str(next_cost),
+                    str(realized),
+                    str(best_bid),
+                    timestamp,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO paper_fills(
+                    order_id,trigger_event_hash,trigger_price_text,fill_price_text,quantity_text,
+                    gross_amount_text,fee_text,filled_at,position_quantity_after_text,
+                    realized_profit_after_text,official_trade_quantity_text,queue_consumed_text,
+                    order_quantity_before_text,order_quantity_after_text,proof_type
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    order_id,
+                    trigger_event_hash,
+                    str(trigger_price),
+                    str(price),
+                    str(fill_quantity),
+                    str(gross),
+                    str(fee),
+                    timestamp,
+                    str(next_quantity),
+                    str(realized),
+                    str(official_trade_quantity),
+                    str(queue_consumed),
+                    str(order_before),
+                    str(order_after),
+                    proof_type,
+                ),
+            )
+            self._insert_paper_account_snapshot(timestamp)
+        return fill_quantity
+
     def paper_trigger_seen(self, trigger_event_hash: str) -> bool:
         row = self.connection.execute(
-            "SELECT 1 FROM paper_fills WHERE trigger_event_hash=?", (trigger_event_hash,)
+            """
+            SELECT 1 FROM paper_fills WHERE trigger_event_hash=?
+            UNION ALL
+            SELECT 1 FROM paper_queue_events WHERE trigger_event_hash=?
+            LIMIT 1
+            """,
+            (trigger_event_hash, trigger_event_hash),
         ).fetchone()
         return row is not None
 
@@ -1081,7 +1374,9 @@ class Store:
             SELECT f.fill_id,f.filled_at,o.condition_id,o.market_id,o.asset_id,o.outcome,
                    o.side,f.fill_price_text,f.quantity_text,f.gross_amount_text,
                    f.fee_text,f.trigger_price_text,f.position_quantity_after_text,
-                   f.realized_profit_after_text
+                   f.realized_profit_after_text,f.official_trade_quantity_text,
+                   f.queue_consumed_text,f.order_quantity_before_text,
+                   f.order_quantity_after_text,f.proof_type
             FROM paper_fills AS f
             JOIN paper_orders AS o ON o.order_id=f.order_id
             ORDER BY f.fill_id

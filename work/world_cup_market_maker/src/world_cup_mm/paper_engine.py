@@ -25,9 +25,9 @@ class PaperEngine:
         store: Store,
         assets: Iterable[PaperAsset],
         *,
-        fill_mode: Literal["strict", "touch"] = "strict",
+        fill_mode: Literal["strict", "touch", "queue"] = "strict",
     ) -> None:
-        if fill_mode not in {"strict", "touch"}:
+        if fill_mode not in {"strict", "touch", "queue"}:
             raise ValueError(f"unsupported_fill_mode:{fill_mode}")
         self.store = store
         self.assets = {asset.asset_id: asset for asset in assets}
@@ -39,7 +39,9 @@ class PaperEngine:
         *,
         asset_id: str,
         best_bid: Decimal,
+        best_bid_size: Decimal | None = None,
         best_ask: Decimal,
+        best_ask_size: Decimal | None = None,
         book_timestamp: str | None,
         risk_state: RiskState,
         now: datetime,
@@ -50,9 +52,25 @@ class PaperEngine:
         self.store.mark_paper_position(asset_id, best_bid, marked_at=now)
         if not self.connected:
             return
+        if self.fill_mode == "queue" and (
+            best_bid_size is None
+            or best_ask_size is None
+            or best_bid_size < 0
+            or best_ask_size < 0
+        ):
+            self.store.cancel_paper_orders(
+                asset_id=asset_id,
+                reason="queue_book_size_missing",
+                cancelled_at=now,
+            )
+            return
         if risk_state is RiskState.PREMATCH_OPEN:
-            self._quote_buy(asset, best_bid, book_timestamp, now)
-            self._quote_sell_if_inventory(asset, best_ask, book_timestamp, now)
+            self._quote_buy(
+                asset, best_bid, best_bid_size, book_timestamp, now
+            )
+            self._quote_sell_if_inventory(
+                asset, best_ask, best_ask_size, book_timestamp, now
+            )
             return
         if risk_state is RiskState.REDUCE_ONLY:
             self.store.cancel_paper_orders(
@@ -61,7 +79,9 @@ class PaperEngine:
                 reason="reduce_only",
                 cancelled_at=now,
             )
-            self._quote_sell_if_inventory(asset, best_ask, book_timestamp, now)
+            self._quote_sell_if_inventory(
+                asset, best_ask, best_ask_size, book_timestamp, now
+            )
             return
         self.store.cancel_paper_orders(
             asset_id=asset_id,
@@ -74,6 +94,8 @@ class PaperEngine:
         *,
         asset_id: str,
         trade_price: Decimal,
+        trade_side: str | None = None,
+        trade_quantity: Decimal | None = None,
         trigger_event_hash: str,
         best_bid: Decimal,
         risk_state: RiskState,
@@ -91,6 +113,37 @@ class PaperEngine:
         for order in self.store.open_paper_orders(asset_id):
             if order.side not in allowed_sides:
                 continue
+            if self.fill_mode == "queue":
+                normalized_side = str(trade_side or "").upper()
+                if trade_quantity is None or trade_quantity <= 0:
+                    return []
+                compatible = (
+                    order.side == "BUY" and normalized_side == "SELL"
+                ) or (
+                    order.side == "SELL" and normalized_side == "BUY"
+                )
+                if not compatible:
+                    continue
+                at_price = trade_price == order.price
+                through = (
+                    order.side == "BUY" and trade_price < order.price
+                ) or (
+                    order.side == "SELL" and trade_price > order.price
+                )
+                if not at_price and not through:
+                    continue
+                quantity = self.store.consume_paper_trade(
+                    order.order_id,
+                    trigger_event_hash=trigger_event_hash,
+                    trigger_price=trade_price,
+                    official_trade_quantity=trade_quantity,
+                    proof_type="AT_PRICE_QUEUE" if at_price else "TRADE_THROUGH",
+                    filled_at=now,
+                    best_bid=best_bid,
+                )
+                if quantity > 0:
+                    filled.append(order.order_id)
+                break
             if self.fill_mode == "touch":
                 crosses = (
                     order.side == "BUY" and trade_price <= order.price
@@ -149,10 +202,17 @@ class PaperEngine:
         self,
         asset: PaperAsset,
         best_bid: Decimal,
+        best_bid_size: Decimal | None,
         book_timestamp: str | None,
         now: datetime,
     ) -> None:
-        self.store.open_paper_order(
+        opener = (
+            self.store.open_queue_paper_order
+            if self.fill_mode == "queue"
+            else self.store.open_paper_order
+        )
+        kwargs = {"queue_ahead": best_bid_size} if self.fill_mode == "queue" else {}
+        opener(
             condition_id=asset.condition_id,
             market_id=asset.market_id,
             asset_id=asset.asset_id,
@@ -163,12 +223,14 @@ class PaperEngine:
             maker_fee_bps=asset.maker_fee_bps,
             quote_book_timestamp=book_timestamp,
             created_at=now,
+            **kwargs,
         )
 
     def _quote_sell_if_inventory(
         self,
         asset: PaperAsset,
         best_ask: Decimal,
+        best_ask_size: Decimal | None,
         book_timestamp: str | None,
         now: datetime,
     ) -> None:
@@ -185,7 +247,13 @@ class PaperEngine:
             )
             return
         quantity = min(asset.minimum_order_size, position.quantity)
-        self.store.open_paper_order(
+        opener = (
+            self.store.open_queue_paper_order
+            if self.fill_mode == "queue"
+            else self.store.open_paper_order
+        )
+        kwargs = {"queue_ahead": best_ask_size} if self.fill_mode == "queue" else {}
+        opener(
             condition_id=asset.condition_id,
             market_id=asset.market_id,
             asset_id=asset.asset_id,
@@ -196,4 +264,5 @@ class PaperEngine:
             maker_fee_bps=asset.maker_fee_bps,
             quote_book_timestamp=book_timestamp,
             created_at=now,
+            **kwargs,
         )
