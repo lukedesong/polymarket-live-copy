@@ -170,7 +170,7 @@ ON paper_orders(asset_id,side,status);
 CREATE TABLE IF NOT EXISTS paper_fills (
     fill_id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL UNIQUE REFERENCES paper_orders(order_id),
-    trigger_event_hash TEXT NOT NULL,
+    trigger_event_hash TEXT NOT NULL UNIQUE,
     trigger_price_text TEXT NOT NULL,
     fill_price_text TEXT NOT NULL,
     quantity_text TEXT NOT NULL,
@@ -860,6 +860,8 @@ class Store:
     ) -> bool:
         timestamp = _iso(filled_at)
         with self.connection:
+            if self.paper_trigger_seen(trigger_event_hash):
+                return False
             row = self.connection.execute(
                 "SELECT * FROM paper_orders WHERE order_id=?", (order_id,)
             ).fetchone()
@@ -948,6 +950,12 @@ class Store:
             )
             self._insert_paper_account_snapshot(timestamp)
         return True
+
+    def paper_trigger_seen(self, trigger_event_hash: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM paper_fills WHERE trigger_event_hash=?", (trigger_event_hash,)
+        ).fetchone()
+        return row is not None
 
     def mark_paper_position(
         self, asset_id: str, best_bid: Decimal, *, marked_at: datetime

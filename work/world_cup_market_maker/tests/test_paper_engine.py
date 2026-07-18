@@ -1,0 +1,107 @@
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from world_cup_mm.paper_engine import PaperAsset, PaperEngine
+from world_cup_mm.risk import RiskState
+from world_cup_mm.storage import Store
+
+
+NOW = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
+ASSET = PaperAsset(
+    condition_id="condition-a",
+    market_id="market-a",
+    asset_id="asset-a",
+    outcome="YES",
+    minimum_order_size=Decimal("5"),
+    maker_fee_bps=0,
+)
+
+
+def engine(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    return store, PaperEngine(store, [ASSET])
+
+
+def quote(paper: PaperEngine, *, state=RiskState.PREMATCH_OPEN):
+    paper.on_book(
+        asset_id="asset-a",
+        best_bid=Decimal("0.49"),
+        best_ask=Decimal("0.51"),
+        book_timestamp="1000",
+        risk_state=state,
+        now=NOW,
+    )
+
+
+def trade(paper: PaperEngine, price: str, event_hash: str, *, state=RiskState.PREMATCH_OPEN):
+    return paper.on_trade(
+        asset_id="asset-a",
+        trade_price=Decimal(price),
+        trigger_event_hash=event_hash,
+        best_bid=Decimal("0.48"),
+        risk_state=state,
+        now=NOW,
+    )
+
+
+def test_touch_does_not_fill_but_trade_through_does(tmp_path):
+    store, paper = engine(tmp_path)
+    quote(paper)
+
+    assert trade(paper, "0.49", "touch") == []
+    fills = trade(paper, "0.48", "through")
+
+    assert len(fills) == 1
+    assert store.paper_fill_count() == 1
+    assert store.paper_position("asset-a").quantity == Decimal("5")
+
+
+def test_sell_only_fills_above_ask_and_cannot_create_short(tmp_path):
+    store, paper = engine(tmp_path)
+    quote(paper)
+    trade(paper, "0.48", "buy")
+    quote(paper)
+
+    assert len(store.open_paper_orders("asset-a")) == 2
+    assert trade(paper, "0.51", "sell-touch") == []
+    assert len(trade(paper, "0.52", "sell-through")) == 1
+    assert store.paper_position("asset-a").quantity == Decimal("0")
+
+    quote(paper)
+    assert [order.side for order in store.open_paper_orders("asset-a")] == ["BUY"]
+
+
+def test_risk_states_cancel_inventory_increasing_orders_and_then_all_orders(tmp_path):
+    store, paper = engine(tmp_path)
+    quote(paper)
+    trade(paper, "0.48", "buy")
+    quote(paper)
+
+    paper.apply_risk("condition-a", RiskState.NO_NEW_INVENTORY, now=NOW)
+    assert store.open_paper_orders("asset-a") == []
+
+    quote(paper, state=RiskState.REDUCE_ONLY)
+    assert [order.side for order in store.open_paper_orders("asset-a")] == ["SELL"]
+
+    paper.apply_risk("condition-a", RiskState.CANCELLED_BLOCKED, now=NOW)
+    assert store.open_paper_orders("asset-a") == []
+
+
+def test_disconnect_cancels_orders_and_blocks_fill_processing(tmp_path):
+    store, paper = engine(tmp_path)
+    quote(paper)
+    paper.disconnect(now=NOW)
+
+    assert store.open_paper_orders("asset-a") == []
+    assert trade(paper, "0.48", "after-disconnect") == []
+    assert store.paper_fill_count() == 0
+
+
+def test_repeated_trade_event_cannot_fill_twice(tmp_path):
+    store, paper = engine(tmp_path)
+    quote(paper)
+
+    assert len(trade(paper, "0.48", "same-event")) == 1
+    quote(paper)
+    assert trade(paper, "0.48", "same-event") == []
+    assert store.paper_fill_count() == 1
