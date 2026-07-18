@@ -145,6 +145,72 @@ CREATE TABLE IF NOT EXISTS risk_actions (
     delivery_status TEXT NOT NULL,
     detail TEXT
 );
+
+CREATE TABLE IF NOT EXISTS paper_orders (
+    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+    price_text TEXT NOT NULL,
+    quantity_text TEXT NOT NULL,
+    maker_fee_bps INTEGER NOT NULL,
+    quote_book_timestamp TEXT,
+    status TEXT NOT NULL CHECK(status IN ('OPEN','FILLED','CANCELLED')),
+    created_at TEXT NOT NULL,
+    cancelled_at TEXT,
+    cancel_reason TEXT,
+    filled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS paper_orders_open_asset_side
+ON paper_orders(asset_id,side,status);
+
+CREATE TABLE IF NOT EXISTS paper_fills (
+    fill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL UNIQUE REFERENCES paper_orders(order_id),
+    trigger_event_hash TEXT NOT NULL,
+    trigger_price_text TEXT NOT NULL,
+    fill_price_text TEXT NOT NULL,
+    quantity_text TEXT NOT NULL,
+    gross_amount_text TEXT NOT NULL,
+    fee_text TEXT NOT NULL,
+    filled_at TEXT NOT NULL,
+    position_quantity_after_text TEXT NOT NULL,
+    realized_profit_after_text TEXT NOT NULL,
+    UNIQUE(order_id,trigger_event_hash)
+);
+
+CREATE TABLE IF NOT EXISTS paper_positions (
+    asset_id TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    quantity_text TEXT NOT NULL,
+    cost_basis_text TEXT NOT NULL,
+    realized_profit_text TEXT NOT NULL,
+    mark_price_text TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_account_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    buy_cost_text TEXT NOT NULL,
+    sell_proceeds_text TEXT NOT NULL,
+    realized_profit_text TEXT NOT NULL,
+    unrealized_profit_text TEXT NOT NULL,
+    total_profit_text TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_report_sync (
+    sync_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempted_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    spreadsheet_id TEXT,
+    detail TEXT
+);
 """
 
 
@@ -174,6 +240,51 @@ class StoredMarket:
     liquidity_text: str
     volume_24h_text: str
     frontier: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PaperOrder:
+    order_id: int
+    condition_id: str
+    market_id: str
+    asset_id: str
+    outcome: str
+    side: str
+    price: Decimal
+    quantity: Decimal
+    maker_fee_bps: int
+    quote_book_timestamp: str | None
+    status: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PaperPosition:
+    asset_id: str
+    condition_id: str
+    market_id: str
+    outcome: str
+    quantity: Decimal
+    cost_basis: Decimal
+    realized_profit: Decimal
+    mark_price: Decimal
+
+    @property
+    def average_cost(self) -> Decimal:
+        return self.cost_basis / self.quantity if self.quantity else Decimal("0")
+
+    @property
+    def unrealized_profit(self) -> Decimal:
+        return self.quantity * self.mark_price - self.cost_basis
+
+
+@dataclass(frozen=True, slots=True)
+class PaperAccount:
+    buy_cost: Decimal
+    sell_proceeds: Decimal
+    realized_profit: Decimal
+    unrealized_profit: Decimal
+    total_profit: Decimal
 
 
 class Store:
@@ -645,6 +756,316 @@ class Store:
                 """,
                 (condition_id, _iso(created_at), action, delivery_status, detail),
             )
+
+    def open_paper_order(
+        self,
+        *,
+        condition_id: str,
+        market_id: str,
+        asset_id: str,
+        outcome: str,
+        side: str,
+        price: Decimal,
+        quantity: Decimal,
+        maker_fee_bps: int,
+        quote_book_timestamp: str | None,
+        created_at: datetime,
+    ) -> int:
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("invalid_paper_side")
+        if price <= 0 or quantity <= 0:
+            raise ValueError("invalid_paper_order_value")
+        if maker_fee_bps != 0:
+            raise ValueError("paper_nonzero_maker_fee_unsupported")
+        timestamp = _iso(created_at)
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE paper_orders SET status='CANCELLED',cancelled_at=?,cancel_reason='requote'
+                WHERE asset_id=? AND side=? AND status='OPEN'
+                """,
+                (timestamp, asset_id, side),
+            )
+            cursor = self.connection.execute(
+                """
+                INSERT INTO paper_orders(
+                    condition_id,market_id,asset_id,outcome,side,price_text,quantity_text,
+                    maker_fee_bps,quote_book_timestamp,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,'OPEN',?)
+                """,
+                (
+                    condition_id,
+                    market_id,
+                    asset_id,
+                    outcome,
+                    side,
+                    str(price),
+                    str(quantity),
+                    maker_fee_bps,
+                    quote_book_timestamp,
+                    timestamp,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def open_paper_orders(self, asset_id: str | None = None) -> list[PaperOrder]:
+        clause = "AND asset_id=?" if asset_id else ""
+        params: tuple[Any, ...] = (asset_id,) if asset_id else ()
+        rows = self.connection.execute(
+            f"SELECT * FROM paper_orders WHERE status='OPEN' {clause} ORDER BY order_id",
+            params,
+        ).fetchall()
+        return [self._paper_order(row) for row in rows]
+
+    def paper_order_status(self, order_id: int) -> str | None:
+        row = self.connection.execute(
+            "SELECT status FROM paper_orders WHERE order_id=?", (order_id,)
+        ).fetchone()
+        return str(row["status"]) if row else None
+
+    def cancel_paper_orders(
+        self,
+        *,
+        reason: str,
+        cancelled_at: datetime,
+        condition_id: str | None = None,
+        asset_id: str | None = None,
+        side: str | None = None,
+    ) -> int:
+        filters = ["status='OPEN'"]
+        values: list[Any] = [_iso(cancelled_at), reason]
+        for column, value in (
+            ("condition_id", condition_id),
+            ("asset_id", asset_id),
+            ("side", side),
+        ):
+            if value is not None:
+                filters.append(f"{column}=?")
+                values.append(value)
+        with self.connection:
+            cursor = self.connection.execute(
+                f"UPDATE paper_orders SET status='CANCELLED',cancelled_at=?,cancel_reason=? WHERE {' AND '.join(filters)}",
+                values,
+            )
+        return int(cursor.rowcount)
+
+    def apply_paper_fill(
+        self,
+        order_id: int,
+        *,
+        trigger_event_hash: str,
+        trigger_price: Decimal,
+        filled_at: datetime,
+        best_bid: Decimal,
+    ) -> bool:
+        timestamp = _iso(filled_at)
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT * FROM paper_orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("paper_order_not_found")
+            if row["status"] != "OPEN":
+                return False
+            quantity = Decimal(row["quantity_text"])
+            price = Decimal(row["price_text"])
+            gross = price * quantity
+            fee = Decimal("0")
+            position_row = self.connection.execute(
+                "SELECT * FROM paper_positions WHERE asset_id=?", (row["asset_id"],)
+            ).fetchone()
+            current_quantity = (
+                Decimal(position_row["quantity_text"]) if position_row else Decimal("0")
+            )
+            current_cost = (
+                Decimal(position_row["cost_basis_text"]) if position_row else Decimal("0")
+            )
+            realized = (
+                Decimal(position_row["realized_profit_text"])
+                if position_row
+                else Decimal("0")
+            )
+            if row["side"] == "BUY":
+                next_quantity = current_quantity + quantity
+                next_cost = current_cost + gross + fee
+            else:
+                if quantity > current_quantity:
+                    raise ValueError("paper_short_not_allowed")
+                average = current_cost / current_quantity if current_quantity else Decimal("0")
+                removed_cost = average * quantity
+                next_quantity = current_quantity - quantity
+                next_cost = current_cost - removed_cost
+                realized += gross - fee - removed_cost
+            self.connection.execute(
+                """
+                INSERT INTO paper_positions(
+                    asset_id,condition_id,market_id,outcome,quantity_text,cost_basis_text,
+                    realized_profit_text,mark_price_text,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    quantity_text=excluded.quantity_text,
+                    cost_basis_text=excluded.cost_basis_text,
+                    realized_profit_text=excluded.realized_profit_text,
+                    mark_price_text=excluded.mark_price_text,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    row["asset_id"],
+                    row["condition_id"],
+                    row["market_id"],
+                    row["outcome"],
+                    str(next_quantity),
+                    str(next_cost),
+                    str(realized),
+                    str(best_bid),
+                    timestamp,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO paper_fills(
+                    order_id,trigger_event_hash,trigger_price_text,fill_price_text,quantity_text,
+                    gross_amount_text,fee_text,filled_at,position_quantity_after_text,
+                    realized_profit_after_text
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    order_id,
+                    trigger_event_hash,
+                    str(trigger_price),
+                    str(price),
+                    str(quantity),
+                    str(gross),
+                    str(fee),
+                    timestamp,
+                    str(next_quantity),
+                    str(realized),
+                ),
+            )
+            self.connection.execute(
+                "UPDATE paper_orders SET status='FILLED',filled_at=? WHERE order_id=?",
+                (timestamp, order_id),
+            )
+            self._insert_paper_account_snapshot(timestamp)
+        return True
+
+    def mark_paper_position(
+        self, asset_id: str, best_bid: Decimal, *, marked_at: datetime
+    ) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE paper_positions SET mark_price_text=?,updated_at=? WHERE asset_id=?",
+                (str(best_bid), _iso(marked_at), asset_id),
+            )
+            if cursor.rowcount:
+                self._insert_paper_account_snapshot(_iso(marked_at))
+        return bool(cursor.rowcount)
+
+    def paper_position(self, asset_id: str) -> PaperPosition:
+        row = self.connection.execute(
+            "SELECT * FROM paper_positions WHERE asset_id=?", (asset_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("paper_position_not_found")
+        return self._paper_position(row)
+
+    def paper_positions(self) -> list[PaperPosition]:
+        return [
+            self._paper_position(row)
+            for row in self.connection.execute(
+                "SELECT * FROM paper_positions ORDER BY condition_id,asset_id"
+            )
+        ]
+
+    def paper_fill_count(self) -> int:
+        return int(self.connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0])
+
+    def paper_account(self) -> PaperAccount:
+        cash_rows = self.connection.execute(
+            """
+            SELECT o.side,f.gross_amount_text,f.fee_text
+            FROM paper_fills f JOIN paper_orders o ON o.order_id=f.order_id
+            """
+        ).fetchall()
+        buy = sum(
+            (
+                Decimal(row["gross_amount_text"]) + Decimal(row["fee_text"])
+                for row in cash_rows
+                if row["side"] == "BUY"
+            ),
+            Decimal("0"),
+        )
+        sell = sum(
+            (
+                Decimal(row["gross_amount_text"]) - Decimal(row["fee_text"])
+                for row in cash_rows
+                if row["side"] == "SELL"
+            ),
+            Decimal("0"),
+        )
+        positions = self.paper_positions()
+        realized = sum((item.realized_profit for item in positions), Decimal("0"))
+        unrealized = sum((item.unrealized_profit for item in positions), Decimal("0"))
+        return PaperAccount(
+            buy_cost=buy,
+            sell_proceeds=sell,
+            realized_profit=realized,
+            unrealized_profit=unrealized,
+            total_profit=realized + unrealized,
+        )
+
+    def _insert_paper_account_snapshot(self, timestamp: str) -> None:
+        account = self.paper_account()
+        self.connection.execute(
+            """
+            INSERT INTO paper_account_snapshots(
+                created_at,buy_cost_text,sell_proceeds_text,realized_profit_text,
+                unrealized_profit_text,total_profit_text
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                timestamp,
+                str(account.buy_cost),
+                str(account.sell_proceeds),
+                str(account.realized_profit),
+                str(account.unrealized_profit),
+                str(account.total_profit),
+            ),
+        )
+
+    @staticmethod
+    def _paper_order(row: sqlite3.Row) -> PaperOrder:
+        return PaperOrder(
+            order_id=int(row["order_id"]),
+            condition_id=str(row["condition_id"]),
+            market_id=str(row["market_id"]),
+            asset_id=str(row["asset_id"]),
+            outcome=str(row["outcome"]),
+            side=str(row["side"]),
+            price=Decimal(row["price_text"]),
+            quantity=Decimal(row["quantity_text"]),
+            maker_fee_bps=int(row["maker_fee_bps"]),
+            quote_book_timestamp=(
+                str(row["quote_book_timestamp"])
+                if row["quote_book_timestamp"] is not None
+                else None
+            ),
+            status=str(row["status"]),
+            created_at=str(row["created_at"]),
+        )
+
+    @staticmethod
+    def _paper_position(row: sqlite3.Row) -> PaperPosition:
+        return PaperPosition(
+            asset_id=str(row["asset_id"]),
+            condition_id=str(row["condition_id"]),
+            market_id=str(row["market_id"]),
+            outcome=str(row["outcome"]),
+            quantity=Decimal(row["quantity_text"]),
+            cost_basis=Decimal(row["cost_basis_text"]),
+            realized_profit=Decimal(row["realized_profit_text"]),
+            mark_price=Decimal(row["mark_price_text"]),
+        )
 
 
 def replay_events(events: Iterable[Mapping[str, Any]]) -> dict[str, OrderBookState]:
