@@ -17,6 +17,9 @@ class ClobMarketParams:
     maker_fee_bps: int
     tick_size: Decimal
     outcomes: dict[str, str]
+    taker_fee_rate: Decimal | None = None
+    fee_exponent: int | None = None
+    taker_only: bool = False
 
 
 def _decimal(value: Any, error: str) -> Decimal:
@@ -36,6 +39,20 @@ def parse_clob_market_info(payload: Mapping[str, Any]) -> ClobMarketParams:
         raise ValueError("invalid_tick_size")
     fee_details = payload.get("fd")
     taker_only = isinstance(fee_details, Mapping) and fee_details.get("to") is True
+    taker_fee_rate: Decimal | None = None
+    fee_exponent: int | None = None
+    if isinstance(fee_details, Mapping):
+        taker_fee_rate = _decimal(
+            fee_details.get("r"), "invalid_taker_fee_rate"
+        )
+        if taker_fee_rate < 0:
+            raise ValueError("invalid_taker_fee_rate")
+        try:
+            fee_exponent = int(fee_details.get("e"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid_fee_exponent") from exc
+        if fee_exponent < 0:
+            raise ValueError("invalid_fee_exponent")
     try:
         raw_maker_fee = int(payload.get("mbf"))
     except (TypeError, ValueError) as exc:
@@ -56,6 +73,9 @@ def parse_clob_market_info(payload: Mapping[str, Any]) -> ClobMarketParams:
         maker_fee_bps=maker_fee,
         tick_size=tick,
         outcomes=outcomes,
+        taker_fee_rate=taker_fee_rate,
+        fee_exponent=fee_exponent,
+        taker_only=taker_only,
     )
 
 

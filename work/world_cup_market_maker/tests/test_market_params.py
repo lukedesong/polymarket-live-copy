@@ -43,6 +43,19 @@ def test_taker_only_fee_curve_keeps_paper_maker_fee_at_zero():
     )
 
     assert result.maker_fee_bps == 0
+    assert result.taker_fee_rate == Decimal("0.05")
+    assert result.fee_exponent == 1
+    assert result.taker_only is True
+
+
+def test_missing_fee_curve_remains_unknown_instead_of_assuming_zero():
+    result = parse_clob_market_info(
+        {"mos": 5, "mbf": 0, "mts": 0.01, "t": []}
+    )
+
+    assert result.taker_fee_rate is None
+    assert result.fee_exponent is None
+    assert result.taker_only is False
 
 
 @pytest.mark.parametrize(
@@ -51,6 +64,16 @@ def test_taker_only_fee_curve_keeps_paper_maker_fee_at_zero():
         ({"mos": 0, "mbf": 0, "mts": 0.01, "t": []}, "invalid_minimum_order_size"),
         ({"mos": 5, "mbf": 0, "mts": 0, "t": []}, "invalid_tick_size"),
         ({"mos": 5, "mbf": 1, "mts": 0.01, "t": []}, "nonzero_maker_fee"),
+        (
+            {
+                "mos": 5,
+                "mbf": 0,
+                "mts": 0.01,
+                "fd": {"r": "bad", "e": 1, "to": True},
+                "t": [],
+            },
+            "invalid_taker_fee_rate",
+        ),
     ],
 )
 def test_invalid_or_nonzero_maker_parameters_fail_closed(payload, error):

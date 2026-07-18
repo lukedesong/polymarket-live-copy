@@ -155,8 +155,14 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
     price_text TEXT NOT NULL,
     quantity_text TEXT NOT NULL,
+    original_quantity_text TEXT NOT NULL DEFAULT '0',
+    remaining_quantity_text TEXT NOT NULL DEFAULT '0',
+    queue_ahead_initial_text TEXT NOT NULL DEFAULT '0',
+    queue_ahead_remaining_text TEXT NOT NULL DEFAULT '0',
     maker_fee_bps INTEGER NOT NULL,
     quote_book_timestamp TEXT,
+    last_book_timestamp TEXT,
+    requeue_reason TEXT,
     status TEXT NOT NULL CHECK(status IN ('OPEN','FILLED','CANCELLED')),
     created_at TEXT NOT NULL,
     cancelled_at TEXT,
@@ -169,7 +175,7 @@ ON paper_orders(asset_id,side,status);
 
 CREATE TABLE IF NOT EXISTS paper_fills (
     fill_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id INTEGER NOT NULL UNIQUE REFERENCES paper_orders(order_id),
+    order_id INTEGER NOT NULL REFERENCES paper_orders(order_id),
     trigger_event_hash TEXT NOT NULL UNIQUE,
     trigger_price_text TEXT NOT NULL,
     fill_price_text TEXT NOT NULL,
@@ -179,7 +185,54 @@ CREATE TABLE IF NOT EXISTS paper_fills (
     filled_at TEXT NOT NULL,
     position_quantity_after_text TEXT NOT NULL,
     realized_profit_after_text TEXT NOT NULL,
+    official_trade_quantity_text TEXT NOT NULL DEFAULT '0',
+    queue_consumed_text TEXT NOT NULL DEFAULT '0',
+    order_quantity_before_text TEXT NOT NULL DEFAULT '0',
+    order_quantity_after_text TEXT NOT NULL DEFAULT '0',
+    proof_type TEXT NOT NULL DEFAULT 'LEGACY',
     UNIQUE(order_id,trigger_event_hash)
+);
+
+CREATE TABLE IF NOT EXISTS paper_queue_events (
+    queue_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES paper_orders(order_id),
+    event_type TEXT NOT NULL,
+    trigger_event_hash TEXT,
+    official_trade_quantity_text TEXT,
+    queue_before_text TEXT NOT NULL,
+    queue_after_text TEXT NOT NULL,
+    order_remaining_before_text TEXT NOT NULL,
+    order_remaining_after_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_inventory_marks (
+    mark_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    marked_at TEXT NOT NULL,
+    book_timestamp TEXT,
+    best_bid_text TEXT,
+    best_ask_text TEXT,
+    liquidatable_quantity_text TEXT NOT NULL,
+    liquidation_proceeds_text TEXT NOT NULL,
+    liquidation_vwap_text TEXT,
+    liquidation_fee_text TEXT NOT NULL,
+    unliquidated_quantity_text TEXT NOT NULL,
+    depth_adjusted_unrealized_profit_text TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_liquidations (
+    liquidation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    price_text TEXT NOT NULL,
+    quantity_text TEXT NOT NULL,
+    gross_proceeds_text TEXT NOT NULL,
+    fee_text TEXT NOT NULL,
+    liquidated_at TEXT NOT NULL,
+    book_timestamp TEXT
 );
 
 CREATE TABLE IF NOT EXISTS paper_positions (
@@ -252,6 +305,10 @@ class PaperOrder:
     side: str
     price: Decimal
     quantity: Decimal
+    original_quantity: Decimal
+    remaining_quantity: Decimal
+    queue_ahead_initial: Decimal
+    queue_ahead_remaining: Decimal
     maker_fee_bps: int
     quote_book_timestamp: str | None
     status: str
@@ -294,7 +351,37 @@ class Store:
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
+        self._migrate_schema()
         self._books: dict[tuple[str, str], OrderBookState] = {}
+
+    def _migrate_schema(self) -> None:
+        order_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(paper_orders)")
+        }
+        additions = {
+            "original_quantity_text": "TEXT NOT NULL DEFAULT '0'",
+            "remaining_quantity_text": "TEXT NOT NULL DEFAULT '0'",
+            "queue_ahead_initial_text": "TEXT NOT NULL DEFAULT '0'",
+            "queue_ahead_remaining_text": "TEXT NOT NULL DEFAULT '0'",
+            "last_book_timestamp": "TEXT",
+            "requeue_reason": "TEXT",
+        }
+        with self.connection:
+            for name, definition in additions.items():
+                if name not in order_columns:
+                    self.connection.execute(
+                        f"ALTER TABLE paper_orders ADD COLUMN {name} {definition}"
+                    )
+            self.connection.execute(
+                """
+                UPDATE paper_orders SET
+                    original_quantity_text=quantity_text,
+                    remaining_quantity_text=CASE
+                        WHEN status='OPEN' THEN quantity_text ELSE '0' END
+                WHERE original_quantity_text='0'
+                """
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -1069,6 +1156,10 @@ class Store:
             side=str(row["side"]),
             price=Decimal(row["price_text"]),
             quantity=Decimal(row["quantity_text"]),
+            original_quantity=Decimal(row["original_quantity_text"]),
+            remaining_quantity=Decimal(row["remaining_quantity_text"]),
+            queue_ahead_initial=Decimal(row["queue_ahead_initial_text"]),
+            queue_ahead_remaining=Decimal(row["queue_ahead_remaining_text"]),
             maker_fee_bps=int(row["maker_fee_bps"]),
             quote_book_timestamp=(
                 str(row["quote_book_timestamp"])

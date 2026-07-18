@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+import sqlite3
 
 import pytest
 
@@ -148,3 +149,57 @@ def test_account_cash_totals_never_use_binary_float(tmp_path):
         )
 
     assert store.paper_account().buy_cost == Decimal("0.30")
+
+
+def test_store_migrates_existing_paper_schema_without_losing_orders(tmp_path):
+    path = tmp_path / "legacy-paper.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE paper_orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            condition_id TEXT NOT NULL,
+            market_id TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            side TEXT NOT NULL,
+            price_text TEXT NOT NULL,
+            quantity_text TEXT NOT NULL,
+            maker_fee_bps INTEGER NOT NULL,
+            quote_book_timestamp TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            cancelled_at TEXT,
+            cancel_reason TEXT,
+            filled_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO paper_orders(
+            condition_id,market_id,asset_id,outcome,side,price_text,quantity_text,
+            maker_fee_bps,quote_book_timestamp,status,created_at
+        ) VALUES('condition-a','market-a','asset-a','YES','BUY','0.49','5',0,'1000','OPEN',?)
+        """,
+        (NOW.isoformat(),),
+    )
+    connection.commit()
+    connection.close()
+
+    store = Store(path)
+
+    order = store.open_paper_orders("asset-a")[0]
+    assert order.original_quantity == Decimal("5")
+    assert order.remaining_quantity == Decimal("5")
+    assert order.queue_ahead_initial == Decimal("0")
+    assert order.queue_ahead_remaining == Decimal("0")
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM paper_queue_events"
+    ).fetchone()[0] == 0
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM paper_inventory_marks"
+    ).fetchone()[0] == 0
+    assert store.connection.execute(
+        "SELECT COUNT(*) FROM paper_liquidations"
+    ).fetchone()[0] == 0
