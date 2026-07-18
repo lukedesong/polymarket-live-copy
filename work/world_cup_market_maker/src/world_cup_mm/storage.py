@@ -223,7 +223,10 @@ CREATE TABLE IF NOT EXISTS paper_inventory_marks (
     liquidation_vwap_text TEXT,
     liquidation_fee_text TEXT NOT NULL,
     unliquidated_quantity_text TEXT NOT NULL,
-    depth_adjusted_unrealized_profit_text TEXT NOT NULL
+    depth_adjusted_unrealized_profit_text TEXT NOT NULL,
+    reference_fill_price_text TEXT,
+    best_bid_drift_text TEXT,
+    liquidation_vwap_drift_text TEXT
 );
 
 CREATE TABLE IF NOT EXISTS paper_liquidations (
@@ -231,12 +234,27 @@ CREATE TABLE IF NOT EXISTS paper_liquidations (
     asset_id TEXT NOT NULL,
     condition_id TEXT NOT NULL,
     reason TEXT NOT NULL,
+    batch_key TEXT NOT NULL,
     price_text TEXT NOT NULL,
     quantity_text TEXT NOT NULL,
     gross_proceeds_text TEXT NOT NULL,
     fee_text TEXT NOT NULL,
     liquidated_at TEXT NOT NULL,
     book_timestamp TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS paper_liquidation_layer_once
+ON paper_liquidations(batch_key,price_text);
+
+CREATE TABLE IF NOT EXISTS paper_liquidation_runs (
+    batch_key TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    book_timestamp TEXT,
+    sold_quantity_text TEXT NOT NULL,
+    unliquidated_quantity_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS paper_positions (
@@ -346,6 +364,84 @@ class PaperAccount:
     realized_profit: Decimal
     unrealized_profit: Decimal
     total_profit: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class DepthFill:
+    price: Decimal
+    quantity: Decimal
+    gross_proceeds: Decimal
+    fee: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class DepthSale:
+    requested_quantity: Decimal
+    sold_quantity: Decimal
+    gross_proceeds: Decimal
+    fee: Decimal
+    net_proceeds: Decimal
+    vwap: Decimal | None
+    unliquidated_quantity: Decimal
+    fills: tuple[DepthFill, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PaperInventoryMark:
+    asset_id: str
+    liquidatable_quantity: Decimal
+    liquidation_proceeds: Decimal
+    liquidation_vwap: Decimal | None
+    liquidation_fee: Decimal
+    unliquidated_quantity: Decimal
+    depth_adjusted_unrealized_profit: Decimal
+    reference_fill_price: Decimal | None
+    best_bid_drift: Decimal | None
+    liquidation_vwap_drift: Decimal | None
+
+
+def executable_sale(
+    quantity: Decimal,
+    bid_levels: Iterable[tuple[Decimal, Decimal]],
+    *,
+    taker_fee_rate: Decimal,
+    fee_exponent: int,
+) -> DepthSale:
+    if quantity < 0:
+        raise ValueError("negative_liquidation_quantity")
+    if taker_fee_rate < 0 or fee_exponent < 0:
+        raise ValueError("invalid_liquidation_fee_curve")
+    remaining = quantity
+    gross = Decimal("0")
+    fee = Decimal("0")
+    fills: list[DepthFill] = []
+    for price, available in sorted(bid_levels, key=lambda item: item[0], reverse=True):
+        if price <= 0 or price >= 1 or available < 0:
+            raise ValueError("invalid_liquidation_book_level")
+        if not available or not remaining:
+            continue
+        filled = min(remaining, available)
+        layer_gross = filled * price
+        layer_fee = (
+            filled
+            * taker_fee_rate
+            * (price * (Decimal("1") - price)) ** fee_exponent
+        )
+        fills.append(DepthFill(price, filled, layer_gross, layer_fee))
+        gross += layer_gross
+        fee += layer_fee
+        remaining -= filled
+    sold = quantity - remaining
+    return DepthSale(
+        requested_quantity=quantity,
+        sold_quantity=sold,
+        gross_proceeds=gross,
+        fee=fee,
+        net_proceeds=gross - fee,
+        vwap=gross / sold if sold else None,
+        unliquidated_quantity=remaining,
+        fills=tuple(fills),
+    )
 
 
 class Store:
@@ -1349,6 +1445,213 @@ class Store:
                 self._insert_paper_account_snapshot(_iso(marked_at))
         return bool(cursor.rowcount)
 
+    def record_inventory_mark(
+        self,
+        *,
+        asset_id: str,
+        bid_levels: Iterable[tuple[Decimal, Decimal]],
+        best_ask: Decimal,
+        taker_fee_rate: Decimal,
+        fee_exponent: int,
+        book_timestamp: str | None,
+        marked_at: datetime,
+    ) -> PaperInventoryMark | None:
+        position_row = self.connection.execute(
+            "SELECT * FROM paper_positions WHERE asset_id=?", (asset_id,)
+        ).fetchone()
+        if position_row is None:
+            return None
+        quantity = Decimal(position_row["quantity_text"])
+        cost_basis = Decimal(position_row["cost_basis_text"])
+        levels = tuple(bid_levels)
+        sale = executable_sale(
+            quantity,
+            levels,
+            taker_fee_rate=taker_fee_rate,
+            fee_exponent=fee_exponent,
+        )
+        average_cost = cost_basis / quantity if quantity else Decimal("0")
+        liquidated_cost = average_cost * sale.sold_quantity
+        depth_profit = sale.net_proceeds - liquidated_cost
+        reference_row = self.connection.execute(
+            """
+            SELECT f.fill_price_text
+            FROM paper_fills AS f
+            JOIN paper_orders AS o ON o.order_id=f.order_id
+            WHERE o.asset_id=? AND o.side='BUY'
+            ORDER BY f.fill_id DESC LIMIT 1
+            """,
+            (asset_id,),
+        ).fetchone()
+        reference = (
+            Decimal(reference_row["fill_price_text"])
+            if reference_row is not None
+            else None
+        )
+        sorted_levels = sorted(levels, key=lambda item: item[0], reverse=True)
+        best_bid = sorted_levels[0][0] if sorted_levels else None
+        best_bid_drift = (
+            best_bid - reference
+            if best_bid is not None and reference is not None
+            else None
+        )
+        vwap_drift = (
+            sale.vwap - reference
+            if sale.vwap is not None and reference is not None
+            else None
+        )
+        mark = PaperInventoryMark(
+            asset_id=asset_id,
+            liquidatable_quantity=sale.sold_quantity,
+            liquidation_proceeds=sale.gross_proceeds,
+            liquidation_vwap=sale.vwap,
+            liquidation_fee=sale.fee,
+            unliquidated_quantity=sale.unliquidated_quantity,
+            depth_adjusted_unrealized_profit=depth_profit,
+            reference_fill_price=reference,
+            best_bid_drift=best_bid_drift,
+            liquidation_vwap_drift=vwap_drift,
+        )
+        timestamp = _iso(marked_at)
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO paper_inventory_marks(
+                    asset_id,condition_id,marked_at,book_timestamp,best_bid_text,best_ask_text,
+                    liquidatable_quantity_text,liquidation_proceeds_text,liquidation_vwap_text,
+                    liquidation_fee_text,unliquidated_quantity_text,
+                    depth_adjusted_unrealized_profit_text,reference_fill_price_text,
+                    best_bid_drift_text,liquidation_vwap_drift_text
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    asset_id,
+                    position_row["condition_id"],
+                    timestamp,
+                    book_timestamp,
+                    str(best_bid) if best_bid is not None else None,
+                    str(best_ask),
+                    str(mark.liquidatable_quantity),
+                    str(mark.liquidation_proceeds),
+                    str(mark.liquidation_vwap) if mark.liquidation_vwap is not None else None,
+                    str(mark.liquidation_fee),
+                    str(mark.unliquidated_quantity),
+                    str(mark.depth_adjusted_unrealized_profit),
+                    str(mark.reference_fill_price) if mark.reference_fill_price is not None else None,
+                    str(mark.best_bid_drift) if mark.best_bid_drift is not None else None,
+                    str(mark.liquidation_vwap_drift) if mark.liquidation_vwap_drift is not None else None,
+                ),
+            )
+            if best_bid is not None:
+                self.connection.execute(
+                    "UPDATE paper_positions SET mark_price_text=?,updated_at=? WHERE asset_id=?",
+                    (str(best_bid), timestamp, asset_id),
+                )
+            self._insert_paper_account_snapshot(timestamp)
+        return mark
+
+    def liquidate_paper_position(
+        self,
+        *,
+        asset_id: str,
+        bid_levels: Iterable[tuple[Decimal, Decimal]],
+        taker_fee_rate: Decimal,
+        fee_exponent: int,
+        reason: str,
+        book_timestamp: str | None,
+        liquidated_at: datetime,
+    ) -> DepthSale:
+        position_row = self.connection.execute(
+            "SELECT * FROM paper_positions WHERE asset_id=?", (asset_id,)
+        ).fetchone()
+        quantity = (
+            Decimal(position_row["quantity_text"])
+            if position_row is not None
+            else Decimal("0")
+        )
+        empty = DepthSale(
+            requested_quantity=quantity,
+            sold_quantity=Decimal("0"),
+            gross_proceeds=Decimal("0"),
+            fee=Decimal("0"),
+            net_proceeds=Decimal("0"),
+            vwap=None,
+            unliquidated_quantity=quantity,
+            fills=(),
+        )
+        if position_row is None or quantity == 0:
+            return empty
+        batch_key = f"{asset_id}:{book_timestamp or 'none'}:{reason}"
+        if self.connection.execute(
+            "SELECT 1 FROM paper_liquidation_runs WHERE batch_key=?", (batch_key,)
+        ).fetchone():
+            return empty
+        sale = executable_sale(
+            quantity,
+            bid_levels,
+            taker_fee_rate=taker_fee_rate,
+            fee_exponent=fee_exponent,
+        )
+        timestamp = _iso(liquidated_at)
+        current_cost = Decimal(position_row["cost_basis_text"])
+        average_cost = current_cost / quantity
+        removed_cost = average_cost * sale.sold_quantity
+        next_quantity = quantity - sale.sold_quantity
+        next_cost = current_cost - removed_cost
+        realized = Decimal(position_row["realized_profit_text"])
+        realized += sale.net_proceeds - removed_cost
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO paper_liquidation_runs(
+                    batch_key,asset_id,condition_id,reason,book_timestamp,
+                    sold_quantity_text,unliquidated_quantity_text,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    batch_key,
+                    asset_id,
+                    position_row["condition_id"],
+                    reason,
+                    book_timestamp,
+                    str(sale.sold_quantity),
+                    str(sale.unliquidated_quantity),
+                    timestamp,
+                ),
+            )
+            self.connection.executemany(
+                """
+                INSERT INTO paper_liquidations(
+                    asset_id,condition_id,reason,batch_key,price_text,quantity_text,
+                    gross_proceeds_text,fee_text,liquidated_at,book_timestamp
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    (
+                        asset_id,
+                        position_row["condition_id"],
+                        reason,
+                        batch_key,
+                        str(layer.price),
+                        str(layer.quantity),
+                        str(layer.gross_proceeds),
+                        str(layer.fee),
+                        timestamp,
+                        book_timestamp,
+                    )
+                    for layer in sale.fills
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE paper_positions SET quantity_text=?,cost_basis_text=?,
+                    realized_profit_text=?,updated_at=? WHERE asset_id=?
+                """,
+                (str(next_quantity), str(next_cost), str(realized), timestamp, asset_id),
+            )
+            self._insert_paper_account_snapshot(timestamp)
+        return sale
+
     def paper_position(self, asset_id: str) -> PaperPosition:
         row = self.connection.execute(
             "SELECT * FROM paper_positions WHERE asset_id=?", (asset_id,)
@@ -1367,6 +1670,11 @@ class Store:
 
     def paper_fill_count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0])
+
+    def paper_liquidation_count(self) -> int:
+        return int(
+            self.connection.execute("SELECT COUNT(*) FROM paper_liquidations").fetchone()[0]
+        )
 
     def paper_fill_rows(self) -> list[dict[str, str | int]]:
         rows = self.connection.execute(
@@ -1407,6 +1715,15 @@ class Store:
                 Decimal(row["gross_amount_text"]) - Decimal(row["fee_text"])
                 for row in cash_rows
                 if row["side"] == "SELL"
+            ),
+            Decimal("0"),
+        )
+        sell += sum(
+            (
+                Decimal(row["gross_proceeds_text"]) - Decimal(row["fee_text"])
+                for row in self.connection.execute(
+                    "SELECT gross_proceeds_text,fee_text FROM paper_liquidations"
+                )
             ),
             Decimal("0"),
         )

@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from world_cup_mm.storage import Store
+from world_cup_mm.storage import Store, executable_sale
 
 
 NOW = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
@@ -203,3 +203,90 @@ def test_store_migrates_existing_paper_schema_without_losing_orders(tmp_path):
     assert store.connection.execute(
         "SELECT COUNT(*) FROM paper_liquidations"
     ).fetchone()[0] == 0
+
+
+def test_executable_sale_walks_depth_and_uses_official_fee_curve():
+    sale = executable_sale(
+        Decimal("3"),
+        (
+            (Decimal("0.60"), Decimal("1")),
+            (Decimal("0.50"), Decimal("2")),
+        ),
+        taker_fee_rate=Decimal("0.03"),
+        fee_exponent=1,
+    )
+
+    expected_fee = (
+        Decimal("1") * Decimal("0.03") * Decimal("0.60") * Decimal("0.40")
+        + Decimal("2") * Decimal("0.03") * Decimal("0.50") * Decimal("0.50")
+    )
+    assert sale.sold_quantity == Decimal("3")
+    assert sale.gross_proceeds == Decimal("1.60")
+    assert sale.fee == expected_fee
+    assert sale.net_proceeds == Decimal("1.60") - expected_fee
+    assert sale.vwap == Decimal("1.60") / Decimal("3")
+    assert sale.unliquidated_quantity == Decimal("0")
+
+
+def test_inventory_mark_uses_depth_and_reports_unliquidated_quantity(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    order_id = open_order(store, price="0.50", quantity="5")
+    fill(store, order_id, event_hash="buy", trigger_price="0.49", best_bid="0.49")
+
+    mark = store.record_inventory_mark(
+        asset_id="asset-a",
+        bid_levels=(
+            (Decimal("0.49"), Decimal("2")),
+            (Decimal("0.48"), Decimal("1")),
+        ),
+        best_ask=Decimal("0.51"),
+        taker_fee_rate=Decimal("0.03"),
+        fee_exponent=1,
+        book_timestamp="1001",
+        marked_at=NOW,
+    )
+
+    assert mark is not None
+    assert mark.liquidatable_quantity == Decimal("3")
+    assert mark.liquidation_proceeds == Decimal("1.46")
+    assert mark.unliquidated_quantity == Decimal("2")
+    assert mark.reference_fill_price == Decimal("0.50")
+    assert mark.best_bid_drift == Decimal("-0.01")
+    assert mark.liquidation_vwap_drift == Decimal("1.46") / Decimal("3") - Decimal("0.50")
+
+
+def test_forced_liquidation_consumes_each_layer_once_and_keeps_depth_shortfall(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    order_id = open_order(store, price="0.50", quantity="5")
+    fill(store, order_id, event_hash="buy", trigger_price="0.49", best_bid="0.49")
+    bids = (
+        (Decimal("0.49"), Decimal("2")),
+        (Decimal("0.48"), Decimal("1")),
+    )
+
+    first = store.liquidate_paper_position(
+        asset_id="asset-a",
+        bid_levels=bids,
+        taker_fee_rate=Decimal("0.03"),
+        fee_exponent=1,
+        reason="risk_cancelled_blocked",
+        book_timestamp="1001",
+        liquidated_at=NOW,
+    )
+    repeated = store.liquidate_paper_position(
+        asset_id="asset-a",
+        bid_levels=bids,
+        taker_fee_rate=Decimal("0.03"),
+        fee_exponent=1,
+        reason="risk_cancelled_blocked",
+        book_timestamp="1001",
+        liquidated_at=NOW,
+    )
+
+    assert first.sold_quantity == Decimal("3")
+    assert first.unliquidated_quantity == Decimal("2")
+    assert repeated.sold_quantity == Decimal("0")
+    assert store.paper_position("asset-a").quantity == Decimal("2")
+    assert store.paper_position("asset-a").cost_basis == Decimal("1.00")
+    assert store.paper_liquidation_count() == 2
+    assert store.paper_account().sell_proceeds == first.net_proceeds

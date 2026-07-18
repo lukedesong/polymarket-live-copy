@@ -17,6 +17,8 @@ class PaperAsset:
     outcome: str
     minimum_order_size: Decimal
     maker_fee_bps: int
+    taker_fee_rate: Decimal | None = None
+    fee_exponent: int | None = None
 
 
 class PaperEngine:
@@ -42,6 +44,8 @@ class PaperEngine:
         best_bid_size: Decimal | None = None,
         best_ask: Decimal,
         best_ask_size: Decimal | None = None,
+        bid_levels: Iterable[tuple[Decimal, Decimal]] | None = None,
+        ask_levels: Iterable[tuple[Decimal, Decimal]] | None = None,
         book_timestamp: str | None,
         risk_state: RiskState,
         now: datetime,
@@ -49,6 +53,8 @@ class PaperEngine:
         asset = self.assets.get(asset_id)
         if asset is None:
             return
+        bids = tuple(bid_levels or ())
+        _asks = tuple(ask_levels or ())
         self.store.mark_paper_position(asset_id, best_bid, marked_at=now)
         if not self.connected:
             return
@@ -57,6 +63,7 @@ class PaperEngine:
             or best_ask_size is None
             or best_bid_size < 0
             or best_ask_size < 0
+            or not bids
         ):
             self.store.cancel_paper_orders(
                 asset_id=asset_id,
@@ -64,6 +71,20 @@ class PaperEngine:
                 cancelled_at=now,
             )
             return
+        if (
+            self.fill_mode == "queue"
+            and asset.taker_fee_rate is not None
+            and asset.fee_exponent is not None
+        ):
+            self.store.record_inventory_mark(
+                asset_id=asset_id,
+                bid_levels=bids,
+                best_ask=best_ask,
+                taker_fee_rate=asset.taker_fee_rate,
+                fee_exponent=asset.fee_exponent,
+                book_timestamp=book_timestamp,
+                marked_at=now,
+            )
         if risk_state is RiskState.PREMATCH_OPEN:
             self._quote_buy(
                 asset, best_bid, best_bid_size, book_timestamp, now
@@ -72,7 +93,7 @@ class PaperEngine:
                 asset, best_ask, best_ask_size, book_timestamp, now
             )
             return
-        if risk_state is RiskState.REDUCE_ONLY:
+        if risk_state in {RiskState.NO_NEW_INVENTORY, RiskState.REDUCE_ONLY}:
             self.store.cancel_paper_orders(
                 asset_id=asset_id,
                 side="BUY",
@@ -88,6 +109,21 @@ class PaperEngine:
             reason=f"risk_{risk_state.value.lower()}",
             cancelled_at=now,
         )
+        if (
+            self.fill_mode == "queue"
+            and risk_state is RiskState.CANCELLED_BLOCKED
+            and asset.taker_fee_rate is not None
+            and asset.fee_exponent is not None
+        ):
+            self.store.liquidate_paper_position(
+                asset_id=asset_id,
+                bid_levels=bids,
+                taker_fee_rate=asset.taker_fee_rate,
+                fee_exponent=asset.fee_exponent,
+                reason="risk_cancelled_blocked",
+                book_timestamp=book_timestamp,
+                liquidated_at=now,
+            )
 
     def on_trade(
         self,

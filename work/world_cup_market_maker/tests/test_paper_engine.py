@@ -14,6 +14,8 @@ ASSET = PaperAsset(
     outcome="YES",
     minimum_order_size=Decimal("5"),
     maker_fee_bps=0,
+    taker_fee_rate=Decimal("0.03"),
+    fee_exponent=1,
 )
 
 
@@ -41,6 +43,7 @@ def queue_quote(
     ask="0.51",
     ask_size="10",
     timestamp="1000",
+    state=RiskState.PREMATCH_OPEN,
 ):
     paper.on_book(
         asset_id="asset-a",
@@ -48,8 +51,10 @@ def queue_quote(
         best_bid_size=Decimal(bid_size),
         best_ask=Decimal(ask),
         best_ask_size=Decimal(ask_size),
+        bid_levels=((Decimal(bid), Decimal(bid_size)),),
+        ask_levels=((Decimal(ask), Decimal(ask_size)),),
         book_timestamp=timestamp,
-        risk_state=RiskState.PREMATCH_OPEN,
+        risk_state=state,
         now=NOW,
     )
 
@@ -258,3 +263,59 @@ def test_queue_mode_trade_through_fills_valid_remainder(tmp_path):
     assert fills == [1]
     assert store.paper_position("asset-a").quantity == Decimal("5")
     assert store.paper_fill_rows()[0]["proof_type"] == "TRADE_THROUGH"
+
+
+def test_queue_mode_records_dynamic_depth_mark_and_fill_price_drift(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid="0.49", bid_size="0")
+    queue_trade(paper, price="0.48", size="1")
+
+    paper.on_book(
+        asset_id="asset-a",
+        best_bid=Decimal("0.47"),
+        best_bid_size=Decimal("2"),
+        best_ask=Decimal("0.49"),
+        best_ask_size=Decimal("4"),
+        bid_levels=(
+            (Decimal("0.47"), Decimal("2")),
+            (Decimal("0.46"), Decimal("1")),
+        ),
+        ask_levels=((Decimal("0.49"), Decimal("4")),),
+        book_timestamp="1002",
+        risk_state=RiskState.PREMATCH_OPEN,
+        now=NOW,
+    )
+
+    row = store.connection.execute(
+        "SELECT * FROM paper_inventory_marks ORDER BY mark_id DESC LIMIT 1"
+    ).fetchone()
+    assert row["liquidatable_quantity_text"] == "3"
+    assert row["unliquidated_quantity_text"] == "2"
+    assert Decimal(row["best_bid_drift_text"]) == Decimal("-0.02")
+    assert Decimal(row["liquidation_vwap_drift_text"]) < Decimal("-0.02")
+
+
+def test_queue_mode_blocking_risk_liquidates_real_depth_and_keeps_remainder(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="queue")
+    queue_quote(paper, bid="0.49", bid_size="0")
+    queue_trade(paper, price="0.48", size="1")
+
+    paper.on_book(
+        asset_id="asset-a",
+        best_bid=Decimal("0.49"),
+        best_bid_size=Decimal("2"),
+        best_ask=Decimal("0.51"),
+        best_ask_size=Decimal("2"),
+        bid_levels=(
+            (Decimal("0.49"), Decimal("2")),
+            (Decimal("0.48"), Decimal("1")),
+        ),
+        ask_levels=((Decimal("0.51"), Decimal("2")),),
+        book_timestamp="1003",
+        risk_state=RiskState.CANCELLED_BLOCKED,
+        now=NOW,
+    )
+
+    assert store.open_paper_orders("asset-a") == []
+    assert store.paper_position("asset-a").quantity == Decimal("2")
+    assert store.paper_liquidation_count() == 2
