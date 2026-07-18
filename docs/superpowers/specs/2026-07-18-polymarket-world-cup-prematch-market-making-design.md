@@ -172,7 +172,7 @@ Additional fail-closed transitions apply when:
 - The Sports WebSocket reports a live or in-progress game.
 - Market and sports metadata materially disagree.
 
-`REDUCE_ONLY` does not invent a liquidation price or force a taker trade. It exposes constraints to a later quoting engine and raises an unresolved-inventory alert. `CANCELLED_BLOCKED` cancels resting orders but does not claim that inventory has been flattened.
+`REDUCE_ONLY` does not invent a liquidation price or force a taker trade. It exposes constraints to a later quoting engine and raises an unresolved-inventory alert. `CANCELLED_BLOCKED` cancels all resting orders for the affected World Cup market but does not claim that inventory has been flattened. It must use market-scoped cancellation and must never invoke an account-wide cancel-all operation that could affect unrelated markets.
 
 ## Cancellation boundary
 
