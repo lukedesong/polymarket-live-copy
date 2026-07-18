@@ -31,6 +31,8 @@ def build_paper_assets(
                     outcome=outcome,
                     minimum_order_size=params.minimum_order_size,
                     maker_fee_bps=params.maker_fee_bps,
+                    taker_fee_rate=params.taker_fee_rate,
+                    fee_exponent=params.fee_exponent,
                 )
             )
     return assets
@@ -49,7 +51,7 @@ class PaperRuntimeSink:
         markets: Iterable[StoredMarket],
         params_by_condition: Mapping[str, ClobMarketParams],
         *,
-        fill_mode: Literal["strict", "touch"] = "strict",
+        fill_mode: Literal["strict", "touch", "queue"] = "strict",
         now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
@@ -100,10 +102,18 @@ class PaperRuntimeSink:
         if bid_text is None or ask_text is None:
             self.engine.apply_risk(market.condition_id, decision.state, now=self._now())
             return
+        bids, asks = self.store.decimal_book_levels(asset_id)
+        if not bids or not asks:
+            self.engine.apply_risk(market.condition_id, decision.state, now=self._now())
+            return
         self.engine.on_book(
             asset_id=asset_id,
             best_bid=Decimal(bid_text),
+            best_bid_size=bids[0][1],
             best_ask=Decimal(ask_text),
+            best_ask_size=asks[0][1],
+            bid_levels=bids,
+            ask_levels=asks,
             book_timestamp=timestamp,
             risk_state=decision.state,
             now=self._now(),
@@ -153,11 +163,47 @@ class PaperRuntimeSink:
                 continue
             try:
                 trade_price = Decimal(str(payload.get("price")))
+                trade_quantity = Decimal(str(payload.get("size")))
             except (InvalidOperation, TypeError, ValueError):
+                self.store.record_paper_anomaly(
+                    reason="invalid_trade_price_or_quantity",
+                    payload=payload,
+                    created_at=self._now(),
+                    event_hash=_event_hash(payload),
+                    asset_id=asset_id,
+                )
+                continue
+            trade_side = str(payload.get("side") or "").upper()
+            if trade_quantity <= 0 or trade_side not in {"BUY", "SELL"}:
+                self.store.record_paper_anomaly(
+                    reason="invalid_trade_side_or_quantity",
+                    payload=payload,
+                    created_at=self._now(),
+                    event_hash=_event_hash(payload),
+                    asset_id=asset_id,
+                )
+                continue
+            trade_timestamp = str(payload.get("timestamp") or "")
+            book_timestamp = self.store.book_timestamp(asset_id)
+            if (
+                trade_timestamp.isdigit()
+                and book_timestamp is not None
+                and book_timestamp.isdigit()
+                and int(trade_timestamp) < int(book_timestamp)
+            ):
+                self.store.record_paper_anomaly(
+                    reason="out_of_order_trade_event",
+                    payload=payload,
+                    created_at=self._now(),
+                    event_hash=_event_hash(payload),
+                    asset_id=asset_id,
+                )
                 continue
             self.engine.on_trade(
                 asset_id=asset_id,
                 trade_price=trade_price,
+                trade_side=trade_side,
+                trade_quantity=trade_quantity,
                 trigger_event_hash=_event_hash(payload),
                 best_bid=Decimal(bid_text),
                 risk_state=self._decision(market, asset_id).state,

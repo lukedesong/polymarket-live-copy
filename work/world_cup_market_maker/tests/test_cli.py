@@ -67,7 +67,7 @@ def test_parser_exposes_paper_only_runtime_commands():
     export = build_parser().parse_args(["paper-export"])
 
     assert run.duration_seconds == 3600
-    assert run.fill_mode == "strict"
+    assert run.fill_mode == "queue"
     assert run.cancel_enabled is False
     assert touch.fill_mode == "touch"
     assert status.command == "paper-status"
@@ -82,7 +82,29 @@ def test_paper_status_reports_fill_mode_from_session(tmp_path):
         started_at=NOW,
     )
 
-    assert build_paper_status(store)["fill_mode"] == "touch"
+    status = build_paper_status(store)
+    assert status["fill_mode"] == "touch"
+    assert status["authoritative"] is False
+    assert status["result_role"] == "comparison_only"
+
+
+def test_queue_paper_status_is_authoritative_and_exposes_queue_metrics(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    store.start_session(
+        "session-a",
+        selection_mode="paper_frontier_queue",
+        started_at=NOW,
+    )
+
+    status = build_paper_status(store)
+
+    assert status["fill_mode"] == "queue"
+    assert status["authoritative"] is True
+    assert status["result_role"] == "authoritative"
+    assert status["official_trade_quantity"] == "0"
+    assert status["partial_fill_order_count"] == 0
+    assert status["full_fill_order_count"] == 0
+    assert status["unliquidated_quantity"] == "0"
 
 
 def test_run_scan_persists_ranked_manifest_without_fixed_liquidity_cutoff(tmp_path):

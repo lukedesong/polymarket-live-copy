@@ -8,6 +8,7 @@ import os
 import sys
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -65,8 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     paper_run.add_argument("--duration-seconds", type=int)
     paper_run.add_argument(
         "--fill-mode",
-        choices=("strict", "touch"),
-        default="strict",
+        choices=("strict", "touch", "queue"),
+        default="queue",
     )
     paper_run.set_defaults(cancel_enabled=False)
     commands.add_parser("paper-status")
@@ -200,19 +201,45 @@ def build_paper_status(store: Store) -> dict[str, Any]:
     account = store.paper_account()
     session = store.latest_session_summary()
     selection_mode = str((session or {}).get("selection_mode") or "")
-    fill_mode = "touch" if selection_mode.endswith("_touch") else "strict"
+    if selection_mode.endswith("_queue"):
+        fill_mode = "queue"
+    elif selection_mode.endswith("_touch"):
+        fill_mode = "touch"
+    else:
+        fill_mode = "strict"
+    authoritative = fill_mode == "queue"
+    metrics = store.paper_metrics()
+    depth_unrealized = Decimal(str(metrics["depth_adjusted_unrealized_profit"]))
+    reported_unrealized = depth_unrealized if authoritative else account.unrealized_profit
+    reported_total = account.realized_profit + reported_unrealized
     return {
         "mode": "paper_only",
         "fill_mode": fill_mode,
+        "authoritative": authoritative,
+        "result_role": "authoritative" if authoritative else "comparison_only",
         "latest_session": session,
         "official_trade_events": store.trade_count(),
+        "official_trade_quantity": str(metrics["official_trade_quantity"]),
         "paper_fill_count": store.paper_fill_count(),
         "open_paper_order_count": len(store.open_paper_orders()),
+        "paper_order_count": metrics["paper_order_count"],
+        "partial_fill_order_count": metrics["partial_fill_order_count"],
+        "full_fill_order_count": metrics["full_fill_order_count"],
+        "cancelled_order_count": metrics["cancelled_order_count"],
+        "average_initial_queue_ahead": str(metrics["average_initial_queue_ahead"]),
+        "queue_consumed_quantity": str(metrics["queue_consumed_quantity"]),
         "buy_cost": str(account.buy_cost),
         "sell_proceeds": str(account.sell_proceeds),
+        "official_fees": str(metrics["official_fees"]),
+        "depth_liquidation_value": str(metrics["depth_liquidation_value"]),
         "realized_profit": str(account.realized_profit),
-        "unrealized_profit": str(account.unrealized_profit),
-        "total_profit": str(account.total_profit),
+        "unrealized_profit": str(reported_unrealized),
+        "depth_adjusted_unrealized_profit": str(depth_unrealized),
+        "legacy_best_bid_unrealized_profit": str(account.unrealized_profit),
+        "total_profit": str(reported_total),
+        "unliquidated_quantity": str(metrics["unliquidated_quantity"]),
+        "max_inventory": str(metrics["max_inventory"]),
+        "anomaly_count": metrics["anomaly_count"],
         "positions": [
             {
                 "market_id": position.market_id,

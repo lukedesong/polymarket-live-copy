@@ -286,6 +286,15 @@ CREATE TABLE IF NOT EXISTS paper_report_sync (
     spreadsheet_id TEXT,
     detail TEXT
 );
+
+CREATE TABLE IF NOT EXISTS paper_anomalies (
+    anomaly_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_hash TEXT,
+    asset_id TEXT,
+    reason TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -841,6 +850,41 @@ class Store:
             (asset_id,),
         ).fetchone()
         return (bid["price_text"] if bid else None, ask["price_text"] if ask else None)
+
+    def decimal_book_levels(
+        self, asset_id: str
+    ) -> tuple[tuple[tuple[Decimal, Decimal], ...], tuple[tuple[Decimal, Decimal], ...]]:
+        if not self.book_ready(asset_id):
+            raise BookNotReady(asset_id)
+        rows = self.connection.execute(
+            "SELECT side,price_text,size_text FROM book_levels WHERE asset_id=?",
+            (asset_id,),
+        ).fetchall()
+        bids = sorted(
+            (
+                (Decimal(row["price_text"]), Decimal(row["size_text"]))
+                for row in rows
+                if row["side"] == "BUY"
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        asks = sorted(
+            (
+                (Decimal(row["price_text"]), Decimal(row["size_text"]))
+                for row in rows
+                if row["side"] == "SELL"
+            ),
+            key=lambda item: item[0],
+        )
+        return tuple(bids), tuple(asks)
+
+    def book_timestamp(self, asset_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT server_timestamp FROM book_readiness WHERE asset_id=? AND ready=1",
+            (asset_id,),
+        ).fetchone()
+        return str(row["server_timestamp"]) if row and row["server_timestamp"] else None
 
     def raw_events(self, session_id: str) -> list[dict[str, Any]]:
         return [
@@ -1450,7 +1494,7 @@ class Store:
         *,
         asset_id: str,
         bid_levels: Iterable[tuple[Decimal, Decimal]],
-        best_ask: Decimal,
+        best_ask: Decimal | None,
         taker_fee_rate: Decimal,
         fee_exponent: int,
         book_timestamp: str | None,
@@ -1530,7 +1574,7 @@ class Store:
                     timestamp,
                     book_timestamp,
                     str(best_bid) if best_bid is not None else None,
-                    str(best_ask),
+                    str(best_ask) if best_ask is not None else None,
                     str(mark.liquidatable_quantity),
                     str(mark.liquidation_proceeds),
                     str(mark.liquidation_vwap) if mark.liquidation_vwap is not None else None,
@@ -1586,9 +1630,10 @@ class Store:
             "SELECT 1 FROM paper_liquidation_runs WHERE batch_key=?", (batch_key,)
         ).fetchone():
             return empty
+        levels = tuple(bid_levels)
         sale = executable_sale(
             quantity,
-            bid_levels,
+            levels,
             taker_fee_rate=taker_fee_rate,
             fee_exponent=fee_exponent,
         )
@@ -1650,6 +1695,23 @@ class Store:
                 (str(next_quantity), str(next_cost), str(realized), timestamp, asset_id),
             )
             self._insert_paper_account_snapshot(timestamp)
+        residual_by_price = {price: available for price, available in levels}
+        for layer in sale.fills:
+            residual_by_price[layer.price] -= layer.quantity
+        residual_levels = tuple(
+            (price, available)
+            for price, available in residual_by_price.items()
+            if available > 0
+        )
+        self.record_inventory_mark(
+            asset_id=asset_id,
+            bid_levels=residual_levels,
+            best_ask=None,
+            taker_fee_rate=taker_fee_rate,
+            fee_exponent=fee_exponent,
+            book_timestamp=f"{book_timestamp or 'none'}:post_liquidation",
+            marked_at=liquidated_at,
+        )
         return sale
 
     def paper_position(self, asset_id: str) -> PaperPosition:
@@ -1675,6 +1737,163 @@ class Store:
         return int(
             self.connection.execute("SELECT COUNT(*) FROM paper_liquidations").fetchone()[0]
         )
+
+    def record_paper_anomaly(
+        self,
+        *,
+        reason: str,
+        payload: Mapping[str, Any],
+        created_at: datetime,
+        event_hash: str | None = None,
+        asset_id: str | None = None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO paper_anomalies(
+                    event_hash,asset_id,reason,payload_json,created_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    event_hash,
+                    asset_id,
+                    reason,
+                    json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                    _iso(created_at),
+                ),
+            )
+
+    def paper_anomaly_count(self) -> int:
+        return int(
+            self.connection.execute("SELECT COUNT(*) FROM paper_anomalies").fetchone()[0]
+        )
+
+    def paper_metrics(self) -> dict[str, int | Decimal | None]:
+        trade_quantities = []
+        for row in self.connection.execute("SELECT size_text FROM trades"):
+            try:
+                quantity = Decimal(row["size_text"])
+            except Exception:
+                continue
+            if quantity > 0:
+                trade_quantities.append(quantity)
+        order_rows = self.connection.execute(
+            """
+            SELECT status,original_quantity_text,remaining_quantity_text,
+                   queue_ahead_initial_text
+            FROM paper_orders
+            """
+        ).fetchall()
+        fill_quantity_by_order: dict[int, Decimal] = {}
+        for row in self.connection.execute(
+            "SELECT order_id,quantity_text FROM paper_fills ORDER BY fill_id"
+        ):
+            order_id = int(row["order_id"])
+            fill_quantity_by_order[order_id] = fill_quantity_by_order.get(
+                order_id, Decimal("0")
+            ) + Decimal(row["quantity_text"])
+        order_rows_with_id = self.connection.execute(
+            """
+            SELECT order_id,status,original_quantity_text,remaining_quantity_text,
+                   queue_ahead_initial_text
+            FROM paper_orders
+            """
+        ).fetchall()
+        partial_orders = sum(
+            1
+            for row in order_rows_with_id
+            if Decimal("0")
+            < fill_quantity_by_order.get(int(row["order_id"]), Decimal("0"))
+            < Decimal(row["original_quantity_text"])
+        )
+        full_orders = sum(
+            1
+            for row in order_rows_with_id
+            if fill_quantity_by_order.get(int(row["order_id"]), Decimal("0"))
+            >= Decimal(row["original_quantity_text"])
+            and Decimal(row["original_quantity_text"]) > 0
+        )
+        queue_initial = [
+            Decimal(row["queue_ahead_initial_text"])
+            for row in order_rows
+            if Decimal(row["queue_ahead_initial_text"]) >= 0
+        ]
+        queue_consumed = sum(
+            (
+                Decimal(row["queue_before_text"]) - Decimal(row["queue_after_text"])
+                for row in self.connection.execute(
+                    """
+                    SELECT queue_before_text,queue_after_text FROM paper_queue_events
+                    WHERE trigger_event_hash IS NOT NULL
+                    """
+                )
+            ),
+            Decimal("0"),
+        )
+        latest_marks = self.connection.execute(
+            """
+            SELECT m.* FROM paper_inventory_marks AS m
+            JOIN (
+                SELECT asset_id,MAX(mark_id) AS mark_id
+                FROM paper_inventory_marks GROUP BY asset_id
+            ) AS latest ON latest.mark_id=m.mark_id
+            """
+        ).fetchall()
+        depth_profit = sum(
+            (Decimal(row["depth_adjusted_unrealized_profit_text"]) for row in latest_marks),
+            Decimal("0"),
+        )
+        depth_value = sum(
+            (
+                Decimal(row["liquidation_proceeds_text"])
+                - Decimal(row["liquidation_fee_text"])
+                for row in latest_marks
+            ),
+            Decimal("0"),
+        )
+        unliquidated = sum(
+            (Decimal(row["unliquidated_quantity_text"]) for row in latest_marks),
+            Decimal("0"),
+        )
+        fill_fee = sum(
+            (Decimal(row["fee_text"]) for row in self.connection.execute("SELECT fee_text FROM paper_fills")),
+            Decimal("0"),
+        )
+        liquidation_fee = sum(
+            (
+                Decimal(row["fee_text"])
+                for row in self.connection.execute("SELECT fee_text FROM paper_liquidations")
+            ),
+            Decimal("0"),
+        )
+        max_inventory = max(
+            [Decimal("0")]
+            + [
+                Decimal(row["position_quantity_after_text"])
+                for row in self.connection.execute(
+                    "SELECT position_quantity_after_text FROM paper_fills"
+                )
+            ]
+        )
+        return {
+            "official_trade_quantity": sum(trade_quantities, Decimal("0")),
+            "paper_order_count": len(order_rows),
+            "partial_fill_order_count": partial_orders,
+            "full_fill_order_count": full_orders,
+            "cancelled_order_count": sum(1 for row in order_rows if row["status"] == "CANCELLED"),
+            "average_initial_queue_ahead": (
+                sum(queue_initial, Decimal("0")) / len(queue_initial)
+                if queue_initial
+                else Decimal("0")
+            ),
+            "queue_consumed_quantity": queue_consumed,
+            "official_fees": fill_fee + liquidation_fee,
+            "depth_liquidation_value": depth_value,
+            "depth_adjusted_unrealized_profit": depth_profit,
+            "unliquidated_quantity": unliquidated,
+            "max_inventory": max_inventory,
+            "anomaly_count": self.paper_anomaly_count(),
+        }
 
     def paper_fill_rows(self) -> list[dict[str, str | int]]:
         rows = self.connection.execute(

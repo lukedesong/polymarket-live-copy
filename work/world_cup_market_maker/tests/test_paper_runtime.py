@@ -33,6 +33,9 @@ def params():
         maker_fee_bps=0,
         tick_size=Decimal("0.01"),
         outcomes={"asset-a": "Yes", "asset-b": "No"},
+        taker_fee_rate=Decimal("0.03"),
+        fee_exponent=1,
+        taker_only=True,
     )
 
 
@@ -64,6 +67,8 @@ def test_build_assets_uses_per_market_official_parameters():
 
     assert [asset.outcome for asset in assets] == ["Yes", "No"]
     assert all(asset.minimum_order_size == Decimal("5") for asset in assets)
+    assert all(asset.taker_fee_rate == Decimal("0.03") for asset in assets)
+    assert all(asset.fee_exponent == 1 for asset in assets)
 
 
 def test_market_events_create_orders_and_conservative_fills(tmp_path):
@@ -171,3 +176,77 @@ def test_no_new_inventory_boundary_creates_no_buy_order(tmp_path):
     asyncio.run(exercise())
 
     assert store.open_paper_orders() == []
+
+
+def test_queue_runtime_uses_official_side_and_quantity_for_partial_fill(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    sink = PaperRuntimeSink(
+        store,
+        "session-a",
+        [market()],
+        {"condition-a": params()},
+        fill_mode="queue",
+        now_fn=lambda: NOW,
+    )
+
+    async def exercise():
+        await sink.connected()
+        await sink.market_event(book())
+        await sink.market_event(
+            {
+                **trade("0.49"),
+                "size": "12",
+                "side": "SELL",
+            }
+        )
+
+    asyncio.run(exercise())
+
+    assert store.paper_fill_count() == 1
+    assert store.paper_position("asset-a").quantity == Decimal("2")
+    assert store.open_paper_orders("asset-a")[0].remaining_quantity == Decimal("3")
+    assert store.latest_session_summary()["selection_mode"] == "paper_frontier_queue"
+
+
+def test_queue_runtime_invalid_trade_evidence_is_recorded_without_fill(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    sink = PaperRuntimeSink(
+        store,
+        "session-a",
+        [market()],
+        {"condition-a": params()},
+        fill_mode="queue",
+        now_fn=lambda: NOW,
+    )
+
+    async def exercise():
+        await sink.connected()
+        await sink.market_event(book())
+        await sink.market_event({**trade("0.49"), "size": "bad", "side": ""})
+
+    asyncio.run(exercise())
+
+    assert store.paper_fill_count() == 0
+    assert store.paper_anomaly_count() == 1
+
+
+def test_queue_runtime_out_of_order_trade_is_recorded_without_fill(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    sink = PaperRuntimeSink(
+        store,
+        "session-a",
+        [market()],
+        {"condition-a": params()},
+        fill_mode="queue",
+        now_fn=lambda: NOW,
+    )
+
+    async def exercise():
+        await sink.connected()
+        await sink.market_event(book())
+        await sink.market_event({**trade("0.49"), "timestamp": "999", "size": "20"})
+
+    asyncio.run(exercise())
+
+    assert store.paper_fill_count() == 0
+    assert store.paper_anomaly_count() == 1

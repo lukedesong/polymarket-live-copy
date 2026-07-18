@@ -71,6 +71,15 @@ class PaperEngine:
                 cancelled_at=now,
             )
             return
+        if self.fill_mode == "queue" and (
+            asset.taker_fee_rate is None or asset.fee_exponent is None
+        ):
+            self.store.cancel_paper_orders(
+                asset_id=asset_id,
+                reason="official_fee_curve_missing",
+                cancelled_at=now,
+            )
+            return
         if (
             self.fill_mode == "queue"
             and asset.taker_fee_rate is not None

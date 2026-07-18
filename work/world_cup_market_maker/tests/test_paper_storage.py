@@ -290,3 +290,6 @@ def test_forced_liquidation_consumes_each_layer_once_and_keeps_depth_shortfall(t
     assert store.paper_position("asset-a").cost_basis == Decimal("1.00")
     assert store.paper_liquidation_count() == 2
     assert store.paper_account().sell_proceeds == first.net_proceeds
+    metrics = store.paper_metrics()
+    assert metrics["depth_adjusted_unrealized_profit"] == Decimal("0")
+    assert metrics["unliquidated_quantity"] == Decimal("2")
