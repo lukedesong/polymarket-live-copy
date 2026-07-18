@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     paper_run = commands.add_parser("paper-run")
     # User specified one hour at launch; seconds are formula-derived by the caller.
     paper_run.add_argument("--duration-seconds", type=int)
+    paper_run.add_argument(
+        "--fill-mode",
+        choices=("strict", "touch"),
+        default="strict",
+    )
     paper_run.set_defaults(cancel_enabled=False)
     commands.add_parser("paper-status")
     commands.add_parser("paper-export")
@@ -193,9 +198,13 @@ def run_replay(store: Store) -> dict[str, Any]:
 
 def build_paper_status(store: Store) -> dict[str, Any]:
     account = store.paper_account()
+    session = store.latest_session_summary()
+    selection_mode = str((session or {}).get("selection_mode") or "")
+    fill_mode = "touch" if selection_mode.endswith("_touch") else "strict"
     return {
         "mode": "paper_only",
-        "latest_session": store.latest_session_summary(),
+        "fill_mode": fill_mode,
+        "latest_session": session,
         "official_trade_events": store.trade_count(),
         "paper_fill_count": store.paper_fill_count(),
         "open_paper_order_count": len(store.open_paper_orders()),
@@ -229,6 +238,7 @@ async def run_paper_collection(
     markets: list[Any],
     *,
     duration_seconds: int | None,
+    fill_mode: str = "strict",
 ) -> dict[str, Any]:
     if duration_seconds is not None and duration_seconds <= 0:
         raise ValueError("duration_seconds_must_be_positive")
@@ -243,6 +253,7 @@ async def run_paper_collection(
         session_id,
         markets,
         params_by_condition,
+        fill_mode=fill_mode,
     )
     asset_ids = list(
         dict.fromkeys(token for market in markets for token in market.token_ids)
@@ -400,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                         store,
                         markets,
                         duration_seconds=args.duration_seconds,
+                        fill_mode=args.fill_mode,
                     )
                 )
             )

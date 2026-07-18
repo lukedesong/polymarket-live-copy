@@ -85,6 +85,30 @@ def test_market_events_create_orders_and_conservative_fills(tmp_path):
 
     assert store.paper_fill_count() == 1
     assert store.paper_position("asset-a").quantity == Decimal("5")
+    assert store.latest_session_summary()["selection_mode"] == "paper_frontier_strict"
+
+
+def test_touch_runtime_fills_equal_price_trade(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    sink = PaperRuntimeSink(
+        store,
+        "session-a",
+        [market()],
+        {"condition-a": params()},
+        fill_mode="touch",
+        now_fn=lambda: NOW,
+    )
+
+    async def exercise():
+        await sink.connected()
+        await sink.market_event(book())
+        await sink.market_event(trade("0.49"))
+
+    asyncio.run(exercise())
+
+    assert store.paper_fill_count() == 1
+    assert store.paper_position("asset-a").quantity == Decimal("5")
+    assert store.latest_session_summary()["selection_mode"] == "paper_frontier_touch"
 
 
 def test_disconnect_cancels_orders_and_invalidates_books(tmp_path):

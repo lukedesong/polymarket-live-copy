@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Literal, Mapping
 
 from .market_params import ClobMarketParams
 from .paper_engine import PaperAsset, PaperEngine
@@ -49,6 +49,7 @@ class PaperRuntimeSink:
         markets: Iterable[StoredMarket],
         params_by_condition: Mapping[str, ClobMarketParams],
         *,
+        fill_mode: Literal["strict", "touch"] = "strict",
         now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
@@ -60,8 +61,11 @@ class PaperRuntimeSink:
             for asset_id in market.token_ids
         }
         self.engine = PaperEngine(
-            store, build_paper_assets(self.markets, params_by_condition)
+            store,
+            build_paper_assets(self.markets, params_by_condition),
+            fill_mode=fill_mode,
         )
+        self.fill_mode = fill_mode
         self.now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.connected_flag = False
 
@@ -114,7 +118,7 @@ class PaperRuntimeSink:
     async def connected(self) -> None:
         self.store.start_session(
             self.session_id,
-            selection_mode="paper_frontier",
+            selection_mode=f"paper_frontier_{self.fill_mode}",
             started_at=self._now(),
         )
         self.connected_flag = True

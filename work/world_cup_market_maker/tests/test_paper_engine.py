@@ -17,9 +17,9 @@ ASSET = PaperAsset(
 )
 
 
-def engine(tmp_path):
+def engine(tmp_path, *, fill_mode="strict"):
     store = Store(tmp_path / "paper.sqlite3")
-    return store, PaperEngine(store, [ASSET])
+    return store, PaperEngine(store, [ASSET], fill_mode=fill_mode)
 
 
 def quote(paper: PaperEngine, *, state=RiskState.PREMATCH_OPEN):
@@ -54,6 +54,29 @@ def test_touch_does_not_fill_but_trade_through_does(tmp_path):
     assert len(fills) == 1
     assert store.paper_fill_count() == 1
     assert store.paper_position("asset-a").quantity == Decimal("5")
+
+
+def test_touch_mode_fills_buy_and_sell_at_equal_quote_price(tmp_path):
+    store, paper = engine(tmp_path, fill_mode="touch")
+    quote(paper)
+
+    assert len(trade(paper, "0.49", "buy-touch")) == 1
+    quote(paper)
+    assert len(trade(paper, "0.51", "sell-touch")) == 1
+
+    assert store.paper_fill_count() == 2
+    assert store.paper_position("asset-a").quantity == Decimal("0")
+
+
+def test_unsupported_fill_mode_is_rejected(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+
+    try:
+        PaperEngine(store, [ASSET], fill_mode="unknown")
+    except ValueError as error:
+        assert str(error) == "unsupported_fill_mode:unknown"
+    else:
+        raise AssertionError("unsupported fill mode was accepted")
 
 
 def test_sell_only_fills_above_ask_and_cannot_create_short(tmp_path):

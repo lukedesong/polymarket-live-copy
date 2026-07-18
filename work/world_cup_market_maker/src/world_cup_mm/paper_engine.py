@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Iterable
+from typing import Iterable, Literal
 
 from .risk import RiskState
 from .storage import PaperOrder, Store
@@ -20,9 +20,18 @@ class PaperAsset:
 
 
 class PaperEngine:
-    def __init__(self, store: Store, assets: Iterable[PaperAsset]) -> None:
+    def __init__(
+        self,
+        store: Store,
+        assets: Iterable[PaperAsset],
+        *,
+        fill_mode: Literal["strict", "touch"] = "strict",
+    ) -> None:
+        if fill_mode not in {"strict", "touch"}:
+            raise ValueError(f"unsupported_fill_mode:{fill_mode}")
         self.store = store
         self.assets = {asset.asset_id: asset for asset in assets}
+        self.fill_mode = fill_mode
         self.connected = True
 
     def on_book(
@@ -82,11 +91,18 @@ class PaperEngine:
         for order in self.store.open_paper_orders(asset_id):
             if order.side not in allowed_sides:
                 continue
-            crosses = (
-                order.side == "BUY" and trade_price < order.price
-            ) or (
-                order.side == "SELL" and trade_price > order.price
-            )
+            if self.fill_mode == "touch":
+                crosses = (
+                    order.side == "BUY" and trade_price <= order.price
+                ) or (
+                    order.side == "SELL" and trade_price >= order.price
+                )
+            else:
+                crosses = (
+                    order.side == "BUY" and trade_price < order.price
+                ) or (
+                    order.side == "SELL" and trade_price > order.price
+                )
             if not crosses:
                 continue
             if self.store.apply_paper_fill(

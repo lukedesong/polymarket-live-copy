@@ -6,6 +6,7 @@ import pytest
 
 from world_cup_mm.cli import (
     StoreSink,
+    build_paper_status,
     build_parser,
     build_status,
     make_order_control,
@@ -61,13 +62,27 @@ def test_parser_defaults_to_data_only_frontier_collection():
 
 def test_parser_exposes_paper_only_runtime_commands():
     run = build_parser().parse_args(["paper-run", "--duration-seconds", "3600"])
+    touch = build_parser().parse_args(["paper-run", "--fill-mode", "touch"])
     status = build_parser().parse_args(["paper-status"])
     export = build_parser().parse_args(["paper-export"])
 
     assert run.duration_seconds == 3600
+    assert run.fill_mode == "strict"
     assert run.cancel_enabled is False
+    assert touch.fill_mode == "touch"
     assert status.command == "paper-status"
     assert export.command == "paper-export"
+
+
+def test_paper_status_reports_fill_mode_from_session(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    store.start_session(
+        "session-a",
+        selection_mode="paper_frontier_touch",
+        started_at=NOW,
+    )
+
+    assert build_paper_status(store)["fill_mode"] == "touch"
 
 
 def test_run_scan_persists_ranked_manifest_without_fixed_liquidity_cutoff(tmp_path):
