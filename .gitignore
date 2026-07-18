@@ -24,3 +24,6 @@ work/CloddsBot/node_modules/
 
 # New World Cup collector runtime data
 data/
+
+# Isolated feature workspaces
+.worktrees/
