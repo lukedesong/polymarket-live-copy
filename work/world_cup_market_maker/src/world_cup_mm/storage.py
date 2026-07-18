@@ -988,6 +988,23 @@ class Store:
     def paper_fill_count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM paper_fills").fetchone()[0])
 
+    def paper_fill_rows(self) -> list[dict[str, str | int]]:
+        rows = self.connection.execute(
+            """
+            SELECT f.fill_id,f.filled_at,o.condition_id,o.market_id,o.asset_id,o.outcome,
+                   o.side,f.fill_price_text,f.quantity_text,f.gross_amount_text,
+                   f.fee_text,f.trigger_price_text,f.position_quantity_after_text,
+                   f.realized_profit_after_text
+            FROM paper_fills AS f
+            JOIN paper_orders AS o ON o.order_id=f.order_id
+            ORDER BY f.fill_id
+            """
+        ).fetchall()
+        return [
+            {key: int(row[key]) if key == "fill_id" else str(row[key]) for key in row.keys()}
+            for row in rows
+        ]
+
     def paper_account(self) -> PaperAccount:
         cash_rows = self.connection.execute(
             """

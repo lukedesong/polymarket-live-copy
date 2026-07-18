@@ -23,6 +23,8 @@ from .discovery import (
     ranked_markets,
 )
 from .order_control import AuthenticatedOrderControl, RecordingOrderControl
+from .market_params import ClobMarketParamsClient
+from .paper_runtime import PaperRuntimeSink
 from .risk import RiskContext, RiskState, evaluate_risk
 from .runtime import RiskRuntime, monitor_risk
 from .storage import Store, replay_events
@@ -58,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--max-messages", type=int)
     commands.add_parser("status")
     commands.add_parser("replay")
+    paper_run = commands.add_parser("paper-run")
+    # User specified one hour at launch; seconds are formula-derived by the caller.
+    paper_run.add_argument("--duration-seconds", type=int)
+    paper_run.set_defaults(cancel_enabled=False)
+    commands.add_parser("paper-status")
+    commands.add_parser("paper-export")
     return parser
 
 
@@ -183,6 +191,81 @@ def run_replay(store: Store) -> dict[str, Any]:
     }
 
 
+def build_paper_status(store: Store) -> dict[str, Any]:
+    account = store.paper_account()
+    return {
+        "mode": "paper_only",
+        "latest_session": store.latest_session_summary(),
+        "official_trade_events": store.trade_count(),
+        "paper_fill_count": store.paper_fill_count(),
+        "open_paper_order_count": len(store.open_paper_orders()),
+        "buy_cost": str(account.buy_cost),
+        "sell_proceeds": str(account.sell_proceeds),
+        "realized_profit": str(account.realized_profit),
+        "unrealized_profit": str(account.unrealized_profit),
+        "total_profit": str(account.total_profit),
+        "positions": [
+            {
+                "market_id": position.market_id,
+                "asset_id": position.asset_id,
+                "outcome": position.outcome,
+                "quantity": str(position.quantity),
+                "average_cost": str(position.average_cost),
+                "mark_price": str(position.mark_price),
+                "realized_profit": str(position.realized_profit),
+                "unrealized_profit": str(position.unrealized_profit),
+            }
+            for position in store.paper_positions()
+        ],
+    }
+
+
+def build_paper_export(store: Store) -> dict[str, Any]:
+    return {"overview": build_paper_status(store), "fills": store.paper_fill_rows()}
+
+
+async def run_paper_collection(
+    store: Store,
+    markets: list[Any],
+    *,
+    duration_seconds: int | None,
+) -> dict[str, Any]:
+    if duration_seconds is not None and duration_seconds <= 0:
+        raise ValueError("duration_seconds_must_be_positive")
+    params_client = ClobMarketParamsClient()
+    params_by_condition = {
+        market.condition_id: params_client.fetch(market.condition_id)
+        for market in markets
+    }
+    session_id = str(uuid.uuid4())
+    sink = PaperRuntimeSink(
+        store,
+        session_id,
+        markets,
+        params_by_condition,
+    )
+    asset_ids = list(
+        dict.fromkeys(token for market in markets for token in market.token_ids)
+    )
+    collector = collect_market_and_sports(asset_ids, sink)
+    timed_out = False
+    if duration_seconds is None:
+        message_count = await collector
+    else:
+        try:
+            message_count = await asyncio.wait_for(collector, timeout=duration_seconds)
+        except TimeoutError:
+            timed_out = True
+            message_count = store.raw_event_count()
+    return {
+        "session_id": session_id,
+        "mode": "paper_only",
+        "duration_complete": timed_out,
+        "message_count": message_count,
+        "paper": build_paper_status(store),
+    }
+
+
 def make_order_control(*, cancel_enabled: bool, env: Mapping[str, str]):
     if not cancel_enabled:
         return RecordingOrderControl()
@@ -297,6 +380,29 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "replay":
             _print_json(run_replay(store))
+            return 0
+        if args.command == "paper-status":
+            _print_json(build_paper_status(store))
+            return 0
+        if args.command == "paper-export":
+            _print_json(build_paper_export(store))
+            return 0
+        if args.command == "paper-run":
+            markets = store.selected_markets(all_eligible=False)
+            if not markets:
+                run_scan(store, GammaClient())
+                markets = store.selected_markets(all_eligible=False)
+            if not markets:
+                raise RuntimeError("no_world_cup_frontier_markets")
+            _print_json(
+                asyncio.run(
+                    run_paper_collection(
+                        store,
+                        markets,
+                        duration_seconds=args.duration_seconds,
+                    )
+                )
+            )
             return 0
         if args.command == "collect":
             order_control = make_order_control(

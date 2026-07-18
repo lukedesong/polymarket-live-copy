@@ -59,6 +59,17 @@ def test_parser_defaults_to_data_only_frontier_collection():
     assert args.max_messages is None
 
 
+def test_parser_exposes_paper_only_runtime_commands():
+    run = build_parser().parse_args(["paper-run", "--duration-seconds", "3600"])
+    status = build_parser().parse_args(["paper-status"])
+    export = build_parser().parse_args(["paper-export"])
+
+    assert run.duration_seconds == 3600
+    assert run.cancel_enabled is False
+    assert status.command == "paper-status"
+    assert export.command == "paper-export"
+
+
 def test_run_scan_persists_ranked_manifest_without_fixed_liquidity_cutoff(tmp_path):
     store = Store(tmp_path / "market.sqlite3")
 
