@@ -31,6 +31,20 @@ def test_parse_clob_market_info_uses_official_minimum_and_maker_fee():
     assert result.outcomes == {"yes": "Yes"}
 
 
+def test_taker_only_fee_curve_keeps_paper_maker_fee_at_zero():
+    result = parse_clob_market_info(
+        {
+            "mos": 5,
+            "mbf": 1000,
+            "mts": 0.01,
+            "fd": {"r": 0.05, "e": 1, "to": True},
+            "t": [{"t": "yes", "o": "Yes"}],
+        }
+    )
+
+    assert result.maker_fee_bps == 0
+
+
 @pytest.mark.parametrize(
     "payload,error",
     [

@@ -34,10 +34,16 @@ def parse_clob_market_info(payload: Mapping[str, Any]) -> ClobMarketParams:
         raise ValueError("invalid_minimum_order_size")
     if tick <= 0:
         raise ValueError("invalid_tick_size")
+    fee_details = payload.get("fd")
+    taker_only = isinstance(fee_details, Mapping) and fee_details.get("to") is True
     try:
-        maker_fee = int(payload.get("mbf"))
+        raw_maker_fee = int(payload.get("mbf"))
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid_maker_fee") from exc
+    # CLOB V2 fee details are authoritative for platform fees. When `to` is
+    # true, Polymarket documents that makers pay zero platform fee even though
+    # the market response may expose non-zero base/builder fee fields.
+    maker_fee = 0 if taker_only else raw_maker_fee
     if maker_fee != 0:
         raise ValueError("nonzero_maker_fee")
     outcomes = {
