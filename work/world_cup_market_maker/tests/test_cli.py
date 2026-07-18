@@ -12,6 +12,7 @@ from world_cup_mm.cli import (
     make_order_control,
     run_replay,
     run_scan,
+    main,
 )
 from world_cup_mm.storage import Store
 
@@ -105,6 +106,49 @@ def test_queue_paper_status_is_authoritative_and_exposes_queue_metrics(tmp_path)
     assert status["partial_fill_order_count"] == 0
     assert status["full_fill_order_count"] == 0
     assert status["unliquidated_quantity"] == "0"
+
+
+def test_paper_run_command_never_enters_authenticated_order_control(
+    tmp_path, monkeypatch
+):
+    selected = object()
+    called = {"paper": False}
+
+    monkeypatch.setattr(
+        "world_cup_mm.cli.Store.selected_markets",
+        lambda self, *, all_eligible: [selected],
+    )
+
+    async def fake_paper_collection(
+        store, markets, *, duration_seconds, fill_mode
+    ):
+        called["paper"] = True
+        assert markets == [selected]
+        assert fill_mode == "queue"
+        return {"mode": "paper_only"}
+
+    monkeypatch.setattr(
+        "world_cup_mm.cli.run_paper_collection", fake_paper_collection
+    )
+    monkeypatch.setattr(
+        "world_cup_mm.cli.make_order_control",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("authenticated order control entered")
+        ),
+    )
+
+    result = main(
+        [
+            "--database",
+            str(tmp_path / "paper.sqlite3"),
+            "paper-run",
+            "--duration-seconds",
+            "1",
+        ]
+    )
+
+    assert result == 0
+    assert called["paper"] is True
 
 
 def test_run_scan_persists_ranked_manifest_without_fixed_liquidity_cutoff(tmp_path):

@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from world_cup_mm.market_params import ClobMarketParams
 from world_cup_mm.paper_runtime import PaperRuntimeSink, build_paper_assets
+from world_cup_mm.cli import build_paper_export
 from world_cup_mm.storage import Store, StoredMarket
 
 
@@ -250,3 +251,90 @@ def test_queue_runtime_out_of_order_trade_is_recorded_without_fill(tmp_path):
 
     assert store.paper_fill_count() == 0
     assert store.paper_anomaly_count() == 1
+
+
+def test_queue_runtime_replays_partial_reprice_trade_through_and_depth_exit(tmp_path):
+    store = Store(tmp_path / "paper.sqlite3")
+    current = {"now": NOW}
+    selected = market(NOW + timedelta(hours=1))
+    sink = PaperRuntimeSink(
+        store,
+        "session-a",
+        [selected],
+        {"condition-a": params()},
+        fill_mode="queue",
+        now_fn=lambda: current["now"],
+    )
+
+    async def exercise():
+        await sink.connected()
+        await sink.market_event(book())
+        await sink.market_event({**trade("0.49"), "size": "12", "side": "SELL"})
+        await sink.market_event(
+            {
+                "event_type": "price_change",
+                "market": "condition-a",
+                "timestamp": "1002",
+                "price_changes": [
+                    {
+                        "asset_id": "asset-a",
+                        "price": "0.48",
+                        "size": "7",
+                        "side": "BUY",
+                        "best_bid": "0.48",
+                        "best_ask": "0.51",
+                    },
+                    {
+                        "asset_id": "asset-a",
+                        "price": "0.49",
+                        "size": "0",
+                        "side": "BUY",
+                        "best_bid": "0.48",
+                        "best_ask": "0.51",
+                    },
+                ],
+            }
+        )
+        await sink.market_event(
+            {**trade("0.47"), "size": "1", "side": "SELL", "timestamp": "1003"}
+        )
+        current["now"] = selected.game_start_time - timedelta(minutes=5)
+        await sink.market_event(
+            {
+                "event_type": "book",
+                "asset_id": "asset-a",
+                "market": "condition-a",
+                "timestamp": "1004",
+                "bids": [
+                    {"price": "0.47", "size": "4"},
+                    {"price": "0.46", "size": "1"},
+                ],
+                "asks": [{"price": "0.49", "size": "4"}],
+            }
+        )
+
+    asyncio.run(exercise())
+
+    export = build_paper_export(store)
+    overview = export["overview"]
+    fills = export["fills"]
+    independent_buy_cost = sum(
+        Decimal(row["gross_amount_text"])
+        for row in fills
+        if row["side"] == "BUY"
+    )
+    independent_liquidation_net = sum(
+        Decimal(row["gross_proceeds_text"]) - Decimal(row["fee_text"])
+        for row in store.connection.execute(
+            "SELECT gross_proceeds_text,fee_text FROM paper_liquidations"
+        )
+    )
+
+    assert overview["authoritative"] is True
+    assert overview["partial_fill_order_count"] == 1
+    assert overview["full_fill_order_count"] == 1
+    assert overview["unliquidated_quantity"] == "2"
+    assert overview["buy_cost"] == str(independent_buy_cost)
+    assert overview["sell_proceeds"] == str(independent_liquidation_net)
+    assert len(fills) == 2
+    assert {row["proof_type"] for row in fills} == {"AT_PRICE_QUEUE", "TRADE_THROUGH"}
