@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .models import EligibleMarket, RejectedMarket, parse_utc_datetime
 from .orderbook import BookNotReady, OrderBookState
 
 
@@ -53,6 +55,7 @@ CREATE TABLE IF NOT EXISTS assets (
     scan_id TEXT NOT NULL,
     market_id TEXT NOT NULL,
     token_id TEXT NOT NULL,
+    token_index INTEGER NOT NULL,
     PRIMARY KEY (scan_id, market_id, token_id),
     FOREIGN KEY (scan_id, market_id) REFERENCES markets(scan_id, market_id)
 );
@@ -157,6 +160,22 @@ def _canonical(payload: Mapping[str, Any]) -> tuple[str, str]:
     return text, hashlib.sha256(text.encode()).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class StoredMarket:
+    scan_id: str
+    market_id: str
+    event_id: str
+    event_slug: str
+    question: str
+    market_slug: str
+    condition_id: str
+    token_ids: tuple[str, ...]
+    game_start_time: datetime
+    liquidity_text: str
+    volume_24h_text: str
+    frontier: bool
+
+
 class Store:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -168,6 +187,155 @@ class Store:
 
     def close(self) -> None:
         self.connection.close()
+
+    def record_scan(
+        self,
+        scan_id: str,
+        *,
+        events: Iterable[Mapping[str, Any]],
+        eligible: Iterable[EligibleMarket],
+        rejected: Iterable[RejectedMarket],
+        started_at: datetime,
+        completed_at: datetime,
+        source_url: str,
+    ) -> None:
+        eligible_items = list(eligible)
+        rejected_items = list(rejected)
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO scan_runs(
+                    scan_id,started_at,completed_at,status,source_url,selection_mode
+                ) VALUES(?,?,?,'complete',?,'frontier')
+                """,
+                (scan_id, _iso(started_at), _iso(completed_at), source_url),
+            )
+            self.connection.executemany(
+                "INSERT INTO events(scan_id,event_id,title,slug,payload_json) VALUES(?,?,?,?,?)",
+                (
+                    (
+                        scan_id,
+                        str(event.get("id") or ""),
+                        str(event.get("title") or ""),
+                        str(event.get("slug") or ""),
+                        json.dumps(event, sort_keys=True, ensure_ascii=False),
+                    )
+                    for event in events
+                    if event.get("id")
+                ),
+            )
+            for market in eligible_items:
+                self.connection.execute(
+                    """
+                    INSERT INTO markets(
+                        scan_id,market_id,event_id,question,slug,condition_id,game_start_time,
+                        liquidity_text,volume_24h_text,eligible,frontier,rejection_reasons_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,1,?, '[]')
+                    """,
+                    (
+                        scan_id,
+                        market.market_id,
+                        market.event_id,
+                        market.question,
+                        market.market_slug,
+                        market.condition_id,
+                        market.game_start_time.isoformat(),
+                        str(market.liquidity),
+                        str(market.volume_24h),
+                        int(market.frontier),
+                    ),
+                )
+                self.connection.executemany(
+                    "INSERT INTO assets(scan_id,market_id,token_id,token_index) VALUES(?,?,?,?)",
+                    (
+                        (scan_id, market.market_id, token_id, index)
+                        for index, token_id in enumerate(market.token_ids)
+                    ),
+                )
+            for market in rejected_items:
+                storage_market_id = market.market_id or f"event:{market.event_id}"
+                self.connection.execute(
+                    """
+                    INSERT INTO markets(
+                        scan_id,market_id,event_id,question,slug,condition_id,game_start_time,
+                        liquidity_text,volume_24h_text,eligible,frontier,rejection_reasons_json
+                    ) VALUES(?,?,?,?, '',NULL,NULL,'0','0',0,0,?)
+                    """,
+                    (
+                        scan_id,
+                        storage_market_id,
+                        market.event_id,
+                        market.question,
+                        json.dumps(market.reasons),
+                    ),
+                )
+
+    def latest_scan_summary(self) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT scan_id FROM scan_runs WHERE status='complete' ORDER BY completed_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        scan_id = str(row["scan_id"])
+        counts = self.connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN eligible=1 THEN 1 ELSE 0 END) AS eligible_count,
+                SUM(CASE WHEN frontier=1 THEN 1 ELSE 0 END) AS frontier_count,
+                SUM(CASE WHEN eligible=0 THEN 1 ELSE 0 END) AS rejected_count
+            FROM markets WHERE scan_id=?
+            """,
+            (scan_id,),
+        ).fetchone()
+        return {
+            "scan_id": scan_id,
+            "eligible_count": int(counts["eligible_count"] or 0),
+            "frontier_count": int(counts["frontier_count"] or 0),
+            "rejected_count": int(counts["rejected_count"] or 0),
+        }
+
+    def selected_markets(self, *, all_eligible: bool) -> list[StoredMarket]:
+        summary = self.latest_scan_summary()
+        if summary is None:
+            return []
+        scan_id = str(summary["scan_id"])
+        frontier_clause = "" if all_eligible else "AND m.frontier=1"
+        rows = self.connection.execute(
+            f"""
+            SELECT m.*, e.slug AS event_slug FROM markets AS m
+            JOIN events AS e ON e.scan_id=m.scan_id AND e.event_id=m.event_id
+            WHERE m.scan_id=? AND m.eligible=1 {frontier_clause}
+            ORDER BY m.frontier DESC, CAST(m.liquidity_text AS REAL) DESC,
+                     CAST(m.volume_24h_text AS REAL) DESC, m.market_id
+            """,
+            (scan_id,),
+        ).fetchall()
+        result: list[StoredMarket] = []
+        for row in rows:
+            token_ids = tuple(
+                str(token["token_id"])
+                for token in self.connection.execute(
+                    "SELECT token_id FROM assets WHERE scan_id=? AND market_id=? ORDER BY token_index",
+                    (scan_id, row["market_id"]),
+                )
+            )
+            result.append(
+                StoredMarket(
+                    scan_id=scan_id,
+                    market_id=str(row["market_id"]),
+                    event_id=str(row["event_id"]),
+                    event_slug=str(row["event_slug"]),
+                    question=str(row["question"]),
+                    market_slug=str(row["slug"]),
+                    condition_id=str(row["condition_id"]),
+                    token_ids=token_ids,
+                    game_start_time=parse_utc_datetime(row["game_start_time"]),
+                    liquidity_text=str(row["liquidity_text"]),
+                    volume_24h_text=str(row["volume_24h_text"]),
+                    frontier=bool(row["frontier"]),
+                )
+            )
+        return result
 
     def start_session(
         self,
@@ -384,6 +552,99 @@ class Store:
                 (session_id,),
             )
         ]
+
+    def latest_session_summary(self) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT session_id,selection_mode,started_at,ended_at,connected
+            FROM collector_sessions ORDER BY started_at DESC,rowid DESC LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "session_id": str(row["session_id"]),
+            "selection_mode": str(row["selection_mode"]),
+            "started_at": str(row["started_at"]),
+            "ended_at": str(row["ended_at"]) if row["ended_at"] else None,
+            "connected": bool(row["connected"]),
+        }
+
+    def record_sports_event(
+        self,
+        session_id: str,
+        payload: Mapping[str, Any],
+        *,
+        received_at: datetime | None = None,
+    ) -> bool:
+        canonical, event_hash = _canonical(payload)
+        with self.connection:
+            inserted = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO sports_status(
+                    session_id,event_hash,slug,live,ended,status,received_at,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    session_id,
+                    event_hash,
+                    str(payload.get("slug") or "") or None,
+                    int(bool(payload.get("live"))),
+                    int(bool(payload.get("ended"))),
+                    str(payload.get("status") or "") or None,
+                    _iso(received_at),
+                    canonical,
+                ),
+            ).rowcount
+        return bool(inserted)
+
+    def latest_sports_live(self, slug: str) -> bool:
+        row = self.connection.execute(
+            "SELECT live FROM sports_status WHERE slug=? ORDER BY rowid DESC LIMIT 1",
+            (slug,),
+        ).fetchone()
+        return bool(row and row["live"])
+
+    def record_risk_decision(
+        self,
+        decision: Any,
+        *,
+        decided_at: datetime,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO risk_decisions(
+                    condition_id,decided_at,state,reason,seconds_to_start
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    decision.market_condition_id,
+                    _iso(decided_at),
+                    decision.state.value,
+                    decision.reason,
+                    decision.seconds_to_start,
+                ),
+            )
+
+    def record_risk_action(
+        self,
+        condition_id: str,
+        action: str,
+        delivery_status: str,
+        *,
+        created_at: datetime,
+        detail: str | None = None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO risk_actions(
+                    condition_id,created_at,action,delivery_status,detail
+                ) VALUES(?,?,?,?,?)
+                """,
+                (condition_id, _iso(created_at), action, delivery_status, detail),
+            )
 
 
 def replay_events(events: Iterable[Mapping[str, Any]]) -> dict[str, OrderBookState]:
