@@ -17,6 +17,7 @@ from wallet_copy_paper import (
     PublicClient,
     ReadOnlyViolation,
     SourceAction,
+    TrackerRuntime,
     TradeRow,
     build_status,
     decide,
@@ -259,3 +260,100 @@ def test_status_and_reports_keep_observed_and_paper_evidence_separate(tmp_path: 
     assert (tmp_path / "ledger.csv").read_text().count("\n") == 2
     with sqlite3.connect(tmp_path / "paper.sqlite3") as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+class FakeClient:
+    def __init__(self):
+        self.rows = {account.wallet: [row(wallet=account.wallet, transaction_hash="0xold")] for account in ACCOUNTS}
+        self.current_book = book(timestamp=301)
+
+    def trades(self, wallet: str):
+        return list(self.rows[wallet])
+
+    def book(self, asset: str):
+        assert asset == "asset-a"
+        return self.current_book
+
+    def market_params(self, condition_id: str):
+        assert condition_id == "condition-a"
+        return params()
+
+
+def test_runtime_seeds_history_then_processes_only_new_source_actions(tmp_path: Path):
+    store = PaperStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    client = FakeClient()
+    runtime = TrackerRuntime(store, client, tmp_path)
+
+    first = runtime.run_once(now=150)
+
+    assert first["seeded_accounts"] == 3
+    assert store.paper_fill_count() == 0
+    for account in ACCOUNTS:
+        client.rows[account.wallet].append(
+            row(
+                wallet=account.wallet,
+                transaction_hash=f"0xnew-{account.account_id}",
+                timestamp=200,
+            )
+        )
+
+    second = runtime.run_once(now=202)
+
+    assert second["processed"] == 3
+    assert second["filled"] == 3
+    assert store.paper_fill_count() == 3
+    assert all(item["paper_fills"] == 1 for item in build_status(store, heartbeat=second)["accounts"])
+
+
+def test_runtime_refreshes_open_positions_at_executable_bid_depth(tmp_path: Path):
+    store = PaperStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    client = FakeClient()
+    runtime = TrackerRuntime(store, client, tmp_path)
+    runtime.run_once(now=150)
+    client.rows[ACCOUNTS[0].wallet].append(
+        row(transaction_hash="0xnew", timestamp=200)
+    )
+
+    runtime.run_once(now=202)
+
+    russell = build_status(store, heartbeat={})["accounts"][0]
+    assert russell["executable_position_value"] == "2.75"
+    assert russell["executable_equity"] == "99.95"
+    assert russell["paper_pnl"] == "-0.05"
+    assert (tmp_path / "status.html").exists()
+
+
+def test_position_aggregation_never_round_trips_through_binary_float(tmp_path: Path):
+    store = PaperStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    for transaction_hash, minimum in (("0xsmall-a", "0.1"), ("0xsmall-b", "0.2")):
+        source = group_trade_rows([row(transaction_hash=transaction_hash)])[0]
+        current_book = Book(
+            asset="asset-a",
+            condition_id="condition-a",
+            timestamp=101,
+            book_hash=transaction_hash,
+            min_order_size=Decimal(minimum),
+            bids=(BookLevel(Decimal("0.5"), Decimal("1")),),
+            asks=(BookLevel(Decimal("0.5"), Decimal("1")),),
+        )
+        market_params = MarketParams(
+            condition_id="condition-a",
+            min_order_size=Decimal(minimum),
+            fee_rate=Decimal("0"),
+            fee_exponent=2,
+        )
+        decision = decide(
+            source,
+            current_book,
+            market_params,
+            cash=store.cash("russell"),
+            position=store.position("russell", "asset-a"),
+        )
+        store.apply(
+            "russell", source, current_book, market_params, decision, observed_at=102
+        )
+
+    assert store.open_positions()[0]["quantity"] == Decimal("0.3")

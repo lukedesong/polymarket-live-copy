@@ -515,6 +515,12 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def decimal_text(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
 class PaperStore:
     def __init__(self, path: Path | str):
         self.path = Path(path)
@@ -740,6 +746,89 @@ class PaperStore:
     def paper_fill_count(self) -> int:
         return int(self.connection.execute("SELECT COUNT(*) FROM fills").fetchone()[0])
 
+    def get_meta(self, key: str) -> str | None:
+        row = self.connection.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO meta(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (key, value),
+            )
+
+    def open_positions(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT account_id,asset_id,condition_id,title,outcome,slug,quantity_open_text
+            FROM lots
+            ORDER BY account_id,asset_id
+            """
+        )
+        grouped: dict[tuple[str, str, str, str, str, str], Decimal] = {}
+        for row in rows:
+            key = (
+                row["account_id"],
+                row["asset_id"],
+                row["condition_id"],
+                row["title"],
+                row["outcome"],
+                row["slug"],
+            )
+            grouped[key] = grouped.get(key, Decimal("0")) + Decimal(
+                row["quantity_open_text"]
+            )
+        return [
+            {
+                "account_id": key[0],
+                "asset": key[1],
+                "condition_id": key[2],
+                "title": key[3],
+                "outcome": key[4],
+                "slug": key[5],
+                "quantity": quantity,
+            }
+            for key, quantity in grouped.items()
+            if quantity > 0
+        ]
+
+    def update_mark(
+        self,
+        *,
+        account_id: str,
+        asset: str,
+        quantity: Decimal,
+        executable_value: Decimal,
+        unliquidated_quantity: Decimal,
+        marked_at: int,
+        book_hash: str,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO marks(
+                  account_id,asset_id,quantity_text,executable_value_text,
+                  unliquidated_quantity_text,marked_at,book_hash
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(account_id,asset_id) DO UPDATE SET
+                  quantity_text=excluded.quantity_text,
+                  executable_value_text=excluded.executable_value_text,
+                  unliquidated_quantity_text=excluded.unliquidated_quantity_text,
+                  marked_at=excluded.marked_at,
+                  book_hash=excluded.book_hash
+                """,
+                (
+                    account_id,
+                    asset,
+                    str(quantity),
+                    str(executable_value),
+                    str(unliquidated_quantity),
+                    marked_at,
+                    book_hash,
+                ),
+            )
+
     def account_summaries(self) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
         for account in ACCOUNTS:
@@ -755,28 +844,18 @@ class PaperStore:
                     "SELECT COUNT(*) FROM fills WHERE account_id=?", (account.account_id,)
                 ).fetchone()[0]
             )
-            positions = []
-            for row in self.connection.execute(
-                """
-                SELECT asset_id,condition_id,title,outcome,slug,
-                       SUM(CAST(quantity_open_text AS REAL)) AS quantity
-                FROM lots WHERE account_id=?
-                GROUP BY asset_id,condition_id,title,outcome,slug
-                HAVING quantity>0
-                ORDER BY title,outcome
-                """,
-                (account.account_id,),
-            ):
-                positions.append(
-                    {
-                        "asset": row["asset_id"],
-                        "condition_id": row["condition_id"],
-                        "title": row["title"],
-                        "outcome": row["outcome"],
-                        "slug": row["slug"],
-                        "quantity": str(Decimal(str(row["quantity"]))),
-                    }
-                )
+            positions = [
+                {
+                    "asset": item["asset"],
+                    "condition_id": item["condition_id"],
+                    "title": item["title"],
+                    "outcome": item["outcome"],
+                    "slug": item["slug"],
+                    "quantity": decimal_text(Decimal(item["quantity"])),
+                }
+                for item in self.open_positions()
+                if item["account_id"] == account.account_id
+            ]
             mark_value = sum(
                 (
                     Decimal(row[0])
@@ -793,12 +872,12 @@ class PaperStore:
                     "account_id": account.account_id,
                     "username": account.username,
                     "wallet": account.wallet,
-                    "starting_cash": str(account.starting_cash),
-                    "cash": str(cash),
-                    "executable_position_value": str(mark_value),
-                    "executable_equity": str(cash + mark_value),
-                    "paper_pnl": str(cash + mark_value - account.starting_cash),
-                    "realized_pnl": str(self.realized_pnl(account.account_id)),
+                    "starting_cash": decimal_text(account.starting_cash),
+                    "cash": decimal_text(cash),
+                    "executable_position_value": decimal_text(mark_value),
+                    "executable_equity": decimal_text(cash + mark_value),
+                    "paper_pnl": decimal_text(cash + mark_value - account.starting_cash),
+                    "realized_pnl": decimal_text(self.realized_pnl(account.account_id)),
                     "source_actions": source_actions,
                     "paper_fills": fills,
                     "positions": positions,
@@ -923,3 +1002,117 @@ def write_reports(
 <p>开放持仓使用最近一次可执行买盘估值；结算前不是最终输赢。</p>""" + "".join(cards) + "</main></html>"
     _atomic_text(root / "status.html", page)
     return status
+
+
+class TrackerRuntime:
+    def __init__(
+        self,
+        store: PaperStore,
+        client: PublicClient,
+        output_dir: Path | str,
+    ):
+        self.store = store
+        self.client = client
+        self.output_dir = Path(output_dir)
+
+    def run_once(self, *, now: int) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "state": "running",
+            "updated_at": now,
+            "seeded_accounts": 0,
+            "processed": 0,
+            "filled": 0,
+            "skipped": 0,
+            "errors": [],
+        }
+        for account in ACCOUNTS:
+            try:
+                actions = group_trade_rows(self.client.trades(account.wallet))
+                seed_key = f"seeded:{account.account_id}"
+                if self.store.get_meta(seed_key) is None:
+                    self.store.seed(account.account_id, actions, observed_at=now)
+                    self.store.set_meta(seed_key, str(now))
+                    summary["seeded_accounts"] += 1
+                    continue
+                for source in actions:
+                    if self.store.has_source(source.identity):
+                        continue
+                    try:
+                        current_book = self.client.book(source.asset)
+                        market_params = self.client.market_params(source.condition_id)
+                        decision = decide(
+                            source,
+                            current_book,
+                            market_params,
+                            cash=self.store.cash(account.account_id),
+                            position=self.store.position(account.account_id, source.asset),
+                        )
+                        if self.store.apply(
+                            account.account_id,
+                            source,
+                            current_book,
+                            market_params,
+                            decision,
+                            observed_at=now,
+                        ):
+                            summary["processed"] += 1
+                            if decision.result == "FILLED":
+                                summary["filled"] += 1
+                            else:
+                                summary["skipped"] += 1
+                    except Exception as error:  # keep other wallets running
+                        summary["errors"].append(
+                            f"action:{account.account_id}:{source.identity}:{type(error).__name__}:{error}"
+                        )
+            except Exception as error:  # a wallet feed failure must not stop peers
+                summary["errors"].append(
+                    f"wallet:{account.account_id}:{type(error).__name__}:{error}"
+                )
+        self.refresh_marks(now=now, errors=summary["errors"])
+        if summary["errors"]:
+            summary["state"] = "degraded"
+        write_reports(self.store, self.output_dir, heartbeat=summary)
+        return summary
+
+    def refresh_marks(self, *, now: int, errors: list[str]) -> None:
+        books: dict[str, Book] = {}
+        market_params: dict[str, MarketParams] = {}
+        for position in self.store.open_positions():
+            try:
+                asset = str(position["asset"])
+                condition_id = str(position["condition_id"])
+                if asset not in books:
+                    books[asset] = self.client.book(asset)
+                current_book = books[asset]
+                if condition_id not in market_params:
+                    market_params[condition_id] = self.client.market_params(condition_id)
+                params = market_params[condition_id]
+                quantity = Decimal(position["quantity"])
+                walked = None
+                if quantity >= params.min_order_size:
+                    walked = _walk(
+                        current_book.bids,
+                        quantity,
+                        fee_rate=params.fee_rate,
+                        exponent=params.fee_exponent,
+                    )
+                if walked is None:
+                    value = Decimal("0")
+                    unliquidated = quantity
+                else:
+                    _, gross, fee = walked
+                    value = gross - fee
+                    unliquidated = Decimal("0")
+                self.store.update_mark(
+                    account_id=str(position["account_id"]),
+                    asset=asset,
+                    quantity=quantity,
+                    executable_value=value,
+                    unliquidated_quantity=unliquidated,
+                    marked_at=now,
+                    book_hash=current_book.book_hash,
+                )
+            except Exception as error:
+                errors.append(
+                    f"mark:{position['account_id']}:{position['asset']}:{type(error).__name__}:{error}"
+                )
