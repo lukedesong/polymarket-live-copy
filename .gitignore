@@ -22,6 +22,7 @@ sim/
 work/polymarket-api-py312-venv
 work/polymarket-api-js/node_modules/
 work/CloddsBot/node_modules/
+work/wallet_copy_paper/runtime/
 
 # New World Cup collector runtime data
 data/
