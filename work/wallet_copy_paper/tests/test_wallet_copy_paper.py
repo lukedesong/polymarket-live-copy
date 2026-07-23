@@ -16,13 +16,16 @@ from wallet_copy_paper import (
     PaperStore,
     PublicClient,
     ReadOnlyViolation,
+    Resolution,
     SourceAction,
     TrackerRuntime,
     TradeRow,
     build_status,
     decide,
+    daemon_loop,
     fee_for_leg,
     group_trade_rows,
+    main,
     parse_epoch,
     validate_public_request,
     write_reports,
@@ -278,6 +281,10 @@ class FakeClient:
         assert condition_id == "condition-a"
         return params()
 
+    def resolution(self, condition_id: str):
+        assert condition_id == "condition-a"
+        return None
+
 
 def test_runtime_seeds_history_then_processes_only_new_source_actions(tmp_path: Path):
     store = PaperStore(tmp_path / "paper.sqlite3")
@@ -357,3 +364,65 @@ def test_position_aggregation_never_round_trips_through_binary_float(tmp_path: P
         )
 
     assert store.open_positions()[0]["quantity"] == Decimal("0.3")
+
+
+def test_daemon_loop_runs_bounded_cycle_and_writes_heartbeat(tmp_path: Path):
+    store = PaperStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    runtime = TrackerRuntime(store, FakeClient(), tmp_path)
+
+    cycles = daemon_loop(
+        runtime,
+        stop_path=tmp_path / "STOP",
+        poll_seconds=Decimal("1"),
+        max_cycles=1,
+        clock=lambda: 150,
+        sleeper=lambda _: None,
+    )
+
+    assert cycles == 1
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["heartbeat"]["updated_at"] == 150
+
+
+def test_cli_init_creates_only_paper_state(tmp_path: Path, capsys):
+    assert main(["--data-dir", str(tmp_path), "init"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["paper_only"] is True
+    assert output["real_order_submitted"] is False
+    assert (tmp_path / "paper.sqlite3").exists()
+    assert (tmp_path / "status.html").exists()
+
+
+def test_official_closed_market_resolution_settles_position_once(tmp_path: Path):
+    payload = [{
+        "conditionId": "condition-a",
+        "closed": True,
+        "umaResolutionStatus": "resolved",
+        "clobTokenIds": '["asset-a", "asset-b"]',
+        "outcomePrices": '["1", "0"]',
+        "outcomes": '["Yes", "No"]',
+    }]
+    client = PublicClient(transport=lambda _: payload)
+    resolution = client.resolution("condition-a")
+    assert resolution == Resolution("condition-a", "asset-a", payload[0])
+
+    store = PaperStore(tmp_path / "paper.sqlite3")
+    store.initialize()
+    source = action()
+    current_book = book()
+    decision = decide(
+        source,
+        current_book,
+        params(),
+        cash=store.cash("russell"),
+        position=Decimal("0"),
+    )
+    store.apply("russell", source, current_book, params(), decision, observed_at=102)
+
+    assert store.settle(resolution, settled_at=200)
+    assert not store.settle(resolution, settled_at=201)
+    assert store.position("russell", "asset-a") == Decimal("0")
+    assert store.cash("russell") == Decimal("102.20")
+    assert store.realized_pnl("russell") == Decimal("2.20")

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import csv
+import fcntl
 import hashlib
 import html
 import json
 import os
 import sqlite3
+import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -112,6 +116,13 @@ class MarketParams:
     min_order_size: Decimal
     fee_rate: Decimal
     fee_exponent: int
+
+
+@dataclass(frozen=True)
+class Resolution:
+    condition_id: str
+    winning_asset: str
+    evidence: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -264,6 +275,45 @@ class PublicClient:
             fee_rate=decimal_value(fee.get("r"), field="fee_rate"),
             fee_exponent=exponent,
         )
+
+    def resolution(self, condition_id: str) -> Resolution | None:
+        query = urllib.parse.urlencode(
+            {"condition_ids": condition_id, "closed": "true"}
+        )
+        payload = self._get(f"https://gamma-api.polymarket.com/markets?{query}")
+        if not isinstance(payload, list):
+            raise DataUnavailable("resolution_payload_not_list")
+        matches = [
+            item
+            for item in payload
+            if isinstance(item, Mapping) and str(item.get("conditionId")) == condition_id
+        ]
+        if not matches:
+            return None
+        market = matches[0]
+        if market.get("closed") is not True or str(
+            market.get("umaResolutionStatus") or ""
+        ).lower() != "resolved":
+            return None
+        tokens = self._array_field(market.get("clobTokenIds"), "clobTokenIds")
+        prices = self._array_field(market.get("outcomePrices"), "outcomePrices")
+        if len(tokens) != len(prices):
+            raise DataUnavailable("resolution_array_length_mismatch")
+        winners = [str(token) for token, price in zip(tokens, prices) if Decimal(str(price)) == 1]
+        if len(winners) != 1:
+            raise DataUnavailable("resolution_winner_not_unique")
+        return Resolution(condition_id, winners[0], dict(market))
+
+    @staticmethod
+    def _array_field(value: object, field: str) -> list[Any]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise DataUnavailable(f"invalid_{field}") from error
+        if not isinstance(value, list):
+            raise DataUnavailable(f"invalid_{field}")
+        return value
 
     @staticmethod
     def _book_level(payload: Mapping[str, Any]) -> BookLevel:
@@ -507,6 +557,23 @@ CREATE TABLE IF NOT EXISTS marks (
   marked_at INTEGER NOT NULL,
   book_hash TEXT NOT NULL,
   PRIMARY KEY(account_id, asset_id)
+);
+CREATE TABLE IF NOT EXISTS settlements (
+  condition_id TEXT PRIMARY KEY,
+  winning_asset_id TEXT NOT NULL,
+  settled_at INTEGER NOT NULL,
+  evidence_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settlement_lines (
+  condition_id TEXT NOT NULL REFERENCES settlements(condition_id),
+  lot_id INTEGER NOT NULL REFERENCES lots(lot_id),
+  account_id TEXT NOT NULL REFERENCES accounts(account_id),
+  asset_id TEXT NOT NULL,
+  quantity_text TEXT NOT NULL,
+  payout_text TEXT NOT NULL,
+  cost_text TEXT NOT NULL,
+  realized_pnl_text TEXT NOT NULL,
+  PRIMARY KEY(condition_id, lot_id)
 );
 """
 
@@ -829,6 +896,90 @@ class PaperStore:
                 ),
             )
 
+    def settle(self, resolution: Resolution, *, settled_at: int) -> bool:
+        with self.connection:
+            inserted = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO settlements(
+                  condition_id,winning_asset_id,settled_at,evidence_json
+                ) VALUES(?,?,?,?)
+                """,
+                (
+                    resolution.condition_id,
+                    resolution.winning_asset,
+                    settled_at,
+                    _json(resolution.evidence),
+                ),
+            )
+            if inserted.rowcount != 1:
+                return False
+            cash_by_account: dict[str, Decimal] = {}
+            realized_by_account: dict[str, Decimal] = {}
+            lots = self.connection.execute(
+                """
+                SELECT lot_id,account_id,asset_id,quantity_open_text,unit_cost_text
+                FROM lots WHERE condition_id=? ORDER BY lot_id
+                """,
+                (resolution.condition_id,),
+            ).fetchall()
+            for lot in lots:
+                quantity = Decimal(lot["quantity_open_text"])
+                if quantity <= 0:
+                    continue
+                payout = quantity if lot["asset_id"] == resolution.winning_asset else Decimal("0")
+                cost = quantity * Decimal(lot["unit_cost_text"])
+                realized = payout - cost
+                account_id = str(lot["account_id"])
+                cash_by_account[account_id] = cash_by_account.get(
+                    account_id, Decimal("0")
+                ) + payout
+                realized_by_account[account_id] = realized_by_account.get(
+                    account_id, Decimal("0")
+                ) + realized
+                self.connection.execute(
+                    "UPDATE lots SET quantity_open_text='0' WHERE lot_id=?",
+                    (lot["lot_id"],),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO settlement_lines(
+                      condition_id,lot_id,account_id,asset_id,quantity_text,
+                      payout_text,cost_text,realized_pnl_text
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        resolution.condition_id,
+                        lot["lot_id"],
+                        account_id,
+                        lot["asset_id"],
+                        str(quantity),
+                        str(payout),
+                        str(cost),
+                        str(realized),
+                    ),
+                )
+            for account_id, payout in cash_by_account.items():
+                self.connection.execute(
+                    "UPDATE accounts SET cash_text=? WHERE account_id=?",
+                    (str(self.cash(account_id) + payout), account_id),
+                )
+                self.connection.execute(
+                    "UPDATE accounts SET realized_pnl_text=? WHERE account_id=?",
+                    (
+                        str(
+                            self.realized_pnl(account_id)
+                            + realized_by_account.get(account_id, Decimal("0"))
+                        ),
+                        account_id,
+                    ),
+                )
+            for lot in lots:
+                self.connection.execute(
+                    "DELETE FROM marks WHERE account_id=? AND asset_id=?",
+                    (lot["account_id"], lot["asset_id"]),
+                )
+            return True
+
     def account_summaries(self) -> list[dict[str, Any]]:
         summaries: list[dict[str, Any]] = []
         for account in ACCOUNTS:
@@ -1077,10 +1228,21 @@ class TrackerRuntime:
     def refresh_marks(self, *, now: int, errors: list[str]) -> None:
         books: dict[str, Book] = {}
         market_params: dict[str, MarketParams] = {}
+        resolutions: dict[str, Resolution | None] = {}
+        settled_conditions: set[str] = set()
         for position in self.store.open_positions():
             try:
                 asset = str(position["asset"])
                 condition_id = str(position["condition_id"])
+                if condition_id in settled_conditions:
+                    continue
+                if condition_id not in resolutions:
+                    resolutions[condition_id] = self.client.resolution(condition_id)
+                resolution = resolutions[condition_id]
+                if resolution is not None:
+                    self.store.settle(resolution, settled_at=now)
+                    settled_conditions.add(condition_id)
+                    continue
                 if asset not in books:
                     books[asset] = self.client.book(asset)
                 current_book = books[asset]
@@ -1116,3 +1278,102 @@ class TrackerRuntime:
                 errors.append(
                     f"mark:{position['account_id']}:{position['asset']}:{type(error).__name__}:{error}"
                 )
+
+
+def daemon_loop(
+    runtime: TrackerRuntime,
+    *,
+    stop_path: Path,
+    poll_seconds: Decimal,
+    max_cycles: int | None = None,
+    clock: Callable[[], float] = time.time,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> int:
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds_must_be_positive")
+    cycles = 0
+    while not stop_path.exists():
+        runtime.run_once(now=int(clock()))
+        cycles += 1
+        if max_cycles is not None and cycles >= max_cycles:
+            break
+        sleeper(float(poll_seconds))
+    return cycles
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="wallet_copy_paper")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "runtime",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("init")
+    commands.add_parser("run-once")
+    commands.add_parser("status")
+    daemon = commands.add_parser("daemon")
+    # Estimated paper-monitor cadence. Three baseline requests per cycle remain
+    # below the documented Data API trade-request limit; it is not an optimum.
+    daemon.add_argument(
+        "--poll-seconds",
+        type=Decimal,
+        default=Decimal(os.environ.get("WALLET_COPY_PAPER_POLL_SECONDS", "1")),
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    data_dir = args.data_dir.resolve()
+    store = PaperStore(data_dir / "paper.sqlite3")
+    store.initialize()
+    try:
+        if args.command == "init":
+            status = write_reports(
+                store,
+                data_dir,
+                heartbeat={"state": "initialized", "updated_at": int(time.time())},
+            )
+            print(_json(status))
+            return 0
+        if args.command == "status":
+            heartbeat: Mapping[str, Any] = {"state": "unknown"}
+            status_path = data_dir / "status.json"
+            if status_path.exists():
+                try:
+                    heartbeat = json.loads(status_path.read_text(encoding="utf-8")).get(
+                        "heartbeat", heartbeat
+                    )
+                except (json.JSONDecodeError, OSError):
+                    pass
+            print(_json(build_status(store, heartbeat=heartbeat)))
+            return 0
+        runtime = TrackerRuntime(store, PublicClient(), data_dir)
+        if args.command == "run-once":
+            print(_json(runtime.run_once(now=int(time.time()))))
+            return 0
+        stop_path = data_dir / "STOP"
+        stop_path.unlink(missing_ok=True)
+        lock_path = data_dir / "daemon.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w", encoding="utf-8") as lock_handle:
+            try:
+                fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("wallet_copy_paper_already_running", file=sys.stderr)
+                return 2
+            lock_handle.write(str(os.getpid()))
+            lock_handle.flush()
+            daemon_loop(
+                runtime,
+                stop_path=stop_path,
+                poll_seconds=args.poll_seconds,
+            )
+        return 0
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
