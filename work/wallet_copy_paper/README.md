@@ -40,4 +40,6 @@ real_order_submitted: false
 
 `start.sh` 安装并启动当前 macOS 用户的 LaunchAgent，同时打开状态页。后台默认每秒检查一次；这个间隔是纸面监控的暂定估算值，不是已证明最优参数。三个钱包的基础请求频率低于 Polymarket Data API 公布的限制，遇到接口错误时本轮不制造成交。
 
+启动脚本会把当前终端实际使用的 HTTP(S) 代理写入本次 LaunchAgent，避免沿用 macOS 登录会话中已经失效的旧代理；不把具体代理端口写死在仓库里。
+
 程序只包含公开 GET 白名单，不加载私钥、API key、secret 或 passphrase，也没有创建、取消订单的代码路径。
