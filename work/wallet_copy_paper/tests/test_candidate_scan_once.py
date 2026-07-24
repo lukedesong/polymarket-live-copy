@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+
 from candidate_scan_once import (
+    LEGACY_SEEDS,
     analyze_trade_lifecycle,
     discover_leaderboard_candidates,
     fetch_trades,
+    load_candidate_state,
+    main,
     merge_candidate_pool,
     ordered_candidate_wallets,
     partition_noncrypto_rows,
+    write_json_atomic,
 )
 
 
@@ -202,3 +208,108 @@ def test_exact_same_timestamp_opposite_sides_without_directional_evidence_is_spe
 
     assert result["same_timestamp_opposite_side_cycles"] == 1
     assert result["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
+
+
+def test_discovery_records_pair_failure_and_keeps_other_pairs():
+    dynamic = "0x" + "3" * 40
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        if params["category"] == "WEATHER":
+            raise RuntimeError("temporary public API failure")
+        return [leaderboard_row(dynamic, "politics", 1)]
+
+    found, coverage = discover_leaderboard_candidates(
+        fetch,
+        categories=("WEATHER", "POLITICS"),
+        periods=("MONTH",),
+        observed_at="2026-07-25T00:00:00+00:00",
+    )
+
+    assert dynamic in found
+    assert coverage["complete"] is False
+    failed = next(
+        pair for pair in coverage["pairs"] if pair["category"] == "WEATHER"
+    )
+    assert failed["error"] == "RuntimeError: temporary public API failure"
+
+
+def test_queue_prioritizes_changed_wallet_before_unchanged_wallet():
+    changed = "0x" + "4" * 40
+    unchanged = "0x" + "5" * 40
+    pool = {
+        changed: {
+            "wallet": changed,
+            "last_analysis_at": "2026-07-24T00:00:00+00:00",
+            "latest_source_trade_timestamp": 20,
+            "last_analyzed_source_trade_timestamp": 10,
+        },
+        unchanged: {
+            "wallet": unchanged,
+            "last_analysis_at": "2026-07-23T00:00:00+00:00",
+            "latest_source_trade_timestamp": 10,
+            "last_analyzed_source_trade_timestamp": 10,
+        },
+    }
+
+    assert ordered_candidate_wallets(pool) == [changed, unchanged]
+
+
+def test_candidate_state_is_written_atomically_and_round_trips(tmp_path):
+    state_path = tmp_path / "candidate-state.json"
+    payload = {
+        "schema_version": 1,
+        "candidates": {
+            "0x" + "6" * 40: {
+                "wallet": "0x" + "6" * 40,
+                "last_analysis_at": "2026-07-25T00:00:00+00:00",
+            }
+        },
+    }
+
+    write_json_atomic(state_path, payload)
+
+    assert load_candidate_state(state_path) == payload
+    assert not state_path.with_name(state_path.name + ".tmp").exists()
+
+
+def test_main_writes_dynamic_pool_snapshot_and_markdown(tmp_path):
+    dynamic = "0x" + "7" * 40
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        if endpoint == "v1/leaderboard":
+            return [leaderboard_row(dynamic, "dynamic-weather", 1)]
+        raise AssertionError(
+            f"unexpected endpoint in discover-only run: {endpoint}"
+        )
+
+    output = tmp_path / "snapshot.json"
+    state = tmp_path / "state.json"
+    report = tmp_path / "snapshot.md"
+    exit_code = main(
+        [
+            "--output",
+            str(output),
+            "--state",
+            str(state),
+            "--report",
+            str(report),
+            "--categories",
+            "WEATHER",
+            "--periods",
+            "MONTH",
+            "--discover-only",
+        ],
+        fetch=fetch,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    pool = json.loads(state.read_text(encoding="utf-8"))
+    report_text = report.read_text(encoding="utf-8")
+    assert exit_code == 0
+    assert dynamic in pool["candidates"]
+    assert payload["scope"]["dynamic_universe"] is True
+    assert payload["scope"]["candidate_pool_size"] > len(LEGACY_SEEDS)
+    assert "dynamic-weather" in report_text
+    assert "polymarket.com/profile/" in report_text
+    assert payload["paper_only"] is True
+    assert payload["real_order_submitted"] is False

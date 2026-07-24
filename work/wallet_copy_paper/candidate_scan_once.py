@@ -48,6 +48,7 @@ LEADERBOARD_CATEGORIES = (
     "FINANCE",
 )
 LEADERBOARD_PERIODS = ("MONTH", "ALL")
+LEADERBOARD_ALLOWED_PERIODS = ("DAY", "WEEK", "MONTH", "ALL")
 # External constraints documented by Polymarket's public leaderboard endpoint.
 LEADERBOARD_PAGE_SIZE = 50
 LEADERBOARD_MAX_OFFSET = 1_000
@@ -195,20 +196,27 @@ def discover_leaderboard_candidates(
                 "period": period,
                 "rows": 0,
                 "complete": False,
+                "error": None,
             }
             for offset in range(
                 0, LEADERBOARD_MAX_OFFSET + 1, LEADERBOARD_PAGE_SIZE
             ):
-                page = fetch(
-                    "v1/leaderboard",
-                    {
-                        "category": category,
-                        "timePeriod": period,
-                        "orderBy": "PNL",
-                        "limit": LEADERBOARD_PAGE_SIZE,
-                        "offset": offset,
-                    },
-                )
+                try:
+                    page = fetch(
+                        "v1/leaderboard",
+                        {
+                            "category": category,
+                            "timePeriod": period,
+                            "orderBy": "PNL",
+                            "limit": LEADERBOARD_PAGE_SIZE,
+                            "offset": offset,
+                        },
+                    )
+                except Exception as error:
+                    pair["error"] = (
+                        f"{type(error).__name__}: {error}"
+                    )
+                    break
                 pair["rows"] += len(page)
                 for row in page:
                     wallet = normalize_wallet(row.get("proxyWallet"))
@@ -241,7 +249,8 @@ def discover_leaderboard_candidates(
             pair_coverage.append(pair)
     return candidates, {
         "pairs": pair_coverage,
-        "complete": all(item["complete"] for item in pair_coverage),
+        "complete": bool(pair_coverage)
+        and all(item["complete"] for item in pair_coverage),
     }
 
 
@@ -922,58 +931,447 @@ def scan_wallet(
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-    generated_at = datetime.now(timezone.utc).isoformat()
-    result = {
+def load_candidate_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"schema_version": 1, "candidates": {}}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("candidate state must be a JSON object")
+    if not isinstance(payload.get("candidates"), dict):
+        raise ValueError("candidate state is missing candidates")
+    return payload
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def profile_url(wallet: str) -> str:
+    return f"https://polymarket.com/profile/{wallet}"
+
+
+def refresh_analyzed_candidate_activity(
+    pool: dict[str, dict[str, Any]],
+    *,
+    fetch: Any,
+    observed_at: str,
+) -> None:
+    """Refresh one-row public activity probes after the unseen queue is empty."""
+
+    if any(not item.get("last_analysis_at") for item in pool.values()):
+        return
+    for wallet, item in pool.items():
+        try:
+            rows = fetch(
+                "trades",
+                {
+                    "user": wallet,
+                    "takerOnly": "false",
+                    "limit": 1,
+                    "offset": 0,
+                    "start": 1,
+                },
+            )
+            latest = max(
+                (
+                    int(number(row.get("timestamp")))
+                    for row in rows
+                    if row.get("timestamp")
+                ),
+                default=0,
+            )
+            item["latest_source_trade_timestamp"] = latest
+            item["last_activity_probe_at"] = observed_at
+            item.pop("activity_probe_error", None)
+        except Exception as error:
+            item["activity_probe_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+
+def candidate_pool_rows(
+    pool: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows = []
+    for wallet in sorted(pool):
+        item = pool[wallet]
+        rows.append(
+            {
+                "wallet": wallet,
+                "name": item.get("name") or wallet,
+                "profile_url": profile_url(wallet),
+                "legacy_seed": bool(item.get("legacy_seed")),
+                "leaderboard_discovered": bool(
+                    item.get("leaderboard_discovered")
+                ),
+                "origins": item.get("origins", []),
+                "first_seen": item.get("first_seen"),
+                "last_seen": item.get("last_seen"),
+                "last_analysis_at": item.get("last_analysis_at"),
+                "analysis_status": item.get("analysis_status")
+                or "PENDING",
+                "analysis_error": item.get("analysis_error"),
+                "activity_probe_error": item.get(
+                    "activity_probe_error"
+                ),
+                "latest_source_trade_timestamp": item.get(
+                    "latest_source_trade_timestamp"
+                ),
+                "last_analyzed_source_trade_timestamp": item.get(
+                    "last_analyzed_source_trade_timestamp"
+                ),
+                "expert_sleeve": item.get("expert_sleeve"),
+            }
+        )
+    return rows
+
+
+def build_snapshot(
+    *,
+    generated_at: str,
+    pool: dict[str, dict[str, Any]],
+    discovery_coverage: dict[str, Any],
+    wallet_results: list[dict[str, Any]],
+    selected: list[str],
+    deferred: list[str],
+    failures: list[dict[str, str]],
+    categories: tuple[str, ...],
+    periods: tuple[str, ...],
+    discover_only: bool,
+    operational_cap: int | None,
+) -> dict[str, Any]:
+    leaderboard_candidates = sum(
+        bool(item.get("leaderboard_discovered"))
+        for item in pool.values()
+    )
+    legacy_candidates = sum(
+        bool(item.get("legacy_seed")) for item in pool.values()
+    )
+    return {
         "generated_at": generated_at,
         "paper_only": True,
         "real_order_submitted": False,
         "scope": {
-            "wallet_count": len(WALLETS),
-            "wallets": WALLETS,
-            "candidate_origin": (
-                "Five wallets found in the prior public-wallet exploration plus "
-                "the three currently observed by the paper-only tracker."
+            "dynamic_universe": True,
+            "requested_categories": list(categories),
+            "requested_periods": list(periods),
+            "leaderboard_order": "PNL",
+            "candidate_pool_size": len(pool),
+            "leaderboard_discovered_candidates": leaderboard_candidates,
+            "legacy_seed_candidates": legacy_candidates,
+            "selected_for_analysis_this_run": len(selected),
+            "successfully_analyzed_this_run": len(wallet_results),
+            "failed_this_run": len(failures),
+            "deferred_candidates": len(deferred),
+            "discover_only": discover_only,
+            "operational_wallet_cap": (
+                None
+                if operational_cap is None
+                else {
+                    "value": operational_cap,
+                    "provenance": (
+                        "Invocation-specified operational estimate; "
+                        "it only defers work and never qualifies a wallet."
+                    ),
+                }
             ),
-            "not_an_exhaustive_universe_scan": True,
         },
+        "discovery_coverage": discovery_coverage,
         "numeric_provenance": {
+            "external_constraints": (
+                "Leaderboard page size/offset and trade page/window "
+                "pagination follow the official public Data API."
+            ),
+            "user_approved_rules": (
+                "MONTH plus ALL defaults, crypto-row removal, mixed-wallet "
+                "non-crypto sleeve preservation, and legacy-seed demotion."
+            ),
             "empirical": (
-                "Raw API rows, timestamps, transaction hashes, conditions, "
-                "positions and Data API reported realizedPnl."
+                "Leaderboard rows, public fills, positions, timestamps, "
+                "reported realizedPnl, lifecycle counts, and coverage."
             ),
             "formula_derived": (
-                "Shares, estimated cost=avgPrice*totalBought, PnL/cost, "
-                "event aggregation, concentrations and chronological median split."
+                "Address deduplication, event/domain aggregation, cost "
+                "estimates, concentrations, and lifecycle grouping."
             ),
             "estimate": (
-                "Domain labels are transparent title/eventSlug keyword heuristics; "
-                "they are not authoritative Gamma tag classifications."
-            ),
-            "external_constraints": (
-                "Data API trades limit and offset are each capped at 10,000; "
-                "closed-position page size is capped at 50."
+                "Title/eventSlug domain labels and any invocation wallet cap; "
+                "neither can promote or reject a wallet by itself."
             ),
         },
         "limitations": [
             "BUY/SELL does not identify maker/taker role.",
-            "Data API reported realizedPnl fee inclusion was not independently reconstructed.",
-            "The event-median split is exploratory and is not a detected formula-change boundary.",
-            "Historical source-wallet results do not establish delayed follower profitability.",
-            "A full Gamma tag join and historical order-book reconstruction are not included.",
+            "Source-wallet PnL does not establish delayed follower profitability.",
+            "COPYABLE_EVIDENCE requires separate forward paper execution evidence.",
+            "Unknown or incomplete history remains reviewable and cannot be promoted.",
         ],
-        "wallets": [],
+        "candidate_pool": candidate_pool_rows(pool),
+        "selected_wallets": selected,
+        "deferred_wallets": deferred,
+        "failures": failures,
+        "wallets": wallet_results,
     }
-    for name, wallet in WALLETS.items():
-        result["wallets"].append(scan_wallet(name, wallet))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+
+
+def markdown_cell(value: Any) -> str:
+    return str(value if value is not None else "").replace(
+        "|", "\\|"
+    ).replace("\n", " ")
+
+
+def origin_label(origins: list[dict[str, Any]]) -> str:
+    labels = []
+    for origin in origins:
+        if origin.get("source") == "leaderboard":
+            rank = origin.get("rank")
+            rank_label = f" rank={rank}" if rank is not None else ""
+            labels.append(
+                f"{origin.get('category')}/{origin.get('period')}"
+                f"{rank_label}"
+            )
+        elif origin.get("source") == "legacy_seed":
+            labels.append(f"legacy:{origin.get('name')}")
+    return "; ".join(labels)
+
+
+def render_markdown(
+    snapshot: dict[str, Any],
+    pool: dict[str, dict[str, Any]],
+) -> str:
+    scope = snapshot["scope"]
+    coverage = snapshot["discovery_coverage"]
+    lines = [
+        "# Polymarket 动态钱包发现",
+        "",
+        f"- 生成时间：{snapshot['generated_at']}",
+        "- 数据边界：公开只读；没有真实订单，也没有修改纸面账本。",
+        f"- 候选池：{scope['candidate_pool_size']}",
+        (
+            "- 排行榜覆盖："
+            + ("完整" if coverage.get("complete") else "不完整，详见覆盖记录")
+        ),
+        f"- 本轮成功分析：{scope['successfully_analyzed_this_run']}",
+        f"- 本轮延期：{scope['deferred_candidates']}",
+        "",
+        "## 候选池",
+        "",
+        "| 名称 | 钱包网页 | 来源 | 策略状态 | 专家部分 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for wallet in sorted(pool):
+        item = pool[wallet]
+        name = markdown_cell(item.get("name") or wallet)
+        url = profile_url(wallet)
+        origins = markdown_cell(origin_label(item.get("origins", [])))
+        status = markdown_cell(item.get("analysis_status") or "PENDING")
+        sleeve = markdown_cell(item.get("expert_sleeve") or "")
+        lines.append(
+            f"| {name} | [{wallet}]({url}) | {origins} | "
+            f"{status} | {sleeve} |"
+        )
+
+    if snapshot["wallets"]:
+        lines.extend(
+            [
+                "",
+                "## 本轮策略分析",
+                "",
+                "| 名称 | 钱包网页 | 非加密策略状态 | 生命周期 | 剔除加密记录 |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for result in snapshot["wallets"]:
+            strategy = result["strategy"]
+            lifecycle = ", ".join(
+                f"{key}={value}"
+                for key, value in strategy.get(
+                    "lifecycle_counts", {}
+                ).items()
+            )
+            removed = sum(result["crypto_rows_removed"].values())
+            lines.append(
+                f"| {markdown_cell(result['name'])} | "
+                f"[{result['wallet']}]({result['profile_url']}) | "
+                f"{strategy['strategy_state']} | "
+                f"{markdown_cell(lifecycle)} | {removed} |"
+            )
+
+    failed_pairs = [
+        pair
+        for pair in coverage.get("pairs", [])
+        if not pair.get("complete")
+    ]
+    if failed_pairs:
+        lines.extend(["", "## 覆盖缺口", ""])
+        for pair in failed_pairs:
+            detail = pair.get("error") or "reached documented offset boundary"
+            lines.append(
+                f"- {pair.get('category')}/{pair.get('period')}: "
+                f"{markdown_cell(detail)}"
+            )
+    lines.extend(
+        [
+            "",
+            "## 结论边界",
+            "",
+            "- 源钱包历史只能产生研究候选，不能单独证明延迟跟单为正期望。",
+            "- 中途买卖、篮子/对冲或同秒双向行为保留为公式研究或执行风险。",
+            "- 只有单独的前瞻纸面成交证据才能升级复制结论。",
+            "",
+        ]
     )
+    return "\n".join(lines)
+
+
+def nonnegative_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Discover and analyze public Polymarket wallets."
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--state", type=Path)
+    parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        choices=LEADERBOARD_CATEGORIES,
+        default=list(LEADERBOARD_CATEGORIES),
+    )
+    parser.add_argument(
+        "--periods",
+        nargs="+",
+        choices=LEADERBOARD_ALLOWED_PERIODS,
+        default=list(LEADERBOARD_PERIODS),
+    )
+    parser.add_argument("--max-wallets", type=nonnegative_integer)
+    parser.add_argument("--discover-only", action="store_true")
+    return parser
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    fetch: Any = api_get,
+) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    state_path = args.state or args.output.with_name(
+        "candidate_discovery_state.json"
+    )
+    report_path = args.report or args.output.with_suffix(".md")
+    state = load_candidate_state(state_path)
+    discovered, discovery_coverage = discover_leaderboard_candidates(
+        fetch,
+        categories=tuple(args.categories),
+        periods=tuple(args.periods),
+        observed_at=generated_at,
+    )
+    pool = merge_candidate_pool(
+        state["candidates"],
+        discovered,
+        LEGACY_SEEDS,
+        observed_at=generated_at,
+    )
+    state_payload = {
+        "schema_version": 1,
+        "updated_at": generated_at,
+        "candidates": pool,
+    }
+    write_json_atomic(state_path, state_payload)
+
+    selected: list[str] = []
+    deferred: list[str] = []
+    wallet_results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    if not args.discover_only:
+        refresh_analyzed_candidate_activity(
+            pool,
+            fetch=fetch,
+            observed_at=generated_at,
+        )
+        queue = ordered_candidate_wallets(pool)
+        if args.max_wallets is None:
+            selected = queue
+        else:
+            selected = queue[: args.max_wallets]
+        deferred = queue[len(selected) :]
+
+        for wallet in selected:
+            item = pool[wallet]
+            try:
+                result = scan_wallet(
+                    str(item.get("name") or wallet),
+                    wallet,
+                    fetch=fetch,
+                )
+                wallet_results.append(result)
+                item["last_analysis_at"] = generated_at
+                item["latest_source_trade_timestamp"] = result[
+                    "latest_source_trade_timestamp"
+                ]
+                item["last_analyzed_source_trade_timestamp"] = result[
+                    "latest_source_trade_timestamp"
+                ]
+                item["latest_noncrypto_trade_timestamp"] = result[
+                    "latest_noncrypto_trade_timestamp"
+                ]
+                item["analysis_status"] = result["strategy"][
+                    "strategy_state"
+                ]
+                domains = result["closed_positions"].get("domains", [])
+                item["expert_sleeve"] = (
+                    domains[0]["domain"] if domains else None
+                )
+                item.pop("analysis_error", None)
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                item["analysis_error"] = message
+                failures.append({"wallet": wallet, "error": message})
+            state_payload = {
+                "schema_version": 1,
+                "updated_at": generated_at,
+                "candidates": pool,
+            }
+            write_json_atomic(state_path, state_payload)
+
+    snapshot = build_snapshot(
+        generated_at=generated_at,
+        pool=pool,
+        discovery_coverage=discovery_coverage,
+        wallet_results=wallet_results,
+        selected=selected,
+        deferred=deferred,
+        failures=failures,
+        categories=tuple(args.categories),
+        periods=tuple(args.periods),
+        discover_only=args.discover_only,
+        operational_cap=args.max_wallets,
+    )
+    write_json_atomic(args.output, snapshot)
+    write_text_atomic(report_path, render_markdown(snapshot, pool))
     print(args.output)
+    print(report_path)
+    print(state_path)
     return 0
 
 
