@@ -179,6 +179,25 @@ def test_crypto_rows_are_removed_but_mixed_wallet_survives():
     assert [row["conditionId"] for row in removed] == ["crypto"]
 
 
+def test_crypto_filter_recognizes_launch_a_token_word_order():
+    wallet = "0x" + "0" * 40
+    rows = [
+        trade(
+            wallet,
+            "token",
+            "phantom",
+            "BUY",
+            1,
+            "Will Phantom launch a token by December 31, 2027?",
+        )
+    ]
+
+    kept, removed = partition_noncrypto_rows(rows)
+
+    assert kept == []
+    assert [row["conditionId"] for row in removed] == ["token"]
+
+
 def test_lifecycle_separates_hold_exit_and_basket():
     wallet = "0x" + "1" * 40
     rows = [

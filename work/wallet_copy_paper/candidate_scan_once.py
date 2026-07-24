@@ -52,6 +52,17 @@ LEADERBOARD_ALLOWED_PERIODS = ("DAY", "WEEK", "MONTH", "ALL")
 # External constraints documented by Polymarket's public leaderboard endpoint.
 LEADERBOARD_PAGE_SIZE = 50
 LEADERBOARD_MAX_OFFSET = 1_000
+TRADE_PAGE_SIZE = 10_000
+TRADE_MAX_OFFSET = 10_000
+CLOSED_POSITION_PAGE_SIZE = 50
+CLOSED_POSITION_MAX_OFFSET = 100_000
+OPEN_POSITION_PAGE_SIZE = 500
+OPEN_POSITION_MAX_OFFSET = 10_000
+# Operational estimates inherited from the read-only scanner. They affect
+# retry latency only and never wallet qualification.
+NETWORK_RETRY_ATTEMPTS = 4
+NETWORK_TIMEOUT_SECONDS = 60
+NETWORK_BACKOFF_BASE_SECONDS = 1
 CRYPTO_DOMAIN = "加密资产与代币"
 
 
@@ -109,7 +120,8 @@ DOMAIN_RULES: list[tuple[str, re.Pattern[str]]] = [
         "加密资产与代币",
         re.compile(
             r"bitcoin|\bbtc\b|ethereum|\beth\b|\bxrp\b|solana|crypto|"
-            r"market cap|fdv|token launch|airdrop",
+            r"market cap|fdv|token launch|launch(?:es|ed|ing)?\s+"
+            r"(?:a\s+)?token|airdrop",
             re.I,
         ),
     ),
@@ -159,16 +171,18 @@ def api_get(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
     )
     last_error: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(NETWORK_RETRY_ATTEMPTS):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(
+                request, timeout=NETWORK_TIMEOUT_SECONDS
+            ) as response:
                 payload = json.load(response)
             if not isinstance(payload, list):
                 raise RuntimeError(f"{endpoint} returned a non-list payload")
             return payload
         except Exception as error:  # pragma: no cover - network retry
             last_error = error
-            time.sleep(1 + attempt)
+            time.sleep(NETWORK_BACKOFF_BASE_SECONDS + attempt)
     assert last_error is not None
     raise last_error
 
@@ -317,8 +331,8 @@ def fetch_trades(
     wallet: str,
     *,
     fetch: Any = api_get,
-    page_size: int = 10_000,
-    max_offset: int = 10_000,
+    page_size: int = TRADE_PAGE_SIZE,
+    max_offset: int = TRADE_MAX_OFFSET,
 ) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     """Read full user history with documented timestamp-window pagination.
 
@@ -397,19 +411,23 @@ def fetch_closed_positions(
 ) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     complete = False
-    for offset in range(0, 100_001, 50):
+    for offset in range(
+        0,
+        CLOSED_POSITION_MAX_OFFSET + 1,
+        CLOSED_POSITION_PAGE_SIZE,
+    ):
         page = fetch(
             "closed-positions",
             {
                 "user": wallet,
-                "limit": 50,
+                "limit": CLOSED_POSITION_PAGE_SIZE,
                 "offset": offset,
                 "sortBy": "TIMESTAMP",
                 "sortDirection": "DESC",
             },
         )
         rows.extend(page)
-        if len(page) < 50:
+        if len(page) < CLOSED_POSITION_PAGE_SIZE:
             complete = True
             break
     return rows, complete
@@ -420,12 +438,16 @@ def fetch_open_positions(
 ) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     complete = False
-    for offset in range(0, 10_001, 500):
+    for offset in range(
+        0,
+        OPEN_POSITION_MAX_OFFSET + 1,
+        OPEN_POSITION_PAGE_SIZE,
+    ):
         page = fetch(
             "positions",
             {
                 "user": wallet,
-                "limit": 500,
+                "limit": OPEN_POSITION_PAGE_SIZE,
                 "offset": offset,
                 "sizeThreshold": 0,
                 "sortBy": "INITIAL",
@@ -433,7 +455,7 @@ def fetch_open_positions(
             },
         )
         rows.extend(page)
-        if len(page) < 500:
+        if len(page) < OPEN_POSITION_PAGE_SIZE:
             complete = True
             break
     return rows, complete
@@ -1108,9 +1130,18 @@ def build_snapshot(
                 "estimates, concentrations, and lifecycle grouping."
             ),
             "estimate": (
-                "Title/eventSlug domain labels and any invocation wallet cap; "
-                "neither can promote or reject a wallet by itself."
+                "Title/eventSlug domain labels, retry timing, display precision, "
+                "top-five examples, chronological median split, and any "
+                "invocation wallet cap; none can promote or reject a wallet "
+                "by itself."
             ),
+            "operational_estimates": {
+                "network_retry_attempts": NETWORK_RETRY_ATTEMPTS,
+                "network_timeout_seconds": NETWORK_TIMEOUT_SECONDS,
+                "network_backoff_base_seconds": (
+                    NETWORK_BACKOFF_BASE_SECONDS
+                ),
+            },
         },
         "limitations": [
             "BUY/SELL does not identify maker/taker role.",
