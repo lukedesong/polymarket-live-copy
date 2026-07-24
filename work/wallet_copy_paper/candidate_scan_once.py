@@ -901,6 +901,26 @@ def light_screen_wallet(
             "The recent public sample contains no non-crypto sleeve."
         )
 
+    recent_trade_summary = trade_summary(noncrypto_trades, False)
+    public_page_saturated_within_one_utc_day = (
+        len(trades) == RECENT_LIGHT_SCREEN_LIMIT
+        and recent_trade_summary["start"] is not None
+        and recent_trade_summary["start"] == recent_trade_summary["end"]
+    )
+    lifecycle["high_frequency_recent_page_saturated"] = (
+        public_page_saturated_within_one_utc_day
+    )
+    if public_page_saturated_within_one_utc_day:
+        lifecycle["observed_strategy_state"] = lifecycle[
+            "strategy_state"
+        ]
+        lifecycle["strategy_state"] = "OBSERVABLE_MM_OR_SPEED"
+        lifecycle["screen_reasons"].append(
+            "The external public-page limit was saturated within one UTC "
+            "date; direct copy research defers this observed high-frequency "
+            "execution shape."
+        )
+
     conditions_by_domain: dict[str, set[str]] = defaultdict(set)
     for row in noncrypto_trades:
         domain = classify_domain(
@@ -961,7 +981,7 @@ def light_screen_wallet(
             "page_full": len(trades) == RECENT_LIGHT_SCREEN_LIMIT,
             "coverage": "RECENT_ONLY_NOT_FULL_HISTORY",
         },
-        "trades": trade_summary(noncrypto_trades, False),
+        "trades": recent_trade_summary,
     }
 
 
@@ -1215,6 +1235,7 @@ def build_snapshot(
     categories: tuple[str, ...],
     periods: tuple[str, ...],
     discover_only: bool,
+    screen_only: bool,
     operational_cap: int | None,
 ) -> dict[str, Any]:
     leaderboard_candidates = sum(
@@ -1241,6 +1262,7 @@ def build_snapshot(
             "failed_this_run": len(failures),
             "deferred_candidates": len(deferred),
             "discover_only": discover_only,
+            "screen_only": screen_only,
             "operational_wallet_cap": (
                 None
                 if operational_cap is None
@@ -1440,6 +1462,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-wallets", type=nonnegative_integer)
     parser.add_argument("--discover-only", action="store_true")
+    parser.add_argument(
+        "--screen-only",
+        action="store_true",
+        help="Run the recent public-page screen without deep pagination.",
+    )
     return parser
 
 
@@ -1500,7 +1527,10 @@ def main(
                     wallet,
                     fetch=fetch,
                 )
-                if light_result["deep_scan_eligible"]:
+                if (
+                    light_result["deep_scan_eligible"]
+                    and not args.screen_only
+                ):
                     result = scan_wallet(
                         str(item.get("name") or wallet),
                         wallet,
@@ -1553,6 +1583,7 @@ def main(
         categories=tuple(args.categories),
         periods=tuple(args.periods),
         discover_only=args.discover_only,
+        screen_only=args.screen_only,
         operational_cap=args.max_wallets,
     )
     write_json_atomic(args.output, snapshot)

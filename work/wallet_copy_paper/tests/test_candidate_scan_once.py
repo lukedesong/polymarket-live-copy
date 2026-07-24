@@ -4,6 +4,7 @@ import json
 
 from candidate_scan_once import (
     LEGACY_SEEDS,
+    RECENT_LIGHT_SCREEN_LIMIT,
     analyze_trade_lifecycle,
     discover_leaderboard_candidates,
     fetch_trades,
@@ -283,6 +284,30 @@ def test_light_screen_flags_but_keeps_one_sided_multi_transaction_candidate():
     assert result["deep_scan_eligible"] is True
 
 
+def test_light_screen_defers_public_page_saturated_within_one_utc_day():
+    wallet = "0x" + "c" * 40
+    rows = [
+        trade(
+            wallet,
+            f"condition-{index}",
+            f"asset-{index}",
+            "BUY",
+            1_700_000_000 + index,
+            "Weather temperature",
+        )
+        for index in range(RECENT_LIGHT_SCREEN_LIMIT)
+    ]
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        return rows
+
+    result = light_screen_wallet("saturated", wallet, fetch=fetch)
+
+    assert result["strategy"]["high_frequency_recent_page_saturated"] is True
+    assert result["strategy"]["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
+    assert result["deep_scan_eligible"] is False
+
+
 def test_discovery_records_pair_failure_and_keeps_other_pairs():
     dynamic = "0x" + "3" * 40
 
@@ -468,3 +493,44 @@ def test_main_light_screens_active_exit_without_full_history_calls(tmp_path):
     assert payload["wallets"][0]["strategy"]["strategy_state"] == (
         "FORMULA_RESEARCH"
     )
+
+
+def test_main_screen_only_keeps_directional_wallet_at_light_depth(tmp_path):
+    dynamic = "0x" + "d" * 40
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        if endpoint == "v1/leaderboard":
+            return [leaderboard_row(dynamic, "directional-weather", 1)]
+        if endpoint == "trades":
+            return [
+                trade(dynamic, "hold", "yes", "BUY", 10, "Election")
+            ]
+        raise AssertionError(
+            f"screen-only run must not call deep endpoint: {endpoint}"
+        )
+
+    output = tmp_path / "snapshot.json"
+    exit_code = main(
+        [
+            "--output",
+            str(output),
+            "--state",
+            str(tmp_path / "state.json"),
+            "--report",
+            str(tmp_path / "snapshot.md"),
+            "--categories",
+            "WEATHER",
+            "--periods",
+            "MONTH",
+            "--max-wallets",
+            "1",
+            "--screen-only",
+        ],
+        fetch=fetch,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert payload["scope"]["screen_only"] is True
+    assert payload["wallets"][0]["analysis_depth"] == "LIGHT_SCREEN"
+    assert payload["wallets"][0]["deep_scan_eligible"] is True
