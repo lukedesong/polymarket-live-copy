@@ -307,6 +307,19 @@ def merge_candidate_pool(
 def ordered_candidate_wallets(
     pool: dict[str, dict[str, Any]],
 ) -> list[str]:
+    def best_leaderboard_rank(item: dict[str, Any]) -> float:
+        ranks: list[int] = []
+        for origin in item.get("origins", []):
+            if origin.get("source") != "leaderboard":
+                continue
+            try:
+                rank = int(str(origin.get("rank")))
+            except (TypeError, ValueError):
+                continue
+            if rank > 0:
+                ranks.append(rank)
+        return float(min(ranks)) if ranks else math.inf
+
     def key(pair: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
         wallet, item = pair
         unseen = not item.get("last_analysis_at")
@@ -320,6 +333,7 @@ def ordered_candidate_wallets(
         return (
             phase,
             legacy_only if unseen else False,
+            best_leaderboard_rank(item),
             item.get("last_analysis_at") or "",
             wallet,
         )

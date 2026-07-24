@@ -273,6 +273,44 @@ def test_queue_prioritizes_changed_wallet_before_unchanged_wallet():
     assert ordered_candidate_wallets(pool) == [changed, unchanged]
 
 
+def test_queue_prioritizes_best_leaderboard_rank_within_unseen_candidates():
+    worse_rank_lower_address = "0x" + "1" * 40
+    better_rank_higher_address = "0x" + "f" * 40
+    pool = {
+        worse_rank_lower_address: {
+            "wallet": worse_rank_lower_address,
+            "leaderboard_discovered": True,
+            "legacy_seed": False,
+            "origins": [
+                {
+                    "source": "leaderboard",
+                    "category": "WEATHER",
+                    "period": "MONTH",
+                    "rank": "20",
+                }
+            ],
+        },
+        better_rank_higher_address: {
+            "wallet": better_rank_higher_address,
+            "leaderboard_discovered": True,
+            "legacy_seed": False,
+            "origins": [
+                {
+                    "source": "leaderboard",
+                    "category": "POLITICS",
+                    "period": "ALL",
+                    "rank": "1",
+                }
+            ],
+        },
+    }
+
+    assert ordered_candidate_wallets(pool) == [
+        better_rank_higher_address,
+        worse_rank_lower_address,
+    ]
+
+
 def test_candidate_state_is_written_atomically_and_round_trips(tmp_path):
     state_path = tmp_path / "candidate-state.json"
     payload = {
