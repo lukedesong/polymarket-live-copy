@@ -24,7 +24,7 @@ from typing import Any
 DATA_API = "https://data-api.polymarket.com"
 USER_AGENT = "wallet-expert-sleeve-research/1.0"
 
-WALLETS = {
+LEGACY_SEEDS = {
     "ratehikes": "0xa309f903dbbd559e87d8d368834b8e41355c4cf2",
     "LlamaLoco0000": "0x93fb8127a1b21a112b11af936361225df0563e4a",
     "tetrose": "0x74471a007ddcc488f6d57b5e86dfb35a8d48a16d",
@@ -34,6 +34,24 @@ WALLETS = {
     "ZorroDeLaVega": "0xaae9b2c5ad90e82b5068c7f8a4b491997633d661",
     "sabsabinxz": "0xd3ecb2aee0d65622da559ff356b00e8c2e626603",
 }
+
+LEADERBOARD_CATEGORIES = (
+    "OVERALL",
+    "POLITICS",
+    "SPORTS",
+    "ESPORTS",
+    "CULTURE",
+    "MENTIONS",
+    "WEATHER",
+    "ECONOMICS",
+    "TECH",
+    "FINANCE",
+)
+LEADERBOARD_PERIODS = ("MONTH", "ALL")
+# External constraints documented by Polymarket's public leaderboard endpoint.
+LEADERBOARD_PAGE_SIZE = 50
+LEADERBOARD_MAX_OFFSET = 1_000
+CRYPTO_DOMAIN = "加密资产与代币"
 
 
 DOMAIN_RULES: list[tuple[str, re.Pattern[str]]] = [
@@ -152,6 +170,138 @@ def api_get(endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:
             time.sleep(1 + attempt)
     assert last_error is not None
     raise last_error
+
+
+def normalize_wallet(value: Any) -> str | None:
+    wallet = str(value or "").lower()
+    return wallet if re.fullmatch(r"0x[a-f0-9]{40}", wallet) else None
+
+
+def discover_leaderboard_candidates(
+    fetch: Any,
+    *,
+    categories: tuple[str, ...] = LEADERBOARD_CATEGORIES,
+    periods: tuple[str, ...] = LEADERBOARD_PERIODS,
+    observed_at: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    pair_coverage: list[dict[str, Any]] = []
+    for category in categories:
+        if category == "CRYPTO":
+            continue
+        for period in periods:
+            pair: dict[str, Any] = {
+                "category": category,
+                "period": period,
+                "rows": 0,
+                "complete": False,
+            }
+            for offset in range(
+                0, LEADERBOARD_MAX_OFFSET + 1, LEADERBOARD_PAGE_SIZE
+            ):
+                page = fetch(
+                    "v1/leaderboard",
+                    {
+                        "category": category,
+                        "timePeriod": period,
+                        "orderBy": "PNL",
+                        "limit": LEADERBOARD_PAGE_SIZE,
+                        "offset": offset,
+                    },
+                )
+                pair["rows"] += len(page)
+                for row in page:
+                    wallet = normalize_wallet(row.get("proxyWallet"))
+                    if wallet is None:
+                        continue
+                    item = candidates.setdefault(
+                        wallet,
+                        {
+                            "wallet": wallet,
+                            "name": str(row.get("userName") or wallet),
+                            "origins": [],
+                        },
+                    )
+                    if row.get("userName"):
+                        item["name"] = str(row["userName"])
+                    origin = {
+                        "source": "leaderboard",
+                        "category": category,
+                        "period": period,
+                        "rank": row.get("rank"),
+                        "pnl": row.get("pnl"),
+                        "vol": row.get("vol"),
+                        "observed_at": observed_at,
+                    }
+                    if origin not in item["origins"]:
+                        item["origins"].append(origin)
+                if len(page) < LEADERBOARD_PAGE_SIZE:
+                    pair["complete"] = True
+                    break
+            pair_coverage.append(pair)
+    return candidates, {
+        "pairs": pair_coverage,
+        "complete": all(item["complete"] for item in pair_coverage),
+    }
+
+
+def merge_candidate_pool(
+    existing: dict[str, dict[str, Any]],
+    discovered: dict[str, dict[str, Any]],
+    legacy_seeds: dict[str, str],
+    *,
+    observed_at: str,
+) -> dict[str, dict[str, Any]]:
+    merged = {wallet: dict(item) for wallet, item in existing.items()}
+    legacy_by_wallet = {
+        wallet.lower(): name for name, wallet in legacy_seeds.items()
+    }
+    for wallet, incoming in discovered.items():
+        item = merged.setdefault(wallet, {"wallet": wallet, "origins": []})
+        item.setdefault("origins", [])
+        item["name"] = incoming["name"]
+        item["first_seen"] = item.get("first_seen") or observed_at
+        item["last_seen"] = observed_at
+        item["legacy_seed"] = wallet in legacy_by_wallet
+        item["leaderboard_discovered"] = True
+        for origin in incoming["origins"]:
+            if origin not in item["origins"]:
+                item["origins"].append(origin)
+    for wallet, name in legacy_by_wallet.items():
+        item = merged.setdefault(wallet, {"wallet": wallet, "origins": []})
+        item.setdefault("origins", [])
+        item["name"] = item.get("name") or name
+        item["first_seen"] = item.get("first_seen") or observed_at
+        item["last_seen"] = item.get("last_seen") or observed_at
+        item["legacy_seed"] = True
+        item.setdefault("leaderboard_discovered", False)
+        origin = {"source": "legacy_seed", "name": name}
+        if origin not in item["origins"]:
+            item["origins"].append(origin)
+    return merged
+
+
+def ordered_candidate_wallets(
+    pool: dict[str, dict[str, Any]],
+) -> list[str]:
+    def key(pair: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
+        wallet, item = pair
+        unseen = not item.get("last_analysis_at")
+        latest = int(item.get("latest_source_trade_timestamp") or 0)
+        analyzed = int(item.get("last_analyzed_source_trade_timestamp") or 0)
+        changed = not unseen and latest > analyzed
+        phase = 0 if unseen else 1 if changed else 2
+        legacy_only = item.get("legacy_seed", False) and not item.get(
+            "leaderboard_discovered", False
+        )
+        return (
+            phase,
+            legacy_only if unseen else False,
+            item.get("last_analysis_at") or "",
+            wallet,
+        )
+
+    return [wallet for wallet, _ in sorted(pool.items(), key=key)]
 
 
 def fetch_trades(wallet: str) -> tuple[list[dict[str, Any]], bool]:
