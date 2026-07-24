@@ -304,32 +304,92 @@ def ordered_candidate_wallets(
     return [wallet for wallet, _ in sorted(pool.items(), key=key)]
 
 
-def fetch_trades(wallet: str) -> tuple[list[dict[str, Any]], bool]:
-    rows: list[dict[str, Any]] = []
-    page_sizes: list[int] = []
-    for offset in (0, 10_000):
-        page = api_get(
-            "trades",
-            {
+def fetch_trades(
+    wallet: str,
+    *,
+    fetch: Any = api_get,
+    page_size: int = 10_000,
+    max_offset: int = 10_000,
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
+    """Read full user history with documented timestamp-window pagination.
+
+    The production page size and offset are external Data API constraints.
+    Smaller values are injectable only for deterministic pagination tests.
+    """
+
+    accepted: list[dict[str, Any]] = []
+    windows: list[dict[str, Any]] = []
+    window_end: int | None = None
+    while True:
+        pages: list[dict[str, Any]] = []
+        for offset in range(0, max_offset + 1, page_size):
+            params: dict[str, Any] = {
                 "user": wallet,
                 "takerOnly": "false",
-                "limit": 10_000,
+                "limit": page_size,
                 "offset": offset,
-            },
+                "start": 1,
+            }
+            if window_end is not None:
+                params["end"] = window_end
+            page = fetch("trades", params)
+            pages.extend(page)
+            if len(page) < page_size:
+                accepted.extend(pages)
+                windows.append(
+                    {
+                        "end": window_end,
+                        "rows": len(pages),
+                        "complete": True,
+                    }
+                )
+                return accepted, True, {
+                    "windows": windows,
+                    "window_count": len(windows),
+                    "block_reason": None,
+                }
+
+        timestamps = [
+            int(number(row.get("timestamp")))
+            for row in pages
+            if int(number(row.get("timestamp"))) > 0
+        ]
+        if not timestamps:
+            return accepted, False, {
+                "windows": windows,
+                "window_count": len(windows),
+                "block_reason": "missing_timestamp",
+            }
+        cutoff = min(timestamps)
+        if window_end is not None and cutoff >= window_end:
+            return accepted, False, {
+                "windows": windows,
+                "window_count": len(windows),
+                "block_reason": "same_timestamp_exceeds_offset_window",
+            }
+        accepted.extend(
+            row
+            for row in pages
+            if int(number(row.get("timestamp"))) > cutoff
         )
-        rows.extend(page)
-        page_sizes.append(len(page))
-        if len(page) < 10_000:
-            break
-    truncated = page_sizes == [10_000, 10_000]
-    return rows, truncated
+        windows.append(
+            {
+                "end": window_end,
+                "rows": len(pages),
+                "complete": False,
+                "next_end": cutoff,
+            }
+        )
+        window_end = cutoff
 
 
-def fetch_closed_positions(wallet: str) -> tuple[list[dict[str, Any]], bool]:
+def fetch_closed_positions(
+    wallet: str, *, fetch: Any = api_get
+) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     complete = False
     for offset in range(0, 100_001, 50):
-        page = api_get(
+        page = fetch(
             "closed-positions",
             {
                 "user": wallet,
@@ -346,11 +406,13 @@ def fetch_closed_positions(wallet: str) -> tuple[list[dict[str, Any]], bool]:
     return rows, complete
 
 
-def fetch_open_positions(wallet: str) -> tuple[list[dict[str, Any]], bool]:
+def fetch_open_positions(
+    wallet: str, *, fetch: Any = api_get
+) -> tuple[list[dict[str, Any]], bool]:
     rows: list[dict[str, Any]] = []
     complete = False
     for offset in range(0, 10_001, 500):
-        page = api_get(
+        page = fetch(
             "positions",
             {
                 "user": wallet,
@@ -382,6 +444,113 @@ def classify_domain(title: str, event_slug: str) -> str:
         if pattern.search(text):
             return label
     return "其他/未分类"
+
+
+def partition_noncrypto_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    kept: list[dict[str, Any]] = []
+    removed: list[dict[str, Any]] = []
+    for row in rows:
+        domain = classify_domain(
+            str(row.get("title") or ""),
+            str(row.get("eventSlug") or ""),
+        )
+        target = removed if domain == CRYPTO_DOMAIN else kept
+        target.append(row)
+    return kept, removed
+
+
+def analyze_trade_lifecycle(
+    trades: list[dict[str, Any]],
+    *,
+    closed_condition_ids: set[str],
+) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in trades:
+        condition = str(
+            row.get("conditionId")
+            or row.get("eventSlug")
+            or row.get("asset")
+            or "unknown"
+        )
+        grouped[condition].append(row)
+
+    conditions: dict[str, dict[str, Any]] = {}
+    same_timestamp_cycles = 0
+    formula_conditions = 0
+    directional_conditions = 0
+    for condition, rows in grouped.items():
+        assets = {str(row.get("asset") or "") for row in rows}
+        outcomes = {str(row.get("outcome") or "") for row in rows}
+        sides = {
+            str(row.get("side") or "").upper()
+            for row in rows
+            if row.get("side")
+        }
+        side_by_asset_time: dict[tuple[str, int], set[str]] = defaultdict(set)
+        for row in rows:
+            timestamp = int(number(row.get("timestamp")))
+            side = str(row.get("side") or "").upper()
+            if timestamp and side:
+                side_by_asset_time[
+                    (str(row.get("asset") or ""), timestamp)
+                ].add(side)
+        cycles = sum(
+            values == {"BUY", "SELL"}
+            for values in side_by_asset_time.values()
+        )
+        same_timestamp_cycles += cycles
+
+        nonempty_assets = {value for value in assets if value}
+        nonempty_outcomes = {value for value in outcomes if value}
+        if len(nonempty_assets) > 1 or len(nonempty_outcomes) > 1:
+            lifecycle = "BASKET_OR_HEDGE"
+            formula_conditions += 1
+        elif sides == {"BUY", "SELL"}:
+            lifecycle = "ACTIVE_EXIT"
+            formula_conditions += 1
+        elif sides == {"BUY"} and condition in closed_condition_ids:
+            lifecycle = "HOLD_TO_RESOLUTION"
+            directional_conditions += 1
+        elif sides == {"BUY"}:
+            lifecycle = "OPEN_OR_UNRESOLVED"
+            directional_conditions += 1
+        elif sides == {"SELL"}:
+            lifecycle = "SELL_ONLY_INCOMPLETE_HISTORY"
+            formula_conditions += 1
+        else:
+            lifecycle = "UNRESOLVED"
+            formula_conditions += 1
+
+        conditions[condition] = {
+            "lifecycle": lifecycle,
+            "sides": sorted(sides),
+            "assets": sorted(nonempty_assets),
+            "outcomes": sorted(nonempty_outcomes),
+            "raw_fill_rows": len(rows),
+            "same_timestamp_opposite_side_cycles": cycles,
+        }
+
+    if not conditions:
+        strategy_state = "NO_NONCRYPTO_SLEEVE"
+    elif same_timestamp_cycles and not directional_conditions:
+        strategy_state = "OBSERVABLE_MM_OR_SPEED"
+    elif formula_conditions:
+        strategy_state = "FORMULA_RESEARCH"
+    else:
+        strategy_state = "DIRECTIONAL_RESEARCH_CANDIDATE"
+    lifecycle_counts = Counter(
+        item["lifecycle"] for item in conditions.values()
+    )
+    return {
+        "strategy_state": strategy_state,
+        "conditions": conditions,
+        "lifecycle_counts": dict(sorted(lifecycle_counts.items())),
+        "same_timestamp_opposite_side_cycles": same_timestamp_cycles,
+        "directional_condition_count": directional_conditions,
+        "formula_condition_count": formula_conditions,
+    }
 
 
 def iso_date(timestamp: int | float | None) -> str | None:
@@ -670,14 +839,60 @@ def open_position_summary(
     }
 
 
-def scan_wallet(name: str, wallet: str) -> dict[str, Any]:
-    trades, trades_truncated = fetch_trades(wallet)
-    closed_rows, closed_complete = fetch_closed_positions(wallet)
-    open_rows, open_complete = fetch_open_positions(wallet)
-    events = aggregate_events(closed_rows)
+def scan_wallet(
+    name: str, wallet: str, *, fetch: Any = api_get
+) -> dict[str, Any]:
+    trades, trades_complete, trade_coverage = fetch_trades(
+        wallet, fetch=fetch
+    )
+    closed_rows, closed_complete = fetch_closed_positions(
+        wallet, fetch=fetch
+    )
+    open_rows, open_complete = fetch_open_positions(wallet, fetch=fetch)
+    noncrypto_trades, crypto_trades = partition_noncrypto_rows(trades)
+    noncrypto_closed, crypto_closed = partition_noncrypto_rows(closed_rows)
+    noncrypto_open, crypto_open = partition_noncrypto_rows(open_rows)
+    events = aggregate_events(noncrypto_closed)
+    closed_condition_ids = {
+        str(row.get("conditionId"))
+        for row in noncrypto_closed
+        if row.get("conditionId")
+    }
+    lifecycle = analyze_trade_lifecycle(
+        noncrypto_trades,
+        closed_condition_ids=closed_condition_ids,
+    )
+    observed_strategy_state = lifecycle["strategy_state"]
+    coverage_complete = (
+        trades_complete and closed_complete and open_complete
+    )
+    block_reasons = []
+    if not trades_complete:
+        block_reasons.append(
+            trade_coverage.get("block_reason") or "trades_incomplete"
+        )
+    if not closed_complete:
+        block_reasons.append("closed_positions_incomplete")
+    if not open_complete:
+        block_reasons.append("open_positions_incomplete")
+    if not coverage_complete:
+        lifecycle["observed_strategy_state"] = observed_strategy_state
+        lifecycle["strategy_state"] = "BLOCK_DATA"
+    lifecycle["block_reasons"] = block_reasons
+    latest_source_trade_timestamp = max(
+        (int(number(row.get("timestamp"))) for row in trades),
+        default=0,
+    )
+    latest_noncrypto_trade_timestamp = max(
+        (int(number(row.get("timestamp"))) for row in noncrypto_trades),
+        default=0,
+    )
     return {
         "name": name,
         "wallet": wallet,
+        "profile_url": f"https://polymarket.com/profile/{wallet}",
+        "latest_source_trade_timestamp": latest_source_trade_timestamp,
+        "latest_noncrypto_trade_timestamp": latest_noncrypto_trade_timestamp,
         "sources": {
             "trades": (
                 f"{DATA_API}/trades?user={wallet}&takerOnly=false"
@@ -687,14 +902,23 @@ def scan_wallet(name: str, wallet: str) -> dict[str, Any]:
             ),
             "open_positions": f"{DATA_API}/positions?user={wallet}",
         },
-        "trades": trade_summary(trades, trades_truncated),
+        "crypto_rows_removed": {
+            "trades": len(crypto_trades),
+            "closed_positions": len(crypto_closed),
+            "open_positions": len(crypto_open),
+        },
+        "strategy": lifecycle,
+        "trade_history_coverage": trade_coverage,
+        "trades": trade_summary(noncrypto_trades, not trades_complete),
         "closed_positions": {
             "pagination_complete": closed_complete,
-            "position_rows": len(closed_rows),
+            "position_rows": len(noncrypto_closed),
             "event_level": period_summary(events),
             "domains": domain_summaries(events),
         },
-        "open_positions": open_position_summary(open_rows, open_complete),
+        "open_positions": open_position_summary(
+            noncrypto_open, open_complete
+        ),
     }
 
 
