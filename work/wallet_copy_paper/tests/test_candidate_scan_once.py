@@ -261,7 +261,7 @@ def test_light_screen_allows_clean_one_sided_candidate_into_deep_scan():
     assert result["deep_scan_eligible"] is True
 
 
-def test_light_screen_defers_same_second_multi_transaction_speed_risk():
+def test_light_screen_flags_but_keeps_one_sided_multi_transaction_candidate():
     wallet = "0x" + "a" * 40
     rows = [
         trade(wallet, "first", "yes-1", "BUY", 10, "Election"),
@@ -276,8 +276,11 @@ def test_light_screen_defers_same_second_multi_transaction_speed_risk():
     result = light_screen_wallet("speed", wallet, fetch=fetch)
 
     assert result["strategy"]["same_second_transaction_burst_count"] == 1
-    assert result["strategy"]["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
-    assert result["deep_scan_eligible"] is False
+    assert result["strategy"]["strategy_state"] == (
+        "DIRECTIONAL_RESEARCH_CANDIDATE"
+    )
+    assert result["strategy"]["execution_speed_risk_observed"] is True
+    assert result["deep_scan_eligible"] is True
 
 
 def test_discovery_records_pair_failure_and_keeps_other_pairs():

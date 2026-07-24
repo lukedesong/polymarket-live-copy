@@ -883,16 +883,15 @@ def light_screen_wallet(
         for transaction_hashes in transactions_by_second.values()
     )
     lifecycle["same_second_transaction_burst_count"] = burst_count
+    lifecycle["execution_speed_risk_observed"] = bool(burst_count)
     lifecycle["screen_reasons"] = []
     if burst_count:
-        lifecycle["observed_strategy_state"] = lifecycle[
-            "strategy_state"
-        ]
-        lifecycle["strategy_state"] = "OBSERVABLE_MM_OR_SPEED"
         lifecycle["screen_reasons"].append(
-            "Multiple unique source transactions share an exact API second."
+            "Multiple unique source transactions share an exact API second; "
+            "this is a speed-risk flag, not standalone evidence of market "
+            "making or price-dependent exits."
         )
-    elif lifecycle["strategy_state"] == "FORMULA_RESEARCH":
+    if lifecycle["strategy_state"] == "FORMULA_RESEARCH":
         lifecycle["screen_reasons"].append(
             "Recent public rows contain active exits, baskets, or incomplete "
             "sell-only lifecycle evidence."
