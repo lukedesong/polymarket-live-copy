@@ -7,6 +7,7 @@ from candidate_scan_once import (
     analyze_trade_lifecycle,
     discover_leaderboard_candidates,
     fetch_trades,
+    light_screen_wallet,
     load_candidate_state,
     main,
     merge_candidate_pool,
@@ -229,6 +230,56 @@ def test_exact_same_timestamp_opposite_sides_without_directional_evidence_is_spe
     assert result["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
 
 
+def test_light_screen_defers_active_exit_strategy_from_full_history():
+    wallet = "0x" + "8" * 40
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        assert endpoint == "trades"
+        return [
+            trade(wallet, "exit", "yes", "BUY", 10, "Election"),
+            trade(wallet, "exit", "yes", "SELL", 11, "Election"),
+        ]
+
+    result = light_screen_wallet("active-exit", wallet, fetch=fetch)
+
+    assert result["analysis_depth"] == "LIGHT_SCREEN"
+    assert result["strategy"]["strategy_state"] == "FORMULA_RESEARCH"
+    assert result["deep_scan_eligible"] is False
+
+
+def test_light_screen_allows_clean_one_sided_candidate_into_deep_scan():
+    wallet = "0x" + "9" * 40
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        return [trade(wallet, "hold", "yes", "BUY", 10, "Election")]
+
+    result = light_screen_wallet("directional", wallet, fetch=fetch)
+
+    assert result["strategy"]["strategy_state"] == (
+        "DIRECTIONAL_RESEARCH_CANDIDATE"
+    )
+    assert result["deep_scan_eligible"] is True
+
+
+def test_light_screen_defers_same_second_multi_transaction_speed_risk():
+    wallet = "0x" + "a" * 40
+    rows = [
+        trade(wallet, "first", "yes-1", "BUY", 10, "Election"),
+        trade(wallet, "second", "yes-2", "BUY", 10, "Election"),
+    ]
+    rows[0]["transactionHash"] = "0xfirst"
+    rows[1]["transactionHash"] = "0xsecond"
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        return rows
+
+    result = light_screen_wallet("speed", wallet, fetch=fetch)
+
+    assert result["strategy"]["same_second_transaction_burst_count"] == 1
+    assert result["strategy"]["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
+    assert result["deep_scan_eligible"] is False
+
+
 def test_discovery_records_pair_failure_and_keeps_other_pairs():
     dynamic = "0x" + "3" * 40
 
@@ -370,3 +421,47 @@ def test_main_writes_dynamic_pool_snapshot_and_markdown(tmp_path):
     assert "polymarket.com/profile/" in report_text
     assert payload["paper_only"] is True
     assert payload["real_order_submitted"] is False
+
+
+def test_main_light_screens_active_exit_without_full_history_calls(tmp_path):
+    dynamic = "0x" + "b" * 40
+
+    def fetch(endpoint: str, params: dict[str, object]):
+        if endpoint == "v1/leaderboard":
+            return [leaderboard_row(dynamic, "active-exit-weather", 1)]
+        if endpoint == "trades":
+            return [
+                trade(dynamic, "exit", "yes", "BUY", 10, "Election"),
+                trade(dynamic, "exit", "yes", "SELL", 11, "Election"),
+            ]
+        raise AssertionError(
+            f"light screen must not call full-history endpoint: {endpoint}"
+        )
+
+    output = tmp_path / "snapshot.json"
+    state = tmp_path / "state.json"
+    report = tmp_path / "snapshot.md"
+    exit_code = main(
+        [
+            "--output",
+            str(output),
+            "--state",
+            str(state),
+            "--report",
+            str(report),
+            "--categories",
+            "WEATHER",
+            "--periods",
+            "MONTH",
+            "--max-wallets",
+            "1",
+        ],
+        fetch=fetch,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert payload["wallets"][0]["analysis_depth"] == "LIGHT_SCREEN"
+    assert payload["wallets"][0]["strategy"]["strategy_state"] == (
+        "FORMULA_RESEARCH"
+    )

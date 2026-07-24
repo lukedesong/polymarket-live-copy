@@ -54,6 +54,8 @@ LEADERBOARD_PAGE_SIZE = 50
 LEADERBOARD_MAX_OFFSET = 1_000
 TRADE_PAGE_SIZE = 10_000
 TRADE_MAX_OFFSET = 10_000
+# External default page size documented for the public trades endpoint.
+RECENT_LIGHT_SCREEN_LIMIT = 100
 CLOSED_POSITION_PAGE_SIZE = 50
 CLOSED_POSITION_MAX_OFFSET = 100_000
 OPEN_POSITION_PAGE_SIZE = 500
@@ -846,6 +848,124 @@ def trade_summary(
     }
 
 
+def light_screen_wallet(
+    name: str,
+    wallet: str,
+    *,
+    fetch: Any = api_get,
+) -> dict[str, Any]:
+    """Classify recent execution shape before any full-history pagination."""
+
+    trades = fetch(
+        "trades",
+        {
+            "user": wallet,
+            "takerOnly": "false",
+            "limit": RECENT_LIGHT_SCREEN_LIMIT,
+            "offset": 0,
+            "start": 1,
+        },
+    )
+    noncrypto_trades, crypto_trades = partition_noncrypto_rows(trades)
+    lifecycle = analyze_trade_lifecycle(
+        noncrypto_trades,
+        closed_condition_ids=set(),
+    )
+
+    transactions_by_second: dict[int, set[str]] = defaultdict(set)
+    for row in noncrypto_trades:
+        timestamp = int(number(row.get("timestamp")))
+        transaction_hash = str(row.get("transactionHash") or "")
+        if timestamp and transaction_hash:
+            transactions_by_second[timestamp].add(transaction_hash)
+    burst_count = sum(
+        len(transaction_hashes) > 1
+        for transaction_hashes in transactions_by_second.values()
+    )
+    lifecycle["same_second_transaction_burst_count"] = burst_count
+    lifecycle["screen_reasons"] = []
+    if burst_count:
+        lifecycle["observed_strategy_state"] = lifecycle[
+            "strategy_state"
+        ]
+        lifecycle["strategy_state"] = "OBSERVABLE_MM_OR_SPEED"
+        lifecycle["screen_reasons"].append(
+            "Multiple unique source transactions share an exact API second."
+        )
+    elif lifecycle["strategy_state"] == "FORMULA_RESEARCH":
+        lifecycle["screen_reasons"].append(
+            "Recent public rows contain active exits, baskets, or incomplete "
+            "sell-only lifecycle evidence."
+        )
+    elif lifecycle["strategy_state"] == "NO_NONCRYPTO_SLEEVE":
+        lifecycle["screen_reasons"].append(
+            "The recent public sample contains no non-crypto sleeve."
+        )
+
+    conditions_by_domain: dict[str, set[str]] = defaultdict(set)
+    for row in noncrypto_trades:
+        domain = classify_domain(
+            str(row.get("title") or ""),
+            str(row.get("eventSlug") or ""),
+        )
+        condition = str(
+            row.get("conditionId")
+            or row.get("eventSlug")
+            or row.get("asset")
+            or "unknown"
+        )
+        conditions_by_domain[domain].add(condition)
+    primary_domain = None
+    if conditions_by_domain:
+        primary_domain = sorted(
+            conditions_by_domain,
+            key=lambda domain: (
+                -len(conditions_by_domain[domain]),
+                domain,
+            ),
+        )[0]
+
+    latest_source_trade_timestamp = max(
+        (int(number(row.get("timestamp"))) for row in trades),
+        default=0,
+    )
+    latest_noncrypto_trade_timestamp = max(
+        (int(number(row.get("timestamp"))) for row in noncrypto_trades),
+        default=0,
+    )
+    return {
+        "name": name,
+        "wallet": wallet,
+        "profile_url": profile_url(wallet),
+        "analysis_depth": "LIGHT_SCREEN",
+        "deep_scan_eligible": (
+            lifecycle["strategy_state"]
+            == "DIRECTIONAL_RESEARCH_CANDIDATE"
+        ),
+        "primary_domain": primary_domain,
+        "latest_source_trade_timestamp": latest_source_trade_timestamp,
+        "latest_noncrypto_trade_timestamp": (
+            latest_noncrypto_trade_timestamp
+        ),
+        "sources": {
+            "trades": f"{DATA_API}/trades?user={wallet}&takerOnly=false",
+        },
+        "crypto_rows_removed": {
+            "trades": len(crypto_trades),
+            "closed_positions": None,
+            "open_positions": None,
+        },
+        "strategy": lifecycle,
+        "recent_trade_sample": {
+            "external_page_limit": RECENT_LIGHT_SCREEN_LIMIT,
+            "returned_rows": len(trades),
+            "page_full": len(trades) == RECENT_LIGHT_SCREEN_LIMIT,
+            "coverage": "RECENT_ONLY_NOT_FULL_HISTORY",
+        },
+        "trades": trade_summary(noncrypto_trades, False),
+    }
+
+
 def open_position_summary(
     rows: list[dict[str, Any]], complete: bool
 ) -> dict[str, Any]:
@@ -932,10 +1052,18 @@ def scan_wallet(
         (int(number(row.get("timestamp"))) for row in noncrypto_trades),
         default=0,
     )
+    closed_domain_summaries = domain_summaries(events)
     return {
         "name": name,
         "wallet": wallet,
         "profile_url": f"https://polymarket.com/profile/{wallet}",
+        "analysis_depth": "DEEP_HISTORY",
+        "deep_scan_eligible": True,
+        "primary_domain": (
+            closed_domain_summaries[0]["domain"]
+            if closed_domain_summaries
+            else None
+        ),
         "latest_source_trade_timestamp": latest_source_trade_timestamp,
         "latest_noncrypto_trade_timestamp": latest_noncrypto_trade_timestamp,
         "sources": {
@@ -959,7 +1087,7 @@ def scan_wallet(
             "pagination_complete": closed_complete,
             "position_rows": len(noncrypto_closed),
             "event_level": period_summary(events),
-            "domains": domain_summaries(events),
+            "domains": closed_domain_summaries,
         },
         "open_positions": open_position_summary(
             noncrypto_open, open_complete
@@ -1059,6 +1187,7 @@ def candidate_pool_rows(
                 "last_analysis_at": item.get("last_analysis_at"),
                 "analysis_status": item.get("analysis_status")
                 or "PENDING",
+                "analysis_depth": item.get("analysis_depth"),
                 "analysis_error": item.get("analysis_error"),
                 "activity_probe_error": item.get(
                     "activity_probe_error"
@@ -1246,7 +1375,10 @@ def render_markdown(
                     "lifecycle_counts", {}
                 ).items()
             )
-            removed = sum(result["crypto_rows_removed"].values())
+            removed = sum(
+                value or 0
+                for value in result["crypto_rows_removed"].values()
+            )
             lines.append(
                 f"| {markdown_cell(result['name'])} | "
                 f"[{result['wallet']}]({result['profile_url']}) | "
@@ -1364,11 +1496,19 @@ def main(
         for wallet in selected:
             item = pool[wallet]
             try:
-                result = scan_wallet(
+                light_result = light_screen_wallet(
                     str(item.get("name") or wallet),
                     wallet,
                     fetch=fetch,
                 )
+                if light_result["deep_scan_eligible"]:
+                    result = scan_wallet(
+                        str(item.get("name") or wallet),
+                        wallet,
+                        fetch=fetch,
+                    )
+                else:
+                    result = light_result
                 wallet_results.append(result)
                 item["last_analysis_at"] = generated_at
                 item["latest_source_trade_timestamp"] = result[
@@ -1383,9 +1523,13 @@ def main(
                 item["analysis_status"] = result["strategy"][
                     "strategy_state"
                 ]
-                domains = result["closed_positions"].get("domains", [])
+                item["analysis_depth"] = result["analysis_depth"]
+                domains = result.get("closed_positions", {}).get(
+                    "domains", []
+                )
                 item["expert_sleeve"] = (
-                    domains[0]["domain"] if domains else None
+                    result.get("primary_domain")
+                    or (domains[0]["domain"] if domains else None)
                 )
                 item.pop("analysis_error", None)
             except Exception as error:
