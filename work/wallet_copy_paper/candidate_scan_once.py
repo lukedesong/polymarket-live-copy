@@ -528,6 +528,13 @@ def analyze_trade_lifecycle(
     formula_conditions = 0
     directional_conditions = 0
     for condition, rows in grouped.items():
+        domain = Counter(
+            classify_domain(
+                str(row.get("title") or ""),
+                str(row.get("eventSlug") or ""),
+            )
+            for row in rows
+        ).most_common(1)[0][0]
         assets = {str(row.get("asset") or "") for row in rows}
         outcomes = {str(row.get("outcome") or "") for row in rows}
         sides = {
@@ -572,6 +579,7 @@ def analyze_trade_lifecycle(
 
         conditions[condition] = {
             "lifecycle": lifecycle,
+            "domain": domain,
             "sides": sorted(sides),
             "assets": sorted(nonempty_assets),
             "outcomes": sorted(nonempty_outcomes),
@@ -590,10 +598,21 @@ def analyze_trade_lifecycle(
     lifecycle_counts = Counter(
         item["lifecycle"] for item in conditions.values()
     )
+    lifecycle_counts_by_domain: dict[str, Counter[str]] = defaultdict(
+        Counter
+    )
+    for item in conditions.values():
+        lifecycle_counts_by_domain[item["domain"]][item["lifecycle"]] += 1
     return {
         "strategy_state": strategy_state,
         "conditions": conditions,
         "lifecycle_counts": dict(sorted(lifecycle_counts.items())),
+        "lifecycle_counts_by_domain": {
+            domain: dict(sorted(counts.items()))
+            for domain, counts in sorted(
+                lifecycle_counts_by_domain.items()
+            )
+        },
         "same_timestamp_opposite_side_cycles": same_timestamp_cycles,
         "directional_condition_count": directional_conditions,
         "formula_condition_count": formula_conditions,

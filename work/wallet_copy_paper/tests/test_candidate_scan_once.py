@@ -213,8 +213,14 @@ def test_lifecycle_separates_hold_exit_and_basket():
     result = analyze_trade_lifecycle(rows, closed_condition_ids={"hold"})
 
     assert result["conditions"]["hold"]["lifecycle"] == "HOLD_TO_RESOLUTION"
+    assert result["conditions"]["hold"]["domain"] == "选举与一般政治"
     assert result["conditions"]["exit"]["lifecycle"] == "ACTIVE_EXIT"
     assert result["conditions"]["basket"]["lifecycle"] == "BASKET_OR_HEDGE"
+    assert result["lifecycle_counts_by_domain"]["选举与一般政治"] == {
+        "ACTIVE_EXIT": 1,
+        "BASKET_OR_HEDGE": 1,
+        "HOLD_TO_RESOLUTION": 1,
+    }
     assert result["strategy_state"] == "FORMULA_RESEARCH"
 
 
