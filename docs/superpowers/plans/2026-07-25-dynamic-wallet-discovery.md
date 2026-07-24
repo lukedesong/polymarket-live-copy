@@ -16,7 +16,7 @@
 - Modify: `work/wallet_copy_paper/candidate_scan_once.py`
 - Create: `work/wallet_copy_paper/tests/test_candidate_scan_once.py`
 
-- [ ] **Step 1: Write failing discovery and pool tests**
+- [x] **Step 1: Write failing discovery and pool tests**
 
 ```python
 from candidate_scan_once import (
@@ -83,18 +83,20 @@ def test_pool_keeps_dynamic_wallet_and_legacy_is_only_provenance():
     assert ordered_candidate_wallets(pool)[0] == dynamic
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
 ```bash
 /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
-  -m pytest -q work/wallet_copy_paper/tests/test_candidate_scan_once.py
+  -m pytest -q tests/test_candidate_scan_once.py
 ```
+
+Working directory: `work/wallet_copy_paper`.
 
 Expected: collection fails because the discovery/state functions do not exist.
 
-- [ ] **Step 3: Implement public leaderboard discovery and state primitives**
+- [x] **Step 3: Implement public leaderboard discovery and state primitives**
 
 Add the official non-crypto categories, approved periods, and external API page bounds:
 
@@ -222,13 +224,13 @@ def ordered_candidate_wallets(pool):
     return [wallet for wallet, _ in sorted(pool.items(), key=key)]
 ```
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run the focused command from Step 2.
 
 Expected: all discovery/state tests pass.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add work/wallet_copy_paper/candidate_scan_once.py \
@@ -242,7 +244,7 @@ git commit -m "feat: discover dynamic wallet candidates"
 - Modify: `work/wallet_copy_paper/candidate_scan_once.py`
 - Modify: `work/wallet_copy_paper/tests/test_candidate_scan_once.py`
 
-- [ ] **Step 1: Add failing pagination, filtering, and lifecycle tests**
+- [x] **Step 1: Add failing pagination, filtering, and lifecycle tests**
 
 ```python
 def trade(wallet, condition, asset, side, timestamp, title, outcome="Yes"):
@@ -323,13 +325,13 @@ def test_lifecycle_separates_hold_exit_and_basket():
     assert result["strategy_state"] == "FORMULA_RESEARCH"
 ```
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 Run the focused test command.
 
 Expected: failures identify missing window-pagination, partition, and lifecycle functions.
 
-- [ ] **Step 3: Implement complete-history window pagination**
+- [x] **Step 3: Implement complete-history window pagination**
 
 Replace the fixed two-offset trade reader with:
 
@@ -378,7 +380,7 @@ def fetch_trades(
 
 The production defaults are external Data API constraints. A non-progressing same-timestamp boundary returns incomplete coverage and blocks promotion.
 
-- [ ] **Step 4: Implement sleeve filtering and lifecycle analysis**
+- [x] **Step 4: Implement sleeve filtering and lifecycle analysis**
 
 Add `partition_noncrypto_rows`, `analyze_trade_lifecycle`, and the strategy-state rules. Group by condition, retain side/outcome/asset structure, count exact same-timestamp opposite-side activity, and use only zero/non-zero logical gates:
 
@@ -463,18 +465,20 @@ def analyze_trade_lifecycle(trades, *, closed_condition_ids):
 
 Update `scan_wallet` so trades, closed positions, and open positions are partitioned before summaries; report removed crypto-row counts, lifecycle evidence, profile URL, and `BLOCK_DATA` when history is incomplete.
 
-- [ ] **Step 5: Run focused and existing non-live tests**
+- [x] **Step 5: Run focused and existing non-live tests**
 
 Run:
 
 ```bash
 /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
-  -m pytest -q -m 'not live' work/wallet_copy_paper/tests
+  -m pytest -q -m 'not live' tests
 ```
+
+Working directory: `work/wallet_copy_paper`.
 
 Expected: all tests pass with the existing paper tests unchanged.
 
-- [ ] **Step 6: Commit Task 2**
+- [x] **Step 6: Commit Task 2**
 
 ```bash
 git add work/wallet_copy_paper/candidate_scan_once.py \
@@ -488,7 +492,7 @@ git commit -m "feat: classify copy strategy lifecycle"
 - Modify: `work/wallet_copy_paper/candidate_scan_once.py`
 - Modify: `work/wallet_copy_paper/tests/test_candidate_scan_once.py`
 
-- [ ] **Step 1: Add failing CLI/checkpoint integration test**
+- [x] **Step 1: Add failing CLI/checkpoint integration test**
 
 ```python
 def test_main_writes_dynamic_pool_snapshot_and_markdown(tmp_path):
@@ -521,13 +525,13 @@ def test_main_writes_dynamic_pool_snapshot_and_markdown(tmp_path):
     assert "polymarket.com/profile/" in report.read_text()
 ```
 
-- [ ] **Step 2: Run the integration test and verify RED**
+- [x] **Step 2: Run the integration test and verify RED**
 
 Run the focused test command.
 
 Expected: `main` rejects injected arguments/fetcher and does not create state or Markdown.
 
-- [ ] **Step 3: Implement state, queue, CLI, and reports**
+- [x] **Step 3: Implement state, queue, CLI, and reports**
 
 Implement:
 
@@ -622,24 +626,26 @@ def main(argv=None, *, fetch=api_get):
     return 0
 ```
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run the focused test command.
 
 Expected: all candidate scanner tests pass.
 
-- [ ] **Step 5: Run the complete non-live wallet-copy suite**
+- [x] **Step 5: Run the complete non-live wallet-copy suite**
 
 Run:
 
 ```bash
 /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
-  -m pytest -q -m 'not live' work/wallet_copy_paper/tests
+  -m pytest -q -m 'not live' tests
 ```
+
+Working directory: `work/wallet_copy_paper`.
 
 Expected: zero failures.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add work/wallet_copy_paper/candidate_scan_once.py \
@@ -653,18 +659,20 @@ git commit -m "feat: checkpoint dynamic wallet scans"
 - Modify: `docs/superpowers/plans/2026-07-25-dynamic-wallet-discovery.md`
 - Generate (ignored/local evidence): `/tmp/polymarket-dynamic-wallet-validation/`
 
-- [ ] **Step 1: Run syntax and full non-live verification**
+- [x] **Step 1: Run syntax and full non-live verification**
 
 ```bash
 /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
-  -m py_compile work/wallet_copy_paper/candidate_scan_once.py
+  -m py_compile candidate_scan_once.py
 /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
-  -m pytest -q -m 'not live' work/wallet_copy_paper/tests
+  -m pytest -q -m 'not live' tests
 ```
+
+Working directory: `work/wallet_copy_paper`.
 
 Expected: compilation succeeds and all non-live tests pass.
 
-- [ ] **Step 2: Run a bounded public discovery snapshot**
+- [x] **Step 2: Run a bounded public discovery snapshot**
 
 ```bash
 mkdir -p /tmp/polymarket-dynamic-wallet-validation
@@ -680,7 +688,7 @@ mkdir -p /tmp/polymarket-dynamic-wallet-validation
 
 The WEATHER/MONTH scope is an explicit validation-run scope, not a research qualification threshold.
 
-- [ ] **Step 3: Audit the live snapshot**
+- [x] **Step 3: Audit the live snapshot**
 
 Read the generated files and verify:
 
@@ -691,7 +699,7 @@ Read the generated files and verify:
 - `paper_only=true` and `real_order_submitted=false`;
 - no source history or delayed-copy result is mislabeled `COPYABLE_EVIDENCE`.
 
-- [ ] **Step 4: Audit diffs and safety**
+- [x] **Step 4: Audit diffs and safety**
 
 ```bash
 git diff --check
@@ -704,7 +712,7 @@ rg -n "private.key|api.key|secret|POST|place.order|create.order|live.trading" \
 
 Expected: no whitespace errors, no credential/order path, and only planned files changed.
 
-- [ ] **Step 5: Mark the plan complete and commit it**
+- [x] **Step 5: Mark the plan complete and commit it**
 
 Change every completed checkbox in this plan from `[ ]` to `[x]`, rerun `git diff --check`, then:
 
