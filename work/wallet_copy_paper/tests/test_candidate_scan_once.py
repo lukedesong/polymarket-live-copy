@@ -237,7 +237,7 @@ def test_exact_same_timestamp_opposite_sides_without_directional_evidence_is_spe
     assert result["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
 
 
-def test_light_screen_defers_active_exit_strategy_from_full_history():
+def test_light_screen_keeps_active_exit_for_full_history():
     wallet = "0x" + "8" * 40
 
     def fetch(endpoint: str, params: dict[str, object]):
@@ -251,7 +251,8 @@ def test_light_screen_defers_active_exit_strategy_from_full_history():
 
     assert result["analysis_depth"] == "LIGHT_SCREEN"
     assert result["strategy"]["strategy_state"] == "FORMULA_RESEARCH"
-    assert result["deep_scan_eligible"] is False
+    assert result["copyability_state"] == "SPEED_REVIEW"
+    assert result["deep_scan_eligible"] is True
 
 
 def test_light_screen_allows_clean_one_sided_candidate_into_deep_scan():
@@ -265,6 +266,7 @@ def test_light_screen_allows_clean_one_sided_candidate_into_deep_scan():
     assert result["strategy"]["strategy_state"] == (
         "DIRECTIONAL_RESEARCH_CANDIDATE"
     )
+    assert result["copyability_state"] == "NEEDS_FORWARD_PAPER"
     assert result["deep_scan_eligible"] is True
 
 
@@ -287,10 +289,11 @@ def test_light_screen_flags_but_keeps_one_sided_multi_transaction_candidate():
         "DIRECTIONAL_RESEARCH_CANDIDATE"
     )
     assert result["strategy"]["execution_speed_risk_observed"] is True
+    assert result["copyability_state"] == "SPEED_REVIEW"
     assert result["deep_scan_eligible"] is True
 
 
-def test_light_screen_defers_public_page_saturated_within_one_utc_day():
+def test_light_screen_keeps_saturated_page_as_speed_evidence():
     wallet = "0x" + "c" * 40
     rows = [
         trade(
@@ -310,7 +313,74 @@ def test_light_screen_defers_public_page_saturated_within_one_utc_day():
     result = light_screen_wallet("saturated", wallet, fetch=fetch)
 
     assert result["strategy"]["high_frequency_recent_page_saturated"] is True
-    assert result["strategy"]["strategy_state"] == "OBSERVABLE_MM_OR_SPEED"
+    assert result["strategy"]["strategy_state"] == (
+        "DIRECTIONAL_RESEARCH_CANDIDATE"
+    )
+    assert result["copyability_state"] == "SPEED_REVIEW"
+    assert result["deep_scan_eligible"] is True
+
+
+def test_rolling_speed_window_is_evidence_not_rejection():
+    wallet = "0x" + "3" * 40
+    # The one-minute observation window is user-specified. These timestamps
+    # are synthetic fixtures inside that window, not a rejection threshold.
+    rows = [
+        trade(wallet, "cycle", "yes", "BUY", 100, "Election"),
+        trade(wallet, "cycle", "yes", "SELL", 159, "Election"),
+    ]
+
+    result = light_screen_wallet(
+        "rapid-exit",
+        wallet,
+        fetch=lambda endpoint, params: rows,
+    )
+
+    assert result["strategy"]["speed_observation_window_seconds"] == 60
+    assert (
+        result["strategy"]["maximum_unique_transactions_in_rolling_window"]
+        == 2
+    )
+    assert result["strategy"]["rapid_opposite_side_transition_count"] == 1
+    assert result["copyability_state"] == "SPEED_REVIEW"
+    assert result["deep_scan_eligible"] is True
+
+
+def test_rolling_transaction_density_raises_review_without_rejection():
+    wallet = "0x" + "5" * 40
+    # The one-minute observation window is user-specified. Repeated actions
+    # inside it are a review signal, never a source-history rejection.
+    rows = [
+        trade(wallet, "first", "yes-1", "BUY", 100, "Election"),
+        trade(wallet, "second", "yes-2", "BUY", 159, "Election"),
+    ]
+
+    result = light_screen_wallet(
+        "rapid-build",
+        wallet,
+        fetch=lambda endpoint, params: rows,
+    )
+
+    assert (
+        result["strategy"]["maximum_unique_transactions_in_rolling_window"]
+        == 2
+    )
+    assert result["copyability_state"] == "SPEED_REVIEW"
+    assert result["deep_scan_eligible"] is True
+
+
+def test_no_noncrypto_sleeve_is_not_deep_scan_eligible():
+    wallet = "0x" + "4" * 40
+    rows = [
+        trade(wallet, "crypto", "btc", "BUY", 100, "Bitcoin above 100k?")
+    ]
+
+    result = light_screen_wallet(
+        "crypto-only",
+        wallet,
+        fetch=lambda endpoint, params: rows,
+    )
+
+    assert result["copyability_state"] == "NO_NONCRYPTO_SLEEVE"
     assert result["deep_scan_eligible"] is False
 
 
@@ -457,10 +527,12 @@ def test_main_writes_dynamic_pool_snapshot_and_markdown(tmp_path):
     assert payload["real_order_submitted"] is False
 
 
-def test_main_light_screens_active_exit_without_full_history_calls(tmp_path):
+def test_main_deep_scans_active_exit_and_persists_copyability(tmp_path):
     dynamic = "0x" + "b" * 40
+    calls: list[str] = []
 
     def fetch(endpoint: str, params: dict[str, object]):
+        calls.append(endpoint)
         if endpoint == "v1/leaderboard":
             return [leaderboard_row(dynamic, "active-exit-weather", 1)]
         if endpoint == "trades":
@@ -468,9 +540,9 @@ def test_main_light_screens_active_exit_without_full_history_calls(tmp_path):
                 trade(dynamic, "exit", "yes", "BUY", 10, "Election"),
                 trade(dynamic, "exit", "yes", "SELL", 11, "Election"),
             ]
-        raise AssertionError(
-            f"light screen must not call full-history endpoint: {endpoint}"
-        )
+        if endpoint in {"closed-positions", "positions"}:
+            return []
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
 
     output = tmp_path / "snapshot.json"
     state = tmp_path / "state.json"
@@ -494,11 +566,20 @@ def test_main_light_screens_active_exit_without_full_history_calls(tmp_path):
     )
 
     payload = json.loads(output.read_text(encoding="utf-8"))
+    pool = json.loads(state.read_text(encoding="utf-8"))
+    report_text = report.read_text(encoding="utf-8")
     assert exit_code == 0
-    assert payload["wallets"][0]["analysis_depth"] == "LIGHT_SCREEN"
+    assert payload["wallets"][0]["analysis_depth"] == "DEEP_HISTORY"
     assert payload["wallets"][0]["strategy"]["strategy_state"] == (
         "FORMULA_RESEARCH"
     )
+    assert payload["wallets"][0]["copyability_state"] == "SPEED_REVIEW"
+    assert (
+        pool["candidates"][dynamic]["copyability_state"]
+        == "SPEED_REVIEW"
+    )
+    assert "复制可行性" in report_text
+    assert {"closed-positions", "positions"} <= set(calls)
 
 
 def test_main_screen_only_keeps_directional_wallet_at_light_depth(tmp_path):

@@ -56,6 +56,9 @@ TRADE_PAGE_SIZE = 10_000
 TRADE_MAX_OFFSET = 10_000
 # External default page size documented for the public trades endpoint.
 RECENT_LIGHT_SCREEN_LIMIT = 100
+# User-specified observation window. It raises research evidence only and
+# never acts as a qualification or rejection threshold.
+SPEED_OBSERVATION_WINDOW_SECONDS = 60
 CLOSED_POSITION_PAGE_SIZE = 50
 CLOSED_POSITION_MAX_OFFSET = 100_000
 OPEN_POSITION_PAGE_SIZE = 500
@@ -508,6 +511,72 @@ def partition_noncrypto_rows(
     return kept, removed
 
 
+def execution_speed_summary(
+    trades: list[dict[str, Any]],
+    *,
+    window_seconds: int = SPEED_OBSERVATION_WINDOW_SECONDS,
+) -> dict[str, Any]:
+    actions = sorted(
+        {
+            (
+                int(number(row.get("timestamp"))),
+                str(row.get("transactionHash") or ""),
+                str(row.get("asset") or ""),
+                str(row.get("side") or "").upper(),
+            )
+            for row in trades
+            if int(number(row.get("timestamp"))) > 0
+            and row.get("transactionHash")
+            and row.get("side")
+        }
+    )
+    transaction_times: dict[str, int] = {}
+    actions_by_asset: dict[
+        str, list[tuple[int, str, str]]
+    ] = defaultdict(list)
+    for timestamp, transaction_hash, asset, side in actions:
+        transaction_times[transaction_hash] = min(
+            timestamp,
+            transaction_times.get(transaction_hash, timestamp),
+        )
+        actions_by_asset[asset].append(
+            (timestamp, transaction_hash, side)
+        )
+
+    timeline = sorted(
+        (timestamp, transaction_hash)
+        for transaction_hash, timestamp in transaction_times.items()
+    )
+    maximum = 0
+    left = 0
+    for right, (timestamp, _) in enumerate(timeline):
+        while (
+            left <= right
+            and timestamp - timeline[left][0] >= window_seconds
+        ):
+            left += 1
+        maximum = max(maximum, right - left + 1)
+
+    transition_count = 0
+    for asset_actions in actions_by_asset.values():
+        for previous, current in zip(
+            asset_actions,
+            asset_actions[1:],
+            strict=False,
+        ):
+            if (
+                previous[2] != current[2]
+                and current[0] - previous[0] < window_seconds
+            ):
+                transition_count += 1
+
+    return {
+        "speed_observation_window_seconds": window_seconds,
+        "maximum_unique_transactions_in_rolling_window": maximum,
+        "rapid_opposite_side_transition_count": transition_count,
+    }
+
+
 def analyze_trade_lifecycle(
     trades: list[dict[str, Any]],
     *,
@@ -901,14 +970,27 @@ def light_screen_wallet(
         len(transaction_hashes) > 1
         for transaction_hashes in transactions_by_second.values()
     )
+    speed = execution_speed_summary(noncrypto_trades)
+    lifecycle.update(speed)
     lifecycle["same_second_transaction_burst_count"] = burst_count
-    lifecycle["execution_speed_risk_observed"] = bool(burst_count)
     lifecycle["screen_reasons"] = []
     if burst_count:
         lifecycle["screen_reasons"].append(
             "Multiple unique source transactions share an exact API second; "
             "this is a speed-risk flag, not standalone evidence of market "
             "making or price-dependent exits."
+        )
+    if speed["rapid_opposite_side_transition_count"]:
+        lifecycle["screen_reasons"].append(
+            "The same asset changes transaction side inside the "
+            "user-specified rolling observation window. This raises "
+            "execution-speed review but does not reject the strategy."
+        )
+    if speed["maximum_unique_transactions_in_rolling_window"] > 1:
+        lifecycle["screen_reasons"].append(
+            "Multiple unique source transactions occur inside the "
+            "user-specified rolling observation window. This is a "
+            "continuous speed-review signal, not a rejection threshold."
         )
     if lifecycle["strategy_state"] == "FORMULA_RESEARCH":
         lifecycle["screen_reasons"].append(
@@ -930,15 +1012,24 @@ def light_screen_wallet(
         public_page_saturated_within_one_utc_day
     )
     if public_page_saturated_within_one_utc_day:
-        lifecycle["observed_strategy_state"] = lifecycle[
-            "strategy_state"
-        ]
-        lifecycle["strategy_state"] = "OBSERVABLE_MM_OR_SPEED"
         lifecycle["screen_reasons"].append(
             "The external public-page limit was saturated within one UTC "
-            "date; direct copy research defers this observed high-frequency "
-            "execution shape."
+            "date. This is coverage and speed evidence, not a wallet "
+            "rejection."
         )
+    speed_risk_observed = bool(
+        burst_count
+        or speed["maximum_unique_transactions_in_rolling_window"] > 1
+        or speed["rapid_opposite_side_transition_count"]
+        or public_page_saturated_within_one_utc_day
+    )
+    lifecycle["execution_speed_risk_observed"] = speed_risk_observed
+    if not noncrypto_trades:
+        copyability_state = "NO_NONCRYPTO_SLEEVE"
+    elif speed_risk_observed:
+        copyability_state = "SPEED_REVIEW"
+    else:
+        copyability_state = "NEEDS_FORWARD_PAPER"
 
     conditions_by_domain: dict[str, set[str]] = defaultdict(set)
     for row in noncrypto_trades:
@@ -976,10 +1067,8 @@ def light_screen_wallet(
         "wallet": wallet,
         "profile_url": profile_url(wallet),
         "analysis_depth": "LIGHT_SCREEN",
-        "deep_scan_eligible": (
-            lifecycle["strategy_state"]
-            == "DIRECTIONAL_RESEARCH_CANDIDATE"
-        ),
+        "copyability_state": copyability_state,
+        "deep_scan_eligible": bool(noncrypto_trades),
         "primary_domain": primary_domain,
         "latest_source_trade_timestamp": latest_source_trade_timestamp,
         "latest_noncrypto_trade_timestamp": (
@@ -1065,6 +1154,14 @@ def scan_wallet(
         noncrypto_trades,
         closed_condition_ids=closed_condition_ids,
     )
+    speed = execution_speed_summary(noncrypto_trades)
+    lifecycle.update(speed)
+    speed_risk_observed = bool(
+        speed["maximum_unique_transactions_in_rolling_window"] > 1
+        or speed["rapid_opposite_side_transition_count"]
+        or lifecycle["same_timestamp_opposite_side_cycles"]
+    )
+    lifecycle["execution_speed_risk_observed"] = speed_risk_observed
     observed_strategy_state = lifecycle["strategy_state"]
     coverage_complete = (
         trades_complete and closed_complete and open_complete
@@ -1081,6 +1178,13 @@ def scan_wallet(
     if not coverage_complete:
         lifecycle["observed_strategy_state"] = observed_strategy_state
         lifecycle["strategy_state"] = "BLOCK_DATA"
+        copyability_state = "BLOCK_DATA"
+    elif not noncrypto_trades:
+        copyability_state = "NO_NONCRYPTO_SLEEVE"
+    elif speed_risk_observed:
+        copyability_state = "SPEED_REVIEW"
+    else:
+        copyability_state = "NEEDS_FORWARD_PAPER"
     lifecycle["block_reasons"] = block_reasons
     latest_source_trade_timestamp = max(
         (int(number(row.get("timestamp"))) for row in trades),
@@ -1096,7 +1200,8 @@ def scan_wallet(
         "wallet": wallet,
         "profile_url": f"https://polymarket.com/profile/{wallet}",
         "analysis_depth": "DEEP_HISTORY",
-        "deep_scan_eligible": True,
+        "copyability_state": copyability_state,
+        "deep_scan_eligible": bool(noncrypto_trades),
         "primary_domain": (
             closed_domain_summaries[0]["domain"]
             if closed_domain_summaries
@@ -1302,7 +1407,9 @@ def build_snapshot(
             ),
             "user_approved_rules": (
                 "MONTH plus ALL defaults, crypto-row removal, mixed-wallet "
-                "non-crypto sleeve preservation, and legacy-seed demotion."
+                "non-crypto sleeve preservation, legacy-seed demotion, and "
+                "the one-minute speed observation window. The observation "
+                "window is not a rejection threshold."
             ),
             "empirical": (
                 "Leaderboard rows, public fills, positions, timestamps, "
@@ -1329,7 +1436,7 @@ def build_snapshot(
         "limitations": [
             "BUY/SELL does not identify maker/taker role.",
             "Source-wallet PnL does not establish delayed follower profitability.",
-            "COPYABLE_EVIDENCE requires separate forward paper execution evidence.",
+            "FORWARD_COPYABLE requires separate forward paper execution evidence.",
             "Unknown or incomplete history remains reviewable and cannot be promoted.",
         ],
         "candidate_pool": candidate_pool_rows(pool),
@@ -1382,8 +1489,8 @@ def render_markdown(
         "",
         "## 候选池",
         "",
-        "| 名称 | 钱包网页 | 来源 | 策略状态 | 专家部分 |",
-        "| --- | --- | --- | --- | --- |",
+        "| 名称 | 钱包网页 | 来源 | 策略状态 | 复制可行性 | 专家部分 |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for wallet in sorted(pool):
         item = pool[wallet]
@@ -1391,10 +1498,13 @@ def render_markdown(
         url = profile_url(wallet)
         origins = markdown_cell(origin_label(item.get("origins", [])))
         status = markdown_cell(item.get("analysis_status") or "PENDING")
+        copyability = markdown_cell(
+            item.get("copyability_state") or "PENDING"
+        )
         sleeve = markdown_cell(item.get("expert_sleeve") or "")
         lines.append(
             f"| {name} | [{wallet}]({url}) | {origins} | "
-            f"{status} | {sleeve} |"
+            f"{status} | {copyability} | {sleeve} |"
         )
 
     if snapshot["wallets"]:
@@ -1403,8 +1513,8 @@ def render_markdown(
                 "",
                 "## 本轮策略分析",
                 "",
-                "| 名称 | 钱包网页 | 非加密策略状态 | 生命周期 | 剔除加密记录 |",
-                "| --- | --- | --- | --- | --- |",
+                "| 名称 | 钱包网页 | 非加密策略状态 | 复制可行性 | 生命周期 | 剔除加密记录 |",
+                "| --- | --- | --- | --- | --- | --- |",
             ]
         )
         for result in snapshot["wallets"]:
@@ -1423,6 +1533,7 @@ def render_markdown(
                 f"| {markdown_cell(result['name'])} | "
                 f"[{result['wallet']}]({result['profile_url']}) | "
                 f"{strategy['strategy_state']} | "
+                f"{result['copyability_state']} | "
                 f"{markdown_cell(lifecycle)} | {removed} |"
             )
 
@@ -1445,7 +1556,8 @@ def render_markdown(
             "## 结论边界",
             "",
             "- 源钱包历史只能产生研究候选，不能单独证明延迟跟单为正期望。",
-            "- 中途买卖、篮子/对冲或同秒双向行为保留为公式研究或执行风险。",
+            "- 中途买卖、篮子/对冲、做市形态或速度信号只是行为描述，不构成自动排除。",
+            "- 只有我方延迟后的前瞻成交证据才能证明策略因执行速度不可复制。",
             "- 只有单独的前瞻纸面成交证据才能升级复制结论。",
             "",
         ]
@@ -1570,6 +1682,9 @@ def main(
                 ]
                 item["analysis_status"] = result["strategy"][
                     "strategy_state"
+                ]
+                item["copyability_state"] = result[
+                    "copyability_state"
                 ]
                 item["analysis_depth"] = result["analysis_depth"]
                 domains = result.get("closed_positions", {}).get(
