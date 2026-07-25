@@ -109,7 +109,9 @@ rejection threshold.
 Run:
 
 ```bash
-work/polymarket-api-py312-venv/bin/python -m pytest \
+PYTHONPATH=work/wallet_copy_paper \
+  /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
+  -m pytest \
   work/wallet_copy_paper/tests/test_candidate_scan_once.py \
   -k "active_exit or saturated or rolling_speed or no_noncrypto" -v
 ```
@@ -267,7 +269,9 @@ Do not emit `FORWARD_COPYABLE` or `UNFOLLOWABLE_EXECUTION` from source history.
 Run:
 
 ```bash
-work/polymarket-api-py312-venv/bin/python -m pytest \
+PYTHONPATH=work/wallet_copy_paper \
+  /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
+  -m pytest \
   work/wallet_copy_paper/tests/test_candidate_scan_once.py \
   -k "active_exit or saturated or rolling_speed or no_noncrypto" -v
 ```
@@ -305,7 +309,9 @@ assert pool["candidates"][dynamic]["copyability_state"] == "SPEED_REVIEW"
 Run:
 
 ```bash
-work/polymarket-api-py312-venv/bin/python -m pytest \
+PYTHONPATH=work/wallet_copy_paper \
+  /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
+  -m pytest \
   work/wallet_copy_paper/tests/test_candidate_scan_once.py \
   -k "main_deep_scans_active_exit" -v
 ```
@@ -347,7 +353,9 @@ git commit -m "feat: report wallet copyability separately"
 - [ ] **Step 1: Run the complete candidate scanner test file**
 
 ```bash
-work/polymarket-api-py312-venv/bin/python -m pytest \
+PYTHONPATH=work/wallet_copy_paper \
+  /Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
+  -m pytest \
   work/wallet_copy_paper/tests/test_candidate_scan_once.py -v
 ```
 
@@ -356,7 +364,8 @@ Expected: all tests pass with no failures.
 - [ ] **Step 2: Compile the scanner**
 
 ```bash
-work/polymarket-api-py312-venv/bin/python -m py_compile \
+/Users/luke/Documents/polymarket/work/polymarket-api-py312-venv/bin/python \
+  -m py_compile \
   work/wallet_copy_paper/candidate_scan_once.py
 ```
 
