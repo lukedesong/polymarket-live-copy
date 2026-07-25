@@ -1,6 +1,9 @@
 from decimal import Decimal
 
-from paper_dashboard_statement import build_account_statement
+from paper_dashboard_statement import (
+    build_account_statement,
+    position_display_state,
+)
 
 
 D = Decimal
@@ -165,3 +168,27 @@ def test_invalid_close_is_reported_without_fabricating_pnl():
     assert statement["replay_errors"] == [
         "ledger:1:invalid_close_quantity"
     ]
+
+
+def test_position_display_state_separates_pending_settlement_from_active():
+    assert (
+        position_display_state(
+            "2026-07-24T23:59:00Z",
+            as_of="2026-07-25T05:00:00Z",
+        )
+        == "待结算"
+    )
+    assert (
+        position_display_state(
+            "2026-07-26T23:59:00Z",
+            as_of="2026-07-25T05:00:00Z",
+        )
+        == "持仓中"
+    )
+    assert (
+        position_display_state(
+            "2026-07-25",
+            as_of="2026-07-25T05:00:00Z",
+        )
+        == "持仓中"
+    )

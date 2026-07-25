@@ -295,6 +295,35 @@ def test_weather_account_statement_separates_open_and_closed_records(tmp_path):
     assert store.target_quantity("token-a") == target_before
 
 
+def test_weather_position_past_end_time_moves_to_pending_settlement(tmp_path):
+    store = PaperStore(
+        tmp_path / "paper.sqlite3",
+        initial_cash=D("300"),
+        scale=D("0.4"),
+    )
+    ended = source_position("25")
+    ended["endDate"] = "2000-01-01T00:00:00Z"
+    store.initialize([], observed_at=1)
+    apply_source_snapshot(
+        store,
+        [ended],
+        books_by_asset={"token-a": book()},
+        observed_at=2,
+    )
+
+    status = store.status()
+
+    assert status["active_positions"] == []
+    assert status["pending_positions"][0]["position_status"] == "待结算"
+    assert status["pending_positions"][0]["pnl_status"] == "等待官方结算"
+
+    runtime_dir = tmp_path / "runtime"
+    render_status_files(store, runtime_dir, poll_seconds=1)
+    html = (runtime_dir / "status.html").read_text()
+    assert "<h2>待结算</h2>" in html
+    assert "活动时间已过，等待 Polymarket 正式判定" in html
+
+
 def test_utc_market_end_is_rendered_in_shanghai_time():
     assert (
         tracker.format_end_time_shanghai("2026-07-25T12:00:00Z")

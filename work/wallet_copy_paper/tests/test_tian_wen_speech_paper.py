@@ -471,11 +471,12 @@ def test_tian_account_statement_separates_open_and_closed_records(tmp_path):
     closed = status["closed_records"][0]
     assert status["pnl_reconciliation_ok"] is True
     assert status["replay_errors"] == []
-    assert status["positions"][0]["position_status"] == "持仓中"
-    assert status["positions"][0]["pnl_status"] == "尚未实现"
-    assert D(status["positions"][0]["occupied_cost"]) == (
-        D(status["positions"][0]["quantity"])
-        * D(status["positions"][0]["average_cost"])
+    assert status["active_positions"] == []
+    assert status["pending_positions"][0]["position_status"] == "待结算"
+    assert status["pending_positions"][0]["pnl_status"] == "等待官方结算"
+    assert D(status["pending_positions"][0]["occupied_cost"]) == (
+        D(status["pending_positions"][0]["quantity"])
+        * D(status["pending_positions"][0]["average_cost"])
     )
     assert closed["close_type"] == "卖出"
     assert D(closed["realized_pnl"]) == (
@@ -492,9 +493,11 @@ def test_tian_account_statement_separates_open_and_closed_records(tmp_path):
 
     html = (runtime_dir / "status.html").read_text()
     assert "<h2>持仓中</h2>" in html
+    assert "<h2>待结算</h2>" in html
     assert "<h2>已结束</h2>" in html
     assert "单笔盈亏" in html
-    assert "尚未实现" in html
+    assert "等待官方结算" in html
+    assert "活动时间已过，等待 Polymarket 正式判定" in html
     assert "占用金额" in html
     assert store.cash() == cash_before
     assert store.open_paper_positions() == positions_before

@@ -17,7 +17,10 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from paper_dashboard_statement import build_account_statement
+from paper_dashboard_statement import (
+    build_account_statement,
+    position_display_state,
+)
 
 
 D = Decimal
@@ -395,13 +398,33 @@ class PaperStore:
                     _decimal(row["quantity"])
                     * _decimal(row["average_cost"])
                 ),
-                "position_status": "持仓中",
-                "pnl_status": "尚未实现",
+                "position_status": position_display_state(
+                    row.get("end_date_utc", "")
+                ),
                 "end_time_shanghai": format_end_time_shanghai(
                     str(row.get("end_date_utc", ""))
                 ),
             }
             for row in positions
+        ]
+        positions = [
+            {
+                **row,
+                "pnl_status": (
+                    "等待官方结算"
+                    if row["position_status"] == "待结算"
+                    else "尚未实现"
+                ),
+            }
+            for row in positions
+        ]
+        active_positions = [
+            row for row in positions
+            if row["position_status"] == "持仓中"
+        ]
+        pending_positions = [
+            row for row in positions
+            if row["position_status"] == "待结算"
         ]
         recent = [
             {
@@ -436,6 +459,8 @@ class PaperStore:
             "realized_pnl": account["realized_pnl"],
             "occupied_capital": str(occupied_capital),
             "positions": positions,
+            "active_positions": active_positions,
+            "pending_positions": pending_positions,
             "closed_records": statement["closed_records"],
             "reconstructed_realized_pnl": statement[
                 "reconstructed_realized_pnl"
@@ -1071,7 +1096,7 @@ def render_status_files(
         runtime_dir / "status.json",
         json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True),
     )
-    position_rows = "".join(
+    active_position_rows = "".join(
         "<tr>"
         f"<td>{escape(row['title'])}</td>"
         f"<td>{escape(row['outcome'])}</td>"
@@ -1082,8 +1107,21 @@ def render_status_files(
         f"<td>{escape(row['position_status'])}</td>"
         f"<td>{escape(row['end_time_shanghai'])}</td>"
         "</tr>"
-        for row in status["positions"]
+        for row in status["active_positions"]
     ) or '<tr><td colspan="8">当前没有持仓中项目</td></tr>'
+    pending_position_rows = "".join(
+        "<tr>"
+        f"<td>{escape(row['title'])}</td>"
+        f"<td>{escape(row['outcome'])}</td>"
+        f"<td>{escape(row['quantity'])}</td>"
+        f"<td>{escape(row['average_cost'])}</td>"
+        f"<td>{_format_usd(row['occupied_cost'])} USD</td>"
+        f"<td class=\"neutral\">{escape(row['pnl_status'])}</td>"
+        f"<td>{escape(row['position_status'])}</td>"
+        f"<td>{escape(row['end_time_shanghai'])}</td>"
+        "</tr>"
+        for row in status["pending_positions"]
+    ) or '<tr><td colspan="8">当前没有待结算项目</td></tr>'
     closed_rows = "".join(
         "<tr>"
         f"<td>{escape(row['close_time_shanghai'])}</td>"
@@ -1145,7 +1183,10 @@ def render_status_files(
   <p class="{'safe' if status['pnl_reconciliation_ok'] else 'warning'}">单笔已实现盈亏合计：{'已与账户累计盈亏核对' if status['pnl_reconciliation_ok'] else '账本待核对'}</p>
   <p>最后心跳：{escape(str(status['last_heartbeat']))}　最后错误：{escape(status['last_error'] or '无')}</p>
   <h2>持仓中</h2>
-  <table><thead><tr><th>市场</th><th>方向</th><th>份数</th><th>含费平均成本</th><th>占用金额</th><th>盈亏</th><th>状态</th><th>结束时间（上海）</th></tr></thead><tbody>{position_rows}</tbody></table>
+  <table><thead><tr><th>市场</th><th>方向</th><th>份数</th><th>含费平均成本</th><th>占用金额</th><th>盈亏</th><th>状态</th><th>结束时间（上海）</th></tr></thead><tbody>{active_position_rows}</tbody></table>
+  <h2>待结算</h2>
+  <p class="section-note">活动时间已过，等待 Polymarket 正式判定；在正式结算前仍占用纸面资金，不计算真实盈亏。</p>
+  <table><thead><tr><th>市场</th><th>方向</th><th>份数</th><th>含费平均成本</th><th>占用金额</th><th>盈亏</th><th>状态</th><th>结束时间（上海）</th></tr></thead><tbody>{pending_position_rows}</tbody></table>
   <h2>已结束</h2>
   <p class="section-note">这里逐笔列出已经卖出的数量或已经结算的仓位；同一市场部分卖出后，也可能同时仍有持仓。</p>
   <table><thead><tr><th>结束时间</th><th>市场</th><th>方向</th><th>结束方式</th><th>份数</th><th>对应成本</th><th>净回款</th><th>费用</th><th>单笔盈亏</th></tr></thead><tbody>{closed_rows}</tbody></table>

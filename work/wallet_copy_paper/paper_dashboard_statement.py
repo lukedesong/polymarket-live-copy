@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -9,6 +9,34 @@ D = Decimal
 ZERO = D("0")
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 EXECUTED_STATUSES = {"FILLED", "PARTIAL", "SETTLED"}
+
+
+def position_display_state(
+    end_date_utc: Any,
+    *,
+    as_of: Any = None,
+) -> str:
+    raw_end = str(end_date_utc or "").strip()
+    if "T" not in raw_end:
+        return "持仓中"
+    try:
+        end_time = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+        current = (
+            as_of
+            if isinstance(as_of, datetime)
+            else datetime.fromisoformat(
+                str(as_of).replace("Z", "+00:00")
+            )
+            if as_of is not None
+            else datetime.now(timezone.utc)
+        )
+    except (TypeError, ValueError):
+        return "持仓中"
+    if end_time.tzinfo is None:
+        end_time = end_time.replace(tzinfo=timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return "待结算" if end_time <= current else "持仓中"
 
 
 def format_observed_at_shanghai(value: Any) -> str:
