@@ -4,6 +4,8 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -160,6 +162,14 @@ class ArtifactTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_direct_script_execution_can_import_project_modules(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "sim/run_polymarket_tennis_ev.py", "--help"],
+            cwd=Path(__file__).parents[1], text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Build a reproducible", result.stdout)
+
     def test_cli_builds_reproducible_complete_artifact_set(self) -> None:
         """The entry point is local-only and publishes a self-verifying bundle."""
         rows = []

@@ -9,7 +9,11 @@ import argparse
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
 from typing import Iterable, Sequence
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim.tennis_ev import bankroll, data, report, research
 
