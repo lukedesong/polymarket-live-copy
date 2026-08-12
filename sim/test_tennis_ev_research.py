@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 import unittest
+
+import numpy as np
 
 from sim.tennis_ev import data, research, statistics
 
@@ -94,12 +97,12 @@ class CausalEventTests(unittest.TestCase):
 
         self.assertIn("BLOCK_DATA_MATCH_STATE", event.feature_availability)
 
-    def test_split_keeps_equal_finish_group_in_training_before_a_later_test_decision(self) -> None:
+    def test_split_purges_boundary_decisions_and_keeps_test_strictly_after_cutoff(self) -> None:
         matches = (
             match_with_path("finish-100-a", finish_ts=100, start_ts=20, pregame_ts=10),
             match_with_path("finish-200-a", finish_ts=200, start_ts=120, pregame_ts=110),
             match_with_path("finish-200-b", finish_ts=200, start_ts=120, pregame_ts=110),
-            match_with_path("finish-300-a", finish_ts=300, start_ts=220, pregame_ts=210),
+            match_with_path("finish-300-a", finish_ts=300, start_ts=230, pregame_ts=220),
         )
 
         split = research.chronological_split(matches, train_fraction=0.70)
@@ -107,11 +110,13 @@ class CausalEventTests(unittest.TestCase):
         train_ids = {match.event_id for match in split.train}
         test_ids = {match.event_id for match in split.test}
         self.assertFalse(train_ids & test_ids)
-        self.assertTrue({"finish-200-a", "finish-200-b"} <= train_ids)
+        self.assertFalse({"finish-200-a", "finish-200-b"} & train_ids)
         self.assertFalse({"finish-200-a", "finish-200-b"} & test_ids)
-        self.assertEqual(split.purged, ())
-        self.assertEqual(split.boundary_ts, 210)
-        self.assertEqual(split.achieved_train_fraction, 0.75)
+        self.assertEqual({match.event_id for match in split.purged}, {"finish-200-a", "finish-200-b"})
+        self.assertEqual(split.boundary_ts, 110)
+        self.assertEqual(split.achieved_train_fraction, 0.50)
+        self.assertTrue(all(match.finish_ts < split.boundary_ts for match in split.train))
+        self.assertTrue(all(match.pregame_ts > split.boundary_ts for match in split.test))
 
     def test_split_rejects_an_all_tied_finish_group(self) -> None:
         matches = tuple(match_with_path(str(index), finish_ts=200) for index in range(3))
@@ -332,6 +337,217 @@ class BaselineAndStatisticsTests(unittest.TestCase):
         self.assertEqual(result["economic_result_basis"], "GROSS_REFERENCE_PROXY")
         repeated = research.random_baseline(rows, draws=10_000, seed=20260812, fee_schedule=None)
         self.assertEqual(result["net_pnl_distribution"], repeated["net_pnl_distribution"])
+
+
+def feature_rows(
+    prices: list[float], *, levels: list[str | None] | None = None,
+    volatility: list[float | None] | None = None,
+) -> tuple[research.ResearchEvent, ...]:
+    """Independent match rows with deliberately hand-checkable outcomes."""
+    rows: list[research.ResearchEvent] = []
+    for index, price in enumerate(prices):
+        row = research.build_event(
+            match_with_path(
+                f"condition-{index}", finish_ts=1_000 + index,
+                path=[(100, price)], won=index % 2 == 0,
+            ), decision_ts=100, outcome_index=0,
+        )
+        rows.append(replace(
+            row,
+            current_price=price,
+            reference_entry_price=price,
+            level=(levels or ["ATP"] * len(prices))[index],
+            realized_volatility=(volatility or [None] * len(prices))[index],
+        ))
+    return tuple(rows)
+
+
+class ConditionDiscoveryTests(unittest.TestCase):
+    def test_outcome_side_null_does_not_treat_fair_90_percent_favorites_as_edge(self) -> None:
+        groups = []
+        for index in range(10):
+            match = match_with_path(
+                f"calibration-{index}", finish_ts=1_000 + index,
+                path=[(100, 0.90)], won=index < 9,
+            )
+            groups.append(tuple(
+                research.build_event(match, decision_ts=100, outcome_index=outcome_index)
+                for outcome_index in (0, 1)
+            ))
+
+        p_value = statistics.outcome_side_permutation_p_value(
+            tuple((pair[0], pair[1]) for pair in groups), draws=1_000, seed=7,
+        )
+
+        self.assertGreater(p_value, 0.05)
+
+    def test_condition_selection_uses_one_deterministic_outcome_per_match(self) -> None:
+        match = match_with_path("condition-pair", finish_ts=1_000, path=[(100, 0.60)])
+        events = tuple(
+            research.build_event(match, decision_ts=100, outcome_index=outcome_index)
+            for outcome_index in (0, 1)
+        )
+        condition = research.Condition(
+            "all-outcomes", "market_level",
+            (research.Clause("current_price", "GE", 0.0),), "TEST",
+        )
+
+        selected = research._condition_selection_groups(condition, events)
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][0].outcome_index, 0)
+        self.assertEqual(selected[0][1].outcome_index, 1)
+
+    def test_condition_selection_uses_one_fixed_position_across_decision_families(self) -> None:
+        match = match_with_path("condition-across-families", finish_ts=1_000, path=[(100, 0.60), (400, 0.70)])
+        events = tuple(
+            research.build_event(
+                match,
+                decision_ts=decision_ts,
+                outcome_index=outcome_index,
+                decision_family=family,
+            )
+            for family, decision_ts in (
+                ("PRE_MATCH_REFERENCE", match.pregame_ts),
+                ("SCHEDULED_START_PROXY", 400),
+            )
+            for outcome_index in (0, 1)
+        )
+        condition = research.Condition(
+            "all-outcomes", "market_level",
+            (research.Clause("current_price", "GE", 0.0),), "TEST",
+        )
+
+        selected = research._condition_selection_groups(condition, events)
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][0].event_id, match.event_id)
+        self.assertEqual(selected[0][0].decision_family, "PRE_MATCH_REFERENCE")
+
+    def test_holdout_rejects_training_event_or_decision_at_cutoff(self) -> None:
+        train = feature_rows([0.2, 0.4, 0.6, 0.8])
+        manifest = research.freeze_training_manifest(train, alpha=0.05, split_cutoff_ts=2_000)
+
+        with self.assertRaisesRegex(ValueError, "overlaps frozen training|strictly after"):
+            research.evaluate_holdout(
+                manifest,
+                (replace(train[0], decision_ts=2_000),),
+            )
+
+    def test_holdout_applies_fdr_correction_to_every_frozen_rule(self) -> None:
+        left = research.build_event(match_with_path("later-a", finish_ts=3_100, path=[(100, 0.60)]), decision_ts=2_100, outcome_index=0)
+        right = research.build_event(match_with_path("later-a", finish_ts=3_100, path=[(100, 0.60)]), decision_ts=2_100, outcome_index=1)
+        rule = research.Condition("all", "market_level", (research.Clause("current_price", "GE", 0.0),), "TEST")
+        manifest = research.FrozenManifest(
+            split_cutoff_ts=2_000, training_source_hashes_sha256="", training_source_hashes=(),
+            source_event_ids=(), feature_definitions=(), empirical_cut_points={},
+            selected_rule_ids=("all",), selected_rule_definitions={"all": rule.to_dict()},
+            ranking_order=("all",), condition_ledger=(), cost_specification={},
+            significance_alpha=0.05, significance_provenance="TEST", kelly_inputs={},
+        )
+
+        result = research.evaluate_holdout(manifest, (left, right))
+
+        self.assertIsNotNone(result[0].q_value)
+        self.assertIsNotNone(result[0].bonferroni_p_value)
+        self.assertEqual(result[0].reject_reason, "FDR_NOT_SIGNIFICANT")
+    def test_candidate_cut_points_come_only_from_training_values(self) -> None:
+        train = feature_rows([0.20, 0.40, 0.60, 0.80])
+        test = feature_rows([0.333, 0.777])
+        candidates = research.generate_candidates(train)
+
+        price_cuts = {
+            clause.value for candidate in candidates for clause in candidate.clauses
+            if clause.feature == "current_price"
+        }
+        self.assertIn(0.2, price_cuts)
+        self.assertNotIn(test[0].current_price, price_cuts)
+        self.assertNotIn(test[1].current_price, price_cuts)
+
+    def test_missing_state_and_book_fields_do_not_generate_conditions(self) -> None:
+        candidates = research.generate_candidates(feature_rows([0.2, 0.4]))
+
+        self.assertFalse(any(candidate.family == "match_state" for candidate in candidates))
+        self.assertFalse(any(candidate.family == "execution_feasibility" for candidate in candidates))
+
+    def test_manifest_records_unavailable_state_and_execution_families(self) -> None:
+        manifest = research.freeze_training_manifest(feature_rows([0.2, 0.4]), alpha=0.05)
+
+        unavailable = {
+            row["family"]: row
+            for row in manifest.condition_ledger
+            if row["rule_id"].startswith("UNAVAILABLE_")
+        }
+        self.assertEqual(unavailable["match_state"]["reject_reason"], "INADEQUATE_FIELD_COVERAGE")
+        self.assertEqual(unavailable["execution_feasibility"]["reject_reason"], "INADEQUATE_FIELD_COVERAGE")
+        self.assertEqual(unavailable["input_validation"]["reject_reason"], "INVALID_ARITHMETIC")
+        self.assertFalse(set(unavailable) & {
+            condition.family for condition in research.generate_candidates(feature_rows([0.2, 0.4]))
+        })
+
+    def test_condition_ledger_includes_concentration_diagnostics_for_every_row(self) -> None:
+        events = feature_rows([0.2, 0.4, 0.6, 0.8])
+        manifest = research.freeze_training_manifest(events, alpha=0.05)
+        results = {
+            result.rule_id: result
+            for result in research._evaluate_conditions(
+                research.generate_candidates(events), events, draws=10_000, seed=20260812,
+            )
+        }
+
+        for row in manifest.condition_ledger:
+            with self.subTest(rule_id=row["rule_id"]):
+                self.assertIn("largest_contribution", row)
+                self.assertIn("pnl_without_largest", row)
+                if row["rule_id"].startswith("UNAVAILABLE_"):
+                    self.assertIsNone(row["largest_contribution"])
+                    self.assertEqual(row["pnl_without_largest"], 0.0)
+                else:
+                    result = results[row["rule_id"]]
+                    self.assertEqual(row["largest_contribution"], result.largest_contribution)
+                    self.assertEqual(row["pnl_without_largest"], result.pnl_without_largest)
+
+    def test_benjamini_hochberg_is_monotone_and_matches_fixture(self) -> None:
+        q_values = statistics.benjamini_hochberg([0.01, 0.04, 0.03, 0.20])
+
+        np.testing.assert_allclose(q_values, [0.04, 0.0533333333, 0.0533333333, 0.20])
+
+    def test_bonferroni_familywise_sensitivity_caps_at_one(self) -> None:
+        adjusted = statistics.bonferroni([0.01, 0.40], tested_conditions=4)
+
+        np.testing.assert_allclose(adjusted, [0.04, 1.00])
+
+    def test_resampling_uses_event_blocks_not_outcome_rows(self) -> None:
+        sampled = statistics.bootstrap_match_blocks(
+            [("match-a", 0.1), ("match-a", 0.2), ("match-b", -0.1), ("match-b", -0.2)],
+            draws=20, seed=7,
+        )
+
+        self.assertTrue(all(draw.count("match-a") in {0, 2, 4} for draw in sampled.match_ids))
+
+    def test_contribution_diagnostic_removes_largest_absolute_event(self) -> None:
+        diagnostic = statistics.contribution_diagnostics([0.10, 0.20, 5.00, -0.10])
+
+        self.assertEqual(diagnostic["largest_contribution"], 5.00)
+        self.assertAlmostEqual(diagnostic["pnl_without_largest"], 0.20)
+
+    def test_holdout_evaluates_frozen_rules_without_reselection(self) -> None:
+        train = feature_rows([0.2, 0.4, 0.6, 0.8], volatility=[0.01, 0.02, 0.03, 0.04])
+        manifest = research.freeze_training_manifest(train, alpha=0.05)
+        holdout = tuple(
+            replace(
+                row,
+                event_id=f"holdout-{index}", market_id=f"holdout-market-{index}",
+                decision_ts=2_000 + index, finish_ts=3_000 + index,
+            )
+            for index, row in enumerate(feature_rows([0.3, 0.7], volatility=[0.02, 0.05]))
+        )
+
+        result = research.evaluate_holdout(manifest, holdout)
+
+        self.assertEqual([item.rule_id for item in result], list(manifest.selected_rule_ids))
+        self.assertEqual([item.selection_rank for item in result], list(range(1, len(result) + 1)))
+        self.assertTrue(all(item.economic_result_basis == "GROSS_REFERENCE_PROXY" for item in result))
 
 
 if __name__ == "__main__":
