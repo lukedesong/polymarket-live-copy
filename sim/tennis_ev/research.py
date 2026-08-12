@@ -590,9 +590,18 @@ def _proxy_pnl_rows(
 
 
 def _evaluate_conditions(
-    candidates: Sequence[Condition], events: Sequence[ResearchEvent], *, draws: int, seed: int,
+    candidates: Sequence[Condition], events: Sequence[ResearchEvent], *, seed: int,
+    draws: int | None = None, bootstrap_draws: int | None = None,
+    permutation_draws: int | None = None,
     fee_schedule: FeeSchedule | None = None,
 ) -> tuple[ConditionResult, ...]:
+    # ``draws`` is retained for existing internal callers; split controls let
+    # the public pipeline state each simulation count explicitly.
+    if draws is not None:
+        bootstrap_draws = draws if bootstrap_draws is None else bootstrap_draws
+        permutation_draws = draws if permutation_draws is None else permutation_draws
+    if bootstrap_draws is None or permutation_draws is None:
+        raise ValueError("bootstrap_draws and permutation_draws are required")
     preliminary: list[ConditionResult] = []
     raw_ps: list[float] = []
     raw_indices: list[int] = []
@@ -610,7 +619,9 @@ def _evaluate_conditions(
             ))
             continue
         pnl_rows, pnls, costs = _proxy_pnl_rows(matched, fee_schedule=fee_schedule)
-        lower, upper = statistics.bootstrap_interval(pnl_rows, draws=draws, seed=seed + index)
+        lower, upper = statistics.bootstrap_interval(
+            pnl_rows, draws=bootstrap_draws, seed=seed + index,
+        )
         p_value = statistics.outcome_side_permutation_p_value(
             selections,
             pnl_pairs=tuple(
@@ -626,7 +637,7 @@ def _evaluate_conditions(
                 )
                 for selected, alternate in selections
             ),
-            draws=draws,
+            draws=permutation_draws,
             seed=seed + len(candidates) + index,
         )
         diagnostic = statistics.contribution_diagnostics([
@@ -665,10 +676,16 @@ def freeze_training_manifest(
     training_events: Iterable[ResearchEvent], *, alpha: float,
     split_cutoff_ts: int | None = None,
     fee_schedule: FeeSchedule | None = None,
+    bootstrap_draws: int = 10_000,
+    permutation_draws: int = 10_000,
 ) -> FrozenManifest:
     """Discover on training data only and freeze rules before holdout access."""
     if not 0.0 < alpha < 1.0:
         raise ValueError("alpha must be strictly between zero and one")
+    if isinstance(bootstrap_draws, bool) or not isinstance(bootstrap_draws, int) or bootstrap_draws <= 0:
+        raise ValueError("bootstrap_draws must be a positive integer")
+    if isinstance(permutation_draws, bool) or not isinstance(permutation_draws, int) or permutation_draws <= 0:
+        raise ValueError("permutation_draws must be a positive integer")
     events = tuple(training_events)
     source_event_ids = tuple(sorted({event.event_id for event in events}))
     source_hashes = tuple(sorted({event.source_sha256 for event in events if event.source_sha256}))
@@ -676,7 +693,9 @@ def freeze_training_manifest(
         (event.finish_ts for event in events), default=None
     )
     candidates = generate_candidates(events)
-    results = _evaluate_conditions(candidates, events, draws=10_000, seed=20260812,
+    results = _evaluate_conditions(
+        candidates, events, bootstrap_draws=bootstrap_draws,
+        permutation_draws=permutation_draws, seed=20260812,
                                    fee_schedule=fee_schedule)
     candidate_by_id = {candidate.rule_id: candidate for candidate in candidates}
     selected_results = []
@@ -746,8 +765,8 @@ def freeze_training_manifest(
         significance_provenance="CONVENTIONAL_RESEARCH_SETTING",
         kelly_inputs={
             "source": "TRAINING_ONLY_GROSS_REFERENCE_PROXY",
-            "bootstrap_draws": 10_000,
-            "permutation_draws": 10_000,
+            "bootstrap_draws": bootstrap_draws,
+            "permutation_draws": permutation_draws,
             "draw_provenance": "USER_SPECIFIED_SIMULATION_COUNT",
         },
     )
@@ -756,9 +775,15 @@ def freeze_training_manifest(
 def evaluate_holdout(
     manifest: FrozenManifest, holdout_events: Iterable[ResearchEvent], *,
     fee_schedule: FeeSchedule | None = None,
+    bootstrap_draws: int = 10_000,
+    permutation_draws: int = 10_000,
 ) -> tuple[ConditionResult, ...]:
     """Evaluate the frozen rank order exactly once; this function never selects."""
     events = tuple(holdout_events)
+    if isinstance(bootstrap_draws, bool) or not isinstance(bootstrap_draws, int) or bootstrap_draws <= 0:
+        raise ValueError("bootstrap_draws must be a positive integer")
+    if isinstance(permutation_draws, bool) or not isinstance(permutation_draws, int) or permutation_draws <= 0:
+        raise ValueError("permutation_draws must be a positive integer")
     overlap = sorted({event.event_id for event in events} & set(manifest.source_event_ids))
     if overlap:
         raise ValueError("holdout overlaps frozen training event IDs")
@@ -781,7 +806,9 @@ def evaluate_holdout(
         selections = _condition_selection_groups(condition, events)
         matched = [selected for selected, _ in selections]
         pnl_rows, pnls, costs = _proxy_pnl_rows(matched, fee_schedule=fee_schedule)
-        lower, upper = statistics.bootstrap_interval(pnl_rows, draws=10_000, seed=20260812 + rank)
+        lower, upper = statistics.bootstrap_interval(
+            pnl_rows, draws=bootstrap_draws, seed=20260812 + rank,
+        )
         p_value = statistics.outcome_side_permutation_p_value(
             selections,
             pnl_pairs=tuple(
@@ -797,7 +824,7 @@ def evaluate_holdout(
                 )
                 for selected, alternate in selections
             ),
-            draws=10_000,
+            draws=permutation_draws,
             seed=20270812 + rank,
         )
         diagnostic = statistics.contribution_diagnostics([

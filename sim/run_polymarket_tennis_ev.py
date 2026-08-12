@@ -162,8 +162,12 @@ def run(args: argparse.Namespace) -> report.ReportArtifacts:
     test_events = _events_for_matches(split.test)
     manifest = research.freeze_training_manifest(
         train_events, alpha=args.alpha, split_cutoff_ts=split.boundary_ts, fee_schedule=schedule,
+        bootstrap_draws=args.simulation_paths, permutation_draws=args.simulation_paths,
     )
-    holdout = research.evaluate_holdout(manifest, test_events, fee_schedule=schedule)
+    holdout = research.evaluate_holdout(
+        manifest, test_events, fee_schedule=schedule,
+        bootstrap_draws=args.simulation_paths, permutation_draws=args.simulation_paths,
+    )
     frozen_manifest = manifest.to_dict()
     frozen_manifest.update({
         "split": {"boundary_ts": split.boundary_ts, "train_matches": len(split.train),

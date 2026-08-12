@@ -45,7 +45,9 @@ class ResearchRun:
     hedge_results: Sequence[Mapping[str, object]] = ()
     bankroll_results: Mapping[str, object] = field(default_factory=dict)
     monte_carlo_summary: Mapping[str, object] = field(default_factory=dict)
-    holdout_ledger: Sequence[Mapping[str, object]] = ()
+    # None means a legacy caller supplied no frozen ledger.  An empty sequence
+    # is an explicit frozen result: the selected rule matched no holdout rows.
+    holdout_ledger: Sequence[Mapping[str, object]] | None = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +172,7 @@ def _cell(value: object) -> object:
 
 
 def _event_ledger(run: ResearchRun) -> list[dict[str, object]]:
-    if run.holdout_ledger:
+    if run.holdout_ledger is not None:
         return [dict(_plain(row)) for row in run.holdout_ledger]
     # Fallback is a transparent favorite baseline ledger, not an inferred
     # frozen-rule fill.  The CLI supplies holdout_ledger when a rule is frozen.

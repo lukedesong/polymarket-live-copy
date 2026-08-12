@@ -68,8 +68,20 @@ class VerdictTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = report.build_report(run, Path(temporary) / "bundle")
             payload = json.loads(artifacts.result_json.read_text())
+            with artifacts.event_ledger.open(newline="") as source:
+                ledger = list(csv.DictReader(source))
         self.assertEqual(payload["verdict"], "NO_SIGNIFICANT_EDGE")
         self.assertEqual(payload["holdout"]["usable_test_matches"], 1)
+        self.assertEqual(payload["holdout"]["selected_events"], 0)
+        self.assertEqual(ledger, [])
+
+    def test_legacy_run_without_frozen_ledger_uses_favorite_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = report.build_report(synthetic_run(), Path(temporary) / "bundle")
+            with artifacts.event_ledger.open(newline="") as source:
+                ledger = list(csv.DictReader(source))
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["token_id"], "yes")
 
     def test_positive_proxy_with_missing_books_is_execution_blocked(self) -> None:
         verdict = report.decide_verdict(usable_test_matches=100, significant_positive_rules=1,
@@ -207,6 +219,14 @@ class CliTests(unittest.TestCase):
                              json.loads((second / "result.json").read_text()))
             self.assertEqual(json.loads((first / "frozen_strategy_manifest.json").read_text()),
                              json.loads((second / "frozen_strategy_manifest.json").read_text()))
+            frozen = json.loads((first / "frozen_strategy_manifest.json").read_text())
+            self.assertEqual(frozen["kelly_inputs"]["bootstrap_draws"], 2)
+            self.assertEqual(frozen["kelly_inputs"]["permutation_draws"], 2)
+            result_payload = json.loads((first / "result.json").read_text())
+            self.assertIsNone(result_payload["criteria"]["display_rule_id"])
+            self.assertEqual(result_payload["holdout"]["selected_events"], 0)
+            with (first / "research_event_ledger.csv").open(newline="") as source:
+                self.assertEqual(list(csv.DictReader(source)), [])
             manifest = json.loads((first / "artifact_manifest.json").read_text())["sha256"]
             import hashlib
             for name, digest in manifest.items():

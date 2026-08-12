@@ -82,7 +82,21 @@ def bootstrap_interval(
         raise ValueError("level must be strictly between zero and one")
     if not rows:
         return None, None
-    samples = np.asarray(bootstrap_match_blocks(rows, draws=draws, seed=seed).sums)
+    blocks: dict[str, float] = {}
+    for match_id, pnl in rows:
+        blocks[match_id] = blocks.get(match_id, 0.0) + float(pnl)
+    ids = tuple(sorted(blocks))
+    values = np.asarray([blocks[match_id] for match_id in ids], dtype=float)
+    rng = np.random.default_rng(seed)
+    samples = np.empty(draws, dtype=float)
+    # Keep the output vector only.  A full (draws, events) index matrix can
+    # exceed memory on the historical universe, while this preserves every
+    # requested bootstrap draw and its seeded random stream.
+    batch_size = min(draws, 256)
+    for offset in range(0, draws, batch_size):
+        count = min(batch_size, draws - offset)
+        indices = rng.integers(0, values.size, size=(count, values.size))
+        samples[offset:offset + count] = np.sum(values[indices], axis=1)
     lower, upper = np.quantile(samples, [(1.0 - level) / 2.0, 1.0 - (1.0 - level) / 2.0])
     return float(lower), float(upper)
 
@@ -142,11 +156,18 @@ def outcome_side_permutation_p_value(
             alternate_pnls.append(float(alternate_pnl))
     observed = float(sum(selected_pnls))
     rng = np.random.default_rng(seed)
-    choices = rng.integers(0, 2, size=(draws, len(selected_pnls)))
     selected_array = np.asarray(selected_pnls, dtype=float)
     alternate_array = np.asarray(alternate_pnls, dtype=float)
-    null = np.sum(np.where(choices == 0, selected_array, alternate_array), axis=1)
-    return float((1 + np.count_nonzero(null >= observed)) / (draws + 1))
+    count_at_least_observed = 0
+    # This null test only needs its exceedance count, not every draw.  Batch
+    # choices so memory is bounded by 256 match-block draws.
+    batch_size = min(draws, 256)
+    for offset in range(0, draws, batch_size):
+        count = min(batch_size, draws - offset)
+        choices = rng.integers(0, 2, size=(count, selected_array.size))
+        null = np.sum(np.where(choices == 0, selected_array, alternate_array), axis=1)
+        count_at_least_observed += int(np.count_nonzero(null >= observed))
+    return float((1 + count_at_least_observed) / (draws + 1))
 
 
 def contribution_diagnostics(pnls: Sequence[float]) -> dict[str, float | int | None]:
