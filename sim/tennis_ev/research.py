@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+from bisect import bisect_left, bisect_right
 from statistics import fmean
 from typing import Iterable, Mapping, Sequence
 
@@ -326,37 +327,41 @@ def chronological_split(
     if len({match.finish_ts for match in ordered}) == 1:
         raise ValueError("cannot split an all-equal finish timestamp group")
 
-    candidates: list[Split] = []
+    # Calculate candidate sizes from sorted timestamps, then materialize only
+    # the chosen partition.  Comparing a MatchRecord to every train/test tuple
+    # makes the old purge construction quadratic and repeatedly traverses paths.
+    finish_times = tuple(match.finish_ts for match in ordered)
+    pregame_times = tuple(sorted(match.pregame_ts for match in ordered))
+    candidates: list[tuple[int, int, int, int, float]] = []
     # A cutoff is the earliest decision timestamp represented in test, not a
     # training settlement timestamp.  This retains every label known strictly
     # before that decision while discarding only intervals that overlap it.
-    for cutoff in sorted({match.pregame_ts for match in ordered}):
-        train = tuple(match for match in ordered if match.finish_ts < cutoff)
+    for cutoff in sorted(set(pregame_times)):
+        train_count = bisect_left(finish_times, cutoff)
         # The cutoff itself belongs to neither side.  This prevents a decision
         # at the same timestamp as the last known training label from entering
         # the holdout as if it were strictly later information.
-        test = tuple(match for match in ordered if match.pregame_ts > cutoff)
-        purged = tuple(match for match in ordered if match not in train and match not in test)
-        if not train or not test:
+        test_count = len(ordered) - bisect_right(pregame_times, cutoff)
+        if not train_count or not test_count:
             continue
-        retained = len(train) + len(test)
-        candidates.append(Split(
-            train=train,
-            test=test,
-            purged=purged,
-            boundary_ts=cutoff,
-            achieved_train_fraction=len(train) / retained,
-        ))
+        retained = train_count + test_count
+        candidates.append((cutoff, train_count, test_count, len(ordered) - retained,
+                           train_count / retained))
     if not candidates:
         raise ValueError("cannot form a causally valid chronological holdout")
-    return min(
+    cutoff, _, _, _, fraction = min(
         candidates,
-        key=lambda split: (
-            abs(split.achieved_train_fraction - train_fraction),
-            len(split.purged),
-            split.boundary_ts,
+        key=lambda candidate: (
+            abs(candidate[4] - train_fraction), candidate[3], candidate[0],
         ),
     )
+    train = tuple(match for match in ordered if match.finish_ts < cutoff)
+    test = tuple(match for match in ordered if match.pregame_ts > cutoff)
+    purged = tuple(match for match in ordered if not (
+        match.finish_ts < cutoff or match.pregame_ts > cutoff
+    ))
+    return Split(train=train, test=test, purged=purged, boundary_ts=cutoff,
+                 achieved_train_fraction=fraction)
 
 
 _NUMERIC_FEATURE_FAMILIES: tuple[tuple[str, str], ...] = (
@@ -568,12 +573,16 @@ def _condition_selection_groups(
     )))
 
 
-def _proxy_pnl_rows(events: Sequence[ResearchEvent]) -> tuple[list[tuple[str, float]], list[float], list[float]]:
+def _proxy_pnl_rows(
+    events: Sequence[ResearchEvent], *, fee_schedule: FeeSchedule | None = None,
+) -> tuple[list[tuple[str, float]], list[float], list[float]]:
     rows: list[tuple[str, float]] = []
     pnls: list[float] = []
     costs: list[float] = []
     for event in events:
-        pnl, cost = statistics.share_pnl(event.current_price, event.won)
+        pnl, cost = statistics.share_pnl(
+            event.current_price, event.won, _fee_per_share(fee_schedule, event.current_price),
+        )
         rows.append((event.event_id, pnl))
         pnls.append(pnl)
         costs.append(cost)
@@ -582,6 +591,7 @@ def _proxy_pnl_rows(events: Sequence[ResearchEvent]) -> tuple[list[tuple[str, fl
 
 def _evaluate_conditions(
     candidates: Sequence[Condition], events: Sequence[ResearchEvent], *, draws: int, seed: int,
+    fee_schedule: FeeSchedule | None = None,
 ) -> tuple[ConditionResult, ...]:
     preliminary: list[ConditionResult] = []
     raw_ps: list[float] = []
@@ -590,12 +600,34 @@ def _evaluate_conditions(
         selections = _condition_selection_groups(condition, events)
         matched = [selected for selected, _ in selections]
         if not selections:
-            preliminary.append(ConditionResult(condition.rule_id, None, 0, 0, 0, 0, 0.0, 0.0, None, None, None, None, None, None, None, 0.0, "ZERO_MATCHES"))
+            preliminary.append(ConditionResult(
+                condition.rule_id, None, 0, 0, 0, 0, 0.0, 0.0, None, None,
+                None, None, None, None, None, 0.0, "ZERO_MATCHES",
+                economic_result_basis=("GROSS_REFERENCE_PROXY" if fee_schedule is None
+                                       else "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE"),
+                execution_cost_block=("BLOCK_DATA_FEE_SLIPPAGE_LIQUIDITY" if fee_schedule is None
+                                      else "BLOCK_DATA_SLIPPAGE_LIQUIDITY"),
+            ))
             continue
-        pnl_rows, pnls, costs = _proxy_pnl_rows(matched)
+        pnl_rows, pnls, costs = _proxy_pnl_rows(matched, fee_schedule=fee_schedule)
         lower, upper = statistics.bootstrap_interval(pnl_rows, draws=draws, seed=seed + index)
         p_value = statistics.outcome_side_permutation_p_value(
-            selections, draws=draws, seed=seed + len(candidates) + index,
+            selections,
+            pnl_pairs=tuple(
+                (
+                    statistics.share_pnl(
+                        selected.current_price, selected.won,
+                        _fee_per_share(fee_schedule, selected.current_price),
+                    )[0],
+                    statistics.share_pnl(
+                        alternate.current_price, alternate.won,
+                        _fee_per_share(fee_schedule, alternate.current_price),
+                    )[0],
+                )
+                for selected, alternate in selections
+            ),
+            draws=draws,
+            seed=seed + len(candidates) + index,
         )
         diagnostic = statistics.contribution_diagnostics([
             sum(value for row_id, value in pnl_rows if row_id == event_id)
@@ -609,6 +641,10 @@ def _evaluate_conditions(
             diagnostic["largest_contribution"], float(diagnostic["pnl_without_largest"]),
             None if sum(pnls) > 0.0 else "NON_POSITIVE_TRAINING_EV",
             mean_pnl=(sum(pnls) / len(pnls) if pnls else None),
+            economic_result_basis=("GROSS_REFERENCE_PROXY" if fee_schedule is None
+                                   else "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE"),
+            execution_cost_block=("BLOCK_DATA_FEE_SLIPPAGE_LIQUIDITY" if fee_schedule is None
+                                  else "BLOCK_DATA_SLIPPAGE_LIQUIDITY"),
         )
         preliminary.append(result)
         if p_value is not None:
@@ -628,6 +664,7 @@ def _evaluate_conditions(
 def freeze_training_manifest(
     training_events: Iterable[ResearchEvent], *, alpha: float,
     split_cutoff_ts: int | None = None,
+    fee_schedule: FeeSchedule | None = None,
 ) -> FrozenManifest:
     """Discover on training data only and freeze rules before holdout access."""
     if not 0.0 < alpha < 1.0:
@@ -639,7 +676,8 @@ def freeze_training_manifest(
         (event.finish_ts for event in events), default=None
     )
     candidates = generate_candidates(events)
-    results = _evaluate_conditions(candidates, events, draws=10_000, seed=20260812)
+    results = _evaluate_conditions(candidates, events, draws=10_000, seed=20260812,
+                                   fee_schedule=fee_schedule)
     candidate_by_id = {candidate.rule_id: candidate for candidate in candidates}
     selected_results = []
     for result in results:
@@ -695,9 +733,14 @@ def freeze_training_manifest(
         condition_ledger=ledger,
         cost_specification={
             "execution_price": "HISTORICAL_REFERENCE_PRICE_ONLY",
-            "fee_schedule": None,
-            "fee_status": "BLOCK_DATA_FEE",
+            "fee_schedule": (None if fee_schedule is None else {
+                "rate": fee_schedule.rate, "exponent": fee_schedule.exponent,
+                "source": fee_schedule.source,
+            }),
+            "fee_status": "BLOCK_DATA_FEE" if fee_schedule is None else "SUPPLIED_FEE_SCHEDULE",
             "slippage": None,
+            "economic_result_basis": ("GROSS_REFERENCE_PROXY" if fee_schedule is None
+                                      else "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE"),
         },
         significance_alpha=alpha,
         significance_provenance="CONVENTIONAL_RESEARCH_SETTING",
@@ -711,7 +754,8 @@ def freeze_training_manifest(
 
 
 def evaluate_holdout(
-    manifest: FrozenManifest, holdout_events: Iterable[ResearchEvent],
+    manifest: FrozenManifest, holdout_events: Iterable[ResearchEvent], *,
+    fee_schedule: FeeSchedule | None = None,
 ) -> tuple[ConditionResult, ...]:
     """Evaluate the frozen rank order exactly once; this function never selects."""
     events = tuple(holdout_events)
@@ -722,6 +766,12 @@ def evaluate_holdout(
         event.decision_ts <= manifest.split_cutoff_ts for event in events
     ):
         raise ValueError("holdout decisions must be strictly after frozen split cutoff")
+    frozen_fee = manifest.cost_specification.get("fee_schedule")
+    supplied_fee = None if fee_schedule is None else {
+        "rate": fee_schedule.rate, "exponent": fee_schedule.exponent, "source": fee_schedule.source,
+    }
+    if frozen_fee != supplied_fee:
+        raise ValueError("holdout fee schedule must match the frozen training fee schedule")
     results: list[ConditionResult] = []
     for rank, rule_id in enumerate(manifest.selected_rule_ids, start=1):
         raw = manifest.selected_rule_definitions.get(rule_id)
@@ -730,10 +780,25 @@ def evaluate_holdout(
         condition = _condition_from_dict(raw)
         selections = _condition_selection_groups(condition, events)
         matched = [selected for selected, _ in selections]
-        pnl_rows, pnls, costs = _proxy_pnl_rows(matched)
+        pnl_rows, pnls, costs = _proxy_pnl_rows(matched, fee_schedule=fee_schedule)
         lower, upper = statistics.bootstrap_interval(pnl_rows, draws=10_000, seed=20260812 + rank)
         p_value = statistics.outcome_side_permutation_p_value(
-            selections, draws=10_000, seed=20270812 + rank,
+            selections,
+            pnl_pairs=tuple(
+                (
+                    statistics.share_pnl(
+                        selected.current_price, selected.won,
+                        _fee_per_share(fee_schedule, selected.current_price),
+                    )[0],
+                    statistics.share_pnl(
+                        alternate.current_price, alternate.won,
+                        _fee_per_share(fee_schedule, alternate.current_price),
+                    )[0],
+                )
+                for selected, alternate in selections
+            ),
+            draws=10_000,
+            seed=20270812 + rank,
         )
         diagnostic = statistics.contribution_diagnostics([
             sum(value for row_id, value in pnl_rows if row_id == event_id)
@@ -746,6 +811,10 @@ def evaluate_holdout(
             lower, upper, p_value, None, None, diagnostic["largest_contribution"],
             float(diagnostic["pnl_without_largest"]), "ZERO_MATCHES" if not matched else None,
             mean_pnl=(sum(pnls) / len(pnls) if pnls else None),
+            economic_result_basis=("GROSS_REFERENCE_PROXY" if fee_schedule is None
+                                   else "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE"),
+            execution_cost_block=("BLOCK_DATA_FEE_SLIPPAGE_LIQUIDITY" if fee_schedule is None
+                                  else "BLOCK_DATA_SLIPPAGE_LIQUIDITY"),
         ))
     raw_indices = [index for index, result in enumerate(results) if result.raw_p_value is not None]
     raw_ps = [results[index].raw_p_value for index in raw_indices]

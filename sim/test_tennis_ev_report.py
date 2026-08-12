@@ -7,6 +7,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from sim import run_polymarket_tennis_ev
+
 from sim.tennis_ev import report
 from sim.tennis_ev import research
 
@@ -36,6 +38,37 @@ def synthetic_run() -> report.ResearchRun:
 
 
 class VerdictTests(unittest.TestCase):
+    def test_report_uses_only_the_displayed_frozen_rule_for_its_verdict(self) -> None:
+        run = synthetic_run()
+        displayed = research.ConditionResult("displayed", 1, 1, 1, 1, 0, 0.40, 0.60,
+                                            2 / 3, 0.10, 0.70, 0.20, 0.20, 0.20,
+                                            0.40, 0.10, "FDR_NOT_SIGNIFICANT")
+        other = research.ConditionResult("other", 2, 1, 1, 1, 0, 0.40, 0.60,
+                                         2 / 3, 0.10, 0.70, 0.01, 0.01, 0.01,
+                                         0.40, 0.10, None)
+        run = report.ResearchRun(**{
+            **run.__dict__, "holdout_results": (displayed, other),
+            "holdout_ledger": ({"event_id": "m1", "rule_id": "displayed", "selected": "true", "net_pnl": 0.4},),
+            "frozen_manifest": {"significance_alpha": 0.05, "display_rule_id": "displayed"},
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = report.build_report(run, Path(temporary) / "bundle")
+            payload = json.loads(artifacts.result_json.read_text())
+        self.assertEqual(payload["verdict"], "NO_SIGNIFICANT_EDGE")
+        self.assertEqual(payload["criteria"]["display_rule_id"], "displayed")
+
+    def test_no_ranked_rule_with_a_usable_holdout_is_no_significant_edge(self) -> None:
+        run = synthetic_run()
+        run = report.ResearchRun(**{
+            **run.__dict__, "holdout_results": (), "holdout_ledger": (),
+            "frozen_manifest": {"significance_alpha": 0.05, "display_rule_id": None},
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = report.build_report(run, Path(temporary) / "bundle")
+            payload = json.loads(artifacts.result_json.read_text())
+        self.assertEqual(payload["verdict"], "NO_SIGNIFICANT_EDGE")
+        self.assertEqual(payload["holdout"]["usable_test_matches"], 1)
+
     def test_positive_proxy_with_missing_books_is_execution_blocked(self) -> None:
         verdict = report.decide_verdict(usable_test_matches=100, significant_positive_rules=1,
                                         executable_book_matches=0, net_after_verified_costs=True)
@@ -124,6 +157,50 @@ class ArtifactTests(unittest.TestCase):
                 report._write_charts = original
             self.assertEqual({path.name for path in output_dir.iterdir()}, {"old.txt"})
             self.assertEqual((output_dir / "old.txt").read_text(), "intact")
+
+
+class CliTests(unittest.TestCase):
+    def test_cli_builds_reproducible_complete_artifact_set(self) -> None:
+        """The entry point is local-only and publishes a self-verifying bundle."""
+        rows = []
+        for index in range(8):
+            start = 1_000 + index * 1_000
+            high_won = index % 2 == 0
+            rows.append({
+                "event_id": f"event-{index}", "market_id": f"market-{index}",
+                "series": "ATP", "title": f"Player A vs Player B {index}",
+                "start_ts": start, "actual_finish_ts": start + 700,
+                "pregame_timestamp": start - 100,
+                "outcomes": ["Player A", "Player B"], "pregame_prices": [0.65, 0.35],
+                "high_outcome": "Player A", "low_outcome": "Player B",
+                "high_token": f"yes-{index}", "low_token": f"no-{index}",
+                "high_pregame_price": 0.65, "low_pregame_price": 0.35,
+                "high_won": high_won, "low_won": not high_won,
+                "high_path": [[0, 0.65], [300, 0.66]],
+                "low_path": [[0, 0.35], [300, 0.34]],
+            })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "paths.jsonl.gz"
+            import gzip
+            with gzip.open(fixture, "wt", encoding="utf-8") as output:
+                for row in rows:
+                    output.write(json.dumps(row) + "\n")
+            first = root / "first"
+            second = root / "second"
+            args = ["--paths", str(fixture), "--output-dir", str(first),
+                    "--simulation-paths", "2"]
+            self.assertEqual(run_polymarket_tennis_ev.main(args), 0)
+            args[3] = str(second)
+            self.assertEqual(run_polymarket_tennis_ev.main(args), 0)
+            self.assertEqual(json.loads((first / "result.json").read_text()),
+                             json.loads((second / "result.json").read_text()))
+            self.assertEqual(json.loads((first / "frozen_strategy_manifest.json").read_text()),
+                             json.loads((second / "frozen_strategy_manifest.json").read_text()))
+            manifest = json.loads((first / "artifact_manifest.json").read_text())["sha256"]
+            import hashlib
+            for name, digest in manifest.items():
+                self.assertEqual(hashlib.sha256((first / name).read_bytes()).hexdigest(), digest)
 
 
 if __name__ == "__main__":

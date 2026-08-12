@@ -220,6 +220,33 @@ def _significant(results: Sequence[object], *, alpha: float | None) -> list[Mapp
     return output
 
 
+def _display_rule_id(manifest: Mapping[str, object]) -> str | None:
+    """Return the predeclared display rule, never a post-hoc holdout winner."""
+    value = manifest.get("display_rule_id")
+    if isinstance(value, str) and value:
+        return value
+    # Read old single-rule manifests deterministically; ambiguous manifests
+    # cannot support a verdict without an explicit displayed rule.
+    selected = manifest.get("selected_rule_ids")
+    if isinstance(selected, Sequence) and not isinstance(selected, (str, bytes)) and len(selected) == 1:
+        return str(selected[0])
+    return None
+
+
+def _display_result(
+    results: Sequence[object], *, display_rule_id: str | None,
+) -> Mapping[str, object] | None:
+    if display_rule_id is None:
+        # Legacy bundles that predate display_rule_id have no ambiguous rank
+        # only when they contain exactly one frozen result.
+        rows = _rows(results)
+        return rows[0] if len(rows) == 1 else None
+    for row in _rows(results):
+        if str(row.get("rule_id")) == display_rule_id:
+            return row
+    return None
+
+
 def _row_execution_evidence_verified(row: Mapping[str, object]) -> bool:
     """A global coverage count cannot prove an individual selected fill."""
     explicit_book = all(row.get(key) is not None for key in ("best_bid", "best_ask")) and any(
@@ -270,9 +297,24 @@ def _build_bundle(run: ResearchRun, output_dir: Path) -> None:
     ledger = _event_ledger(run)
     selected = [row for row in ledger if str(row.get("selected", "false")).lower() == "true"]
     total = sum(float(row.get("net_pnl", row.get("pnl", 0.0))) for row in selected)
-    usable_test_matches = len({row.get("event_id") for row in selected})
+    # A rule may select zero events even though the frozen test population is
+    # usable.  The denominator for BLOCK_DATA is the whole test coverage, not
+    # the selected rank-one ledger.
+    usable_test_matches = len({getattr(event, "event_id", None) for event in run.test_events})
+    usable_test_matches -= int(None in {getattr(event, "event_id", None) for event in run.test_events})
+    coverage_test_matches = run.coverage.get("research_decision_coverage", {})
+    if isinstance(coverage_test_matches, Mapping):
+        usable_test_matches = max(usable_test_matches, int(coverage_test_matches.get("test_matches", 0) or 0))
     alpha = _significance_alpha(run.frozen_manifest)
-    significant = _significant(run.holdout_results, alpha=alpha)
+    display_rule_id = _display_rule_id(run.frozen_manifest)
+    displayed_result = _display_result(run.holdout_results, display_rule_id=display_rule_id)
+    significant = (
+        [displayed_result] if displayed_result is not None and alpha is not None
+        and displayed_result.get("q_value") is not None
+        and float(displayed_result["q_value"]) <= alpha
+        and float(displayed_result.get("net_pnl", 0.0)) > 0.0
+        else []
+    )
     coverage_books = int(run.coverage.get("execution_book_matches", 0) or 0)
     verified_rows = [row for row in selected if _row_execution_evidence_verified(row)]
     full_execution = bool(selected) and len(verified_rows) == len(selected)
@@ -286,7 +328,7 @@ def _build_bundle(run: ResearchRun, output_dir: Path) -> None:
                                   executable_book_matches=len(verified_rows), net_after_verified_costs=verified_costs,
                                   corrected_significance_passed=bool(significant), net_ev_interval_lower_positive=lower_positive,
                                   concentration_check_passed=concentration, execution_coverage_complete=full_execution)
-    result = {"verdict": verdict, "holdout": {"object": "frozen_holdout_selected_event_ledger", "unit": "one_share", "selected_events": len(selected), "usable_test_matches": usable_test_matches, "net_pnl": total, "data_source": "research_event_ledger.csv", "numeric_provenance": "FORMULA_DERIVED_VALUE"}, "criteria": {"significance_alpha": alpha, "significant_positive_rules": len(significant), "global_execution_book_matches": coverage_books, "row_verified_execution_cost_matches": len(verified_rows), "verified_costs_captured": verified_costs, "execution_coverage_complete": full_execution}}
+    result = {"verdict": verdict, "holdout": {"object": "frozen_holdout_selected_event_ledger", "unit": "one_share", "selected_events": len(selected), "usable_test_matches": usable_test_matches, "net_pnl": total, "data_source": "research_event_ledger.csv", "numeric_provenance": "FORMULA_DERIVED_VALUE"}, "criteria": {"significance_alpha": alpha, "display_rule_id": display_rule_id, "significant_positive_rules": len(significant), "global_execution_book_matches": coverage_books, "row_verified_execution_cost_matches": len(verified_rows), "verified_costs_captured": verified_costs, "execution_coverage_complete": full_execution}}
     _json(output_dir / "coverage_manifest.json", run.coverage)
     _csv(output_dir / "normalized_matches.csv", _rows(run.matches)); _csv(output_dir / "market_snapshots.csv", _rows(run.snapshots)); _csv(output_dir / "trades.csv", _rows(run.trades)); _csv(output_dir / "match_state.csv", _rows(run.states)); _csv(output_dir / "exclusions.csv", _rows(run.exclusions))
     _csv(output_dir / "research_event_ledger.csv", ledger); _json(output_dir / "frozen_strategy_manifest.json", run.frozen_manifest)

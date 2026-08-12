@@ -43,6 +43,22 @@ def match_with_path(
 
 
 class CausalEventTests(unittest.TestCase):
+    def test_split_handles_a_thousand_records_without_record_equality_partitioning(self) -> None:
+        """A real-sized split must not repeatedly compare full path records."""
+        matches = tuple(
+            match_with_path(
+                f"large-{index}", finish_ts=index * 100 + 80,
+                start_ts=index * 100 + 20, pregame_ts=index * 100 + 10,
+                path=[(index * 100 + 20, 0.60)],
+            )
+            for index in range(1_000)
+        )
+
+        split = research.chronological_split(matches, train_fraction=0.70)
+
+        self.assertEqual(len(split.train) + len(split.test) + len(split.purged), len(matches))
+        self.assertTrue(all(match.finish_ts < split.boundary_ts for match in split.train))
+        self.assertTrue(all(match.pregame_ts > split.boundary_ts for match in split.test))
     def test_feature_builder_never_reads_points_after_decision(self) -> None:
         match = match_with_path()
 
@@ -363,6 +379,35 @@ def feature_rows(
 
 
 class ConditionDiscoveryTests(unittest.TestCase):
+    def test_condition_results_use_the_same_supplied_fee_schedule_in_training_and_holdout(self) -> None:
+        schedule = research.FeeSchedule(0.10, 2.0, "TEST_FEE")
+        train = feature_rows([0.60, 0.70, 0.80, 0.90])
+        manifest = research.freeze_training_manifest(train, alpha=0.05, fee_schedule=schedule)
+
+        self.assertEqual(manifest.cost_specification["fee_schedule"]["source"], "TEST_FEE")
+        self.assertEqual(manifest.cost_specification["economic_result_basis"], "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE")
+        self.assertTrue(all(
+            row["economic_result_basis"] == "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE"
+            for row in manifest.condition_ledger if not row["rule_id"].startswith("UNAVAILABLE_")
+        ))
+
+        selected = manifest.selected_rule_ids
+        if selected:
+            holdout = tuple(replace(event, event_id=f"holdout-{event.event_id}", decision_ts=10_000) for event in train)
+            results = research.evaluate_holdout(manifest, holdout, fee_schedule=schedule)
+            self.assertTrue(all(result.economic_result_basis == "REFERENCE_PROXY_NET_OF_SUPPLIED_FEE_SCHEDULE" for result in results))
+
+    def test_holdout_rejects_a_fee_schedule_that_differs_from_the_frozen_training_schedule(self) -> None:
+        train = feature_rows([0.60, 0.70, 0.80, 0.90])
+        manifest = research.freeze_training_manifest(
+            train, alpha=0.05, fee_schedule=research.FeeSchedule(0.10, 2.0, "TRAIN"),
+        )
+        holdout = tuple(replace(event, event_id=f"holdout-{event.event_id}", decision_ts=10_000) for event in train)
+
+        with self.assertRaisesRegex(ValueError, "fee schedule"):
+            research.evaluate_holdout(
+                manifest, holdout, fee_schedule=research.FeeSchedule(0.20, 2.0, "OTHER"),
+            )
     def test_outcome_side_null_does_not_treat_fair_90_percent_favorites_as_edge(self) -> None:
         groups = []
         for index in range(10):
@@ -380,6 +425,24 @@ class ConditionDiscoveryTests(unittest.TestCase):
         )
 
         self.assertGreater(p_value, 0.05)
+
+    def test_outcome_side_permutation_uses_supplied_net_pair_pnls_without_price_recomputation(self) -> None:
+        """The null must use the same already-costed returns as reported PnL."""
+        selections = ((object(), object()), (object(), object()))
+        net_pairs = ((0.30, -0.80), (0.30, -0.80))
+
+        actual = statistics.outcome_side_permutation_p_value(
+            selections, pnl_pairs=net_pairs, draws=4, seed=1,
+        )
+
+        choices = np.random.default_rng(1).integers(0, 2, size=(4, 2))
+        null = np.sum(np.where(
+            choices == 0,
+            np.array([0.30, 0.30]),
+            np.array([-0.80, -0.80]),
+        ), axis=1)
+        expected = (1 + np.count_nonzero(null >= 0.60)) / 5
+        self.assertEqual(actual, expected)
 
     def test_condition_selection_uses_one_deterministic_outcome_per_match(self) -> None:
         match = match_with_path("condition-pair", finish_ts=1_000, path=[(100, 0.60)])

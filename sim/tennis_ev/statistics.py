@@ -110,6 +110,7 @@ def block_sign_permutation_p_value(
 
 def outcome_side_permutation_p_value(
     selections: Sequence[tuple[object, object]], *, draws: int, seed: int,
+    pnl_pairs: Sequence[tuple[float, float]] | None = None,
 ) -> float | None:
     """Test a directional choice against its other outcome within each match.
 
@@ -125,11 +126,20 @@ def outcome_side_permutation_p_value(
         return None
     selected_pnls: list[float] = []
     alternate_pnls: list[float] = []
-    for selected, alternate in selections:
-        selected_pnl, _ = share_pnl(float(selected.current_price), bool(selected.won))
-        alternate_pnl, _ = share_pnl(float(alternate.current_price), bool(alternate.won))
-        selected_pnls.append(selected_pnl)
-        alternate_pnls.append(alternate_pnl)
+    if pnl_pairs is None:
+        for selected, alternate in selections:
+            selected_pnl, _ = share_pnl(float(selected.current_price), bool(selected.won))
+            alternate_pnl, _ = share_pnl(float(alternate.current_price), bool(alternate.won))
+            selected_pnls.append(selected_pnl)
+            alternate_pnls.append(alternate_pnl)
+    else:
+        if len(pnl_pairs) != len(selections):
+            raise ValueError("pnl_pairs must have one pair per selection")
+        for selected_pnl, alternate_pnl in pnl_pairs:
+            if not math.isfinite(selected_pnl) or not math.isfinite(alternate_pnl):
+                raise ValueError("pnl_pairs must contain finite PnL values")
+            selected_pnls.append(float(selected_pnl))
+            alternate_pnls.append(float(alternate_pnl))
     observed = float(sum(selected_pnls))
     rng = np.random.default_rng(seed)
     choices = rng.integers(0, 2, size=(draws, len(selected_pnls)))
