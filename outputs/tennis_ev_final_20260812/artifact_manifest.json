@@ -1,0 +1,27 @@
+{
+  "sha256": {
+    "all_training_conditions.csv": "406ab39276d46f008b0aea6bc7beb226c46364f6374a026bcea9872188f8ba2c",
+    "bankroll_results.json": "78a6f82dc964a47fe3463c7339a544220ee7982051a5037441931f757939c9f2",
+    "coverage_manifest.json": "9a13e1819c9e631d40afc182fa650cc21edf04c1bdce5e68d1d8abaeb36a3e61",
+    "drawdown_curve.png": "cb25152c44258ef1126f9396f9fa6502f1de6bc4e9075040584c3e18cdac42fb",
+    "equity_curve.png": "3175d008577096c5b0501ef18159440ac3f0ecabf2ef434202da64634cc3696e",
+    "exclusions.csv": "686d4254119db81ab10e95644d96c7a29a1b78574191571c3fc71f985ca96a80",
+    "favorite_baseline.csv": "5b818f11e61828e9ccc76655e2b37ee57bd56cbb164c184dfce1318da2d6a632",
+    "favorite_calibration.csv": "c2012d3fab02a43a629101791b5812b2dcac2c00b2ba1a2e60356810e949ad65",
+    "frozen_holdout_results.csv": "686d4254119db81ab10e95644d96c7a29a1b78574191571c3fc71f985ca96a80",
+    "frozen_strategy_manifest.json": "bc60c6fc2be3828b2fc630a4559280cb368033cef9628c7448a673a51184de31",
+    "hedge_results.csv": "8b2dbcbbe8359ef694e5e669d532ac1afd6aa40618a7b68c76925906687f9c44",
+    "market_snapshots.csv": "686d4254119db81ab10e95644d96c7a29a1b78574191571c3fc71f985ca96a80",
+    "match_state.csv": "686d4254119db81ab10e95644d96c7a29a1b78574191571c3fc71f985ca96a80",
+    "monte_carlo_summary.json": "c98f9e9e8d4c0981baee3cedd92d72fddc67949a40d1f0c905bcabbcedcd3b4d",
+    "normalized_matches.csv": "610cd437c1d53dcc04c712328e14ae9401e9021e0c4b6db63f310c6ed04141bd",
+    "random_baseline.json": "bf363a69d331fe768ec1001209699e985a680e80d9927fc8020927e4cf8039a3",
+    "report.md": "2187da7bcc608c37b38d4040b31c44085ab07767351833b9846df0e2356dfb55",
+    "research_event_ledger.csv": "686d4254119db81ab10e95644d96c7a29a1b78574191571c3fc71f985ca96a80",
+    "result.json": "23d732fda6c738520388bcb4fa8c08bdd2db78d894de5e3727eb3279a5ccd377",
+    "roi_distribution.png": "679e96246fdcc3aaabcf43ee9fc42f0bdc2df7ba0bcdd79b239ed1846d5f6301",
+    "strategy_comparison.png": "11a7e4584ca66c1d147e2dfeac9290b5fc5621313daf5090e16389c10d54837a",
+    "top_50_training_conditions.csv": "a48be1eb4fca16ab2a5a371bf4ee412560bd3d50bad4877107ac3a0108358452",
+    "trades.csv": "686d4254119db81ab10e95644d96c7a29a1b78574191571c3fc71f985ca96a80"
+  }
+}

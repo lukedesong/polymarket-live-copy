@@ -150,7 +150,9 @@ def _csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
-            writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+            writer = csv.DictWriter(
+                output, fieldnames=fields, extrasaction="ignore", lineterminator="\n"
+            )
             writer.writeheader()
             for row in normalized:
                 writer.writerow({key: _cell(row.get(key)) for key in fields})

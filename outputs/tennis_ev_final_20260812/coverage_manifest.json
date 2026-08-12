@@ -1,0 +1,35 @@
+{
+  "earliest_finish_ts": 1762982391,
+  "excluded_matches": 0,
+  "exclusions_by_reason": {},
+  "execution_book_matches": 0,
+  "latest_finish_ts": 1786384481,
+  "match_state_matches": 0,
+  "pagination_status": "UNKNOWN_ARTIFACT",
+  "raw_rows": 2416,
+  "research_decision_coverage": {
+    "purged_matches": 7,
+    "test_events": 2892,
+    "test_matches": 723,
+    "train_events": 6740,
+    "train_matches": 1686
+  },
+  "settlement_coverage": {
+    "fraction": 1.0,
+    "settled_matches": 2416,
+    "usable_matches": 2416
+  },
+  "source_path": "outputs/polymarket_tennis_exit_paths_primary.jsonl.gz",
+  "source_sha256": "6cd9d1f38881c177415198efbbcb7e9033b9f627c9736cbf665809c6a7df4b53",
+  "timestamp_coverage": {
+    "earliest_finish_ts": 1762982391,
+    "earliest_pregame_ts": 1762975748,
+    "earliest_start_ts": 1762975800,
+    "latest_finish_ts": 1786384481,
+    "latest_pregame_ts": 1786379350,
+    "latest_start_ts": 1786379400
+  },
+  "truncation_status": "UNKNOWN_ARTIFACT",
+  "unique_markets": 2416,
+  "usable_matches": 2416
+}
