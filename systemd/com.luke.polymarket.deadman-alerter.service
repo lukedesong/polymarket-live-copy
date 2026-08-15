@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket dead-man liveness alerter (independent of business code)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=polymarket-live
+Group=polymarket-live
+EnvironmentFile=/etc/polymarket-live/deadman-alerter.env
+ExecStart=/opt/polymarket-live/venv/bin/python /opt/polymarket-live/current/ops/polymarket-deadman-alerter.py
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/polymarket-live/runtime/server_health
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

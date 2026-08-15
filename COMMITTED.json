@@ -1,0 +1,32 @@
+{
+  "change_id": "version-authority-private-timeline-v3.10-20260815",
+  "committed_at_utc": "2026-08-15T12:55:14Z",
+  "previous_release": "/opt/polymarket-live/releases/20260815T123908Z-gtc-active-cancel-v3.9",
+  "release": "/opt/polymarket-live/releases/20260815T130000Z-version-authority-private-timeline-v3.10",
+  "result": "VERIFIED_FIXED",
+  "safety": {
+    "executor_restart_performed": false,
+    "historical_replay_performed": false,
+    "live_ledger_rewritten": false,
+    "manual_order_submitted": false,
+    "unknown_submission_reposted": false
+  },
+  "scope": "Allow the canonical version verifier to read the private repair timeline through fixed non-interactive sudo without widening runtime-directory permissions. No trading runtime, policy, service, or ledger change.",
+  "semantic_repair_version": "3.10",
+  "sha256": {
+    "MANIFEST.sha256": "eff6321a53c79dd28f2110783344615be76c85c00f5f24e47b00b49d1f7c9b8f",
+    "verify_repair_version_authority.py": "d9e2355bfd2f29fdb8faabfed9f6754be2c1218092f63bd94544f605994fa384"
+  },
+  "verification": {
+    "active_executor_services": 4,
+    "active_executor_services_expected": 4,
+    "canonical_nonroot_verifier_passed_before_cutover": true,
+    "cd90_user_paused": true,
+    "live_sqlite_integrity_passed": 4,
+    "live_sqlite_integrity_total": 4,
+    "runtime_asset_groups_identical": 3,
+    "runtime_asset_groups_total": 3,
+    "targeted_tests_passed": 2,
+    "targeted_tests_total": 2
+  }
+}
