@@ -226,7 +226,7 @@ def test_tennis_skips_buys_below_the_current_market_minimum():
     )
 
 
-def test_arm_runtime_records_user_authorized_minimum_upscale_for_future_buys_only(
+def test_arm_runtime_preserves_skip_below_minimum_without_rebasing(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -267,39 +267,17 @@ def test_arm_runtime_records_user_authorized_minimum_upscale_for_future_buys_onl
         store=store,
         adapter=Adapter(),
         env=env,
-        minimum_size_policy=live.MINIMUM_SIZE_POLICY_UPSCALE_TO_MINIMUM,
+        minimum_size_policy=live.MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
     )
 
-    assert allocation == D("100")
+    assert allocation is None
     assert store.config("minimum_size_policy") == (
-        live.MINIMUM_SIZE_POLICY_UPSCALE_TO_MINIMUM
+        live.MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM
     )
     assert store.config("source_wallet") == "0x" + "b" * 40
     assert store.account_snapshot() == before_account
     assert store.fixed_share_scale() == before_scale
-    with store.connect() as connection:
-        receipt = connection.execute(
-            """
-            SELECT config_key, previous_value, new_value, reason, details_json
-            FROM config_change_receipts
-            """
-        ).fetchone()
-    assert dict(receipt) == {
-        "config_key": "minimum_size_policy",
-        "previous_value": live.MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
-        "new_value": live.MINIMUM_SIZE_POLICY_UPSCALE_TO_MINIMUM,
-        "reason": "USER_AUTHORIZED_MINIMUM_UPSCALE_FOR_FUTURE_BUYS",
-        "details_json": json.dumps(
-            {
-                "applies_to": "FUTURE_SOURCE_ACTIONS_ONLY",
-                "fixed_share_scale_changed": False,
-                "historical_ledger_rewritten": False,
-                "open_positions_changed": False,
-                "upscale_scope": "INITIAL_BUY_TARGET_ONLY",
-            },
-            sort_keys=True,
-        ),
-    }
+    assert store.runtime_value("live_enabled") == "true"
 
 
 def test_arm_runtime_does_not_persist_a_strategy_wallet_policy(
@@ -414,7 +392,7 @@ def test_arm_runtime_initializes_scale_when_authenticated_cash_is_zero(
         ),
     }
 
-    assert live._arm_runtime(store=store, adapter=Adapter(), env=env) == D("100")
+    assert live._arm_runtime(store=store, adapter=Adapter(), env=env) is None
     assert store.fixed_share_scale() == D("0.25")
 
 
@@ -538,7 +516,7 @@ def test_arm_runtime_migrates_legacy_minimum_upscale_policy_without_rebasing(
         minimum_size_policy=live.MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
     )
 
-    assert allocation == D("100")
+    assert allocation is None
     assert store.config("minimum_size_policy") == (
         live.MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM
     )
@@ -620,6 +598,109 @@ def action(*, side: str = "BUY", quantity: str = "40", marker: str = "1") -> Sou
         source_role="maker",
         discovered_at_ms=1_700_000_000_100,
     )
+
+
+def _available_cash_usd(store: LiveStore) -> Decimal:
+    """Current cash authority less only active authenticated BUY reservations."""
+
+    return store.account_snapshot()["cash_usd"] - store.active_buy_reservations_usd()
+
+
+def _action_transition_count(store: LiveStore) -> int:
+    with store.connect() as connection:
+        return int(
+            connection.execute("SELECT COUNT(*) FROM action_transitions").fetchone()[0]
+        )
+
+
+def _fill_correction_count(store: LiveStore) -> int:
+    with store.connect() as connection:
+        return int(
+            connection.execute("SELECT COUNT(*) FROM fill_corrections").fetchone()[0]
+        )
+
+
+def _seed_local_fill(
+    *,
+    store: LiveStore,
+    source: SourceAction,
+    quantity: Decimal,
+    price: Decimal,
+    fee_usd: Decimal,
+) -> None:
+    """Create a pre-existing local fill for setup without pretending to submit."""
+
+    store.record_action_receipt(source)
+    with store.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        LiveStore._apply_fill_on_connection(
+            connection,
+            source=source,
+            quantity=quantity,
+            price=price,
+            fee_usd=fee_usd,
+            notional_usd=None,
+        )
+    store.append_transition(
+        source=source,
+        status="FILLED",
+        reason="TEST_SEEDED_LOCAL_FILL",
+        created_at_ms=source.discovered_at_ms,
+    )
+
+
+def _begin_test_submission_attempt(
+    *,
+    store: LiveStore,
+    source: SourceAction,
+    requested_quantity: Decimal,
+    snapshot: dict[str, str],
+    created_at_ms: int,
+):
+    price = D(snapshot["best_price"])
+    buy_notional = requested_quantity * price if source.side == "BUY" else D("0")
+    return store.begin_submission_attempt(
+        source=source,
+        plan=live.ActionPlan(
+            terminal_status="SUBMIT_STARTED",
+            reason="TEST_SUBMISSION_ATTEMPT",
+            side=source.side,
+            proportional_quantity=requested_quantity,
+            requested_quantity=requested_quantity,
+            order_amount_usd=buy_notional,
+            worst_price=price,
+            reserved_cash_usd=buy_notional,
+        ),
+        snapshot=snapshot,
+        condition_id="condition-123",
+        created_at_ms=created_at_ms,
+        transition_details={"test_fixture": True},
+    )
+
+
+def _set_authoritative_fill(
+    *,
+    execution,
+    quantity: Decimal,
+    notional_usd: Decimal,
+    vwap_price: Decimal,
+    fee_usd: Decimal = D("0"),
+    receipt_evidence=None,
+) -> None:
+    """Provide the current reconciliation contract without a fake order row."""
+
+    evidence = (
+        [{"transaction_hash": "0x" + "1" * 64}]
+        if receipt_evidence is None
+        else receipt_evidence
+    )
+    execution.authoritative_submission_execution = lambda **_kwargs: {
+        "quantity": quantity,
+        "notional_usd": notional_usd,
+        "fee_usd": fee_usd,
+        "vwap_price": vwap_price,
+        "receipt_evidence": evidence,
+    }
 
 
 def test_fidelity_schema_migration_is_additive_and_preserves_existing_ledger(
@@ -752,7 +833,8 @@ def test_frozen_metadata_target_and_attempts_are_idempotent_and_auditable(
     assert target["target_quantity"] == D("5")
     assert target["remaining_quantity"] == D("5")
 
-    first = store.next_submission_attempt(
+    first = _begin_test_submission_attempt(
+        store=store,
         source=source,
         requested_quantity=D("5"),
         snapshot={"best_price": "0.40"},
@@ -770,7 +852,18 @@ def test_frozen_metadata_target_and_attempts_are_idempotent_and_auditable(
         response={"status": "ORDER_STATUS_CANCELED"},
         updated_at_ms=15,
     )
-    second = store.next_submission_attempt(
+    store.release_reservation_and_finalize(
+        source=source,
+        terminal_status="PENDING_LIQUIDITY",
+        reason="TEST_FIRST_ATTEMPT_NO_FILL",
+        created_at_ms=15,
+        details={"test_fixture": True},
+        attempt_id=first["attempt_id"],
+        attempt_state="NO_FILL",
+        attempt_response={"status": "ORDER_STATUS_CANCELED"},
+    )
+    second = _begin_test_submission_attempt(
+        store=store,
         source=source,
         requested_quantity=D("5"),
         snapshot={"best_price": "0.41"},
@@ -2487,7 +2580,6 @@ def test_direct_counterparty_execution_fails_closed_before_book_or_ledger_write(
         follower._process_source_action(
             action=counterparty,
             execution=SnapshotMustNotRun(),
-            allocated_cash=D("100"),
             live_enabled=True,
         )
 
@@ -2569,7 +2661,16 @@ def test_counterparty_unknown_submission_never_reaches_authenticated_reconciliat
     )
     counterparty = replace(action(marker="c"), source_role="taker")
     assert store.record_action_receipt(counterparty) is True
-    attempt = store.next_submission_attempt(
+    store.ensure_action_target(
+        source=counterparty,
+        proportional_quantity=D("4"),
+        target_quantity=D("4"),
+        state="READY",
+        reason="LEGACY_COUNTERPARTY_AUDIT_ONLY",
+        updated_at_ms=counterparty.discovered_at_ms,
+    )
+    attempt = _begin_test_submission_attempt(
+        store=store,
         source=counterparty,
         requested_quantity=D("4"),
         snapshot={"best_price": "0.40"},
@@ -2719,11 +2820,12 @@ def test_source_actions_use_the_scale_version_of_their_chain_block(tmp_path: Pat
         allocated_cash=D("100"),
         live_enabled=True,
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10",
-        "size_matched": "10",
-        "price": "0.40",
+    execution.authoritative_submission_execution = lambda **_kwargs: {
+        "quantity": D("10"),
+        "notional_usd": D("4"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "1" * 64}],
     }
     reconcile_submitted_actions(store=store, execution=execution)
     execution.response = {"success": True, "orderID": "order-2"}
@@ -2788,7 +2890,7 @@ def test_disabled_live_mode_never_submits_an_order(tmp_path: Path):
         )
 
     assert execution.calls == []
-    assert store.action_transition_count() == 0
+    assert _action_transition_count(store) == 0
 
 
 def test_exact_proportional_size_posts_fak_without_rounding_and_reserves_notional(
@@ -2823,7 +2925,7 @@ def test_exact_proportional_size_posts_fak_without_rounding_and_reserves_notiona
     ]
     # Formula-derived: 100 cash - (10 shares * 0.40 limit) = 96 available
     # while the FAK receipt remains unreconciled.
-    assert store.available_cash_usd() == D("96")
+    assert _available_cash_usd(store) == D("96")
     assert store.action_receipt_count() == 1
 
 
@@ -3135,29 +3237,6 @@ def test_later_same_token_action_waits_for_prior_unknown_fill_before_sizing(
     assert len(execution.calls) == 1
     assert store.action_target(second.action_id) is None
 
-    execution.authoritative_submission_execution = lambda **_kwargs: {
-        "quantity": D("5"),
-        "notional_usd": D("2"),
-        "fee_usd": D("0"),
-        "vwap_price": D("0.40"),
-        "receipt_evidence": [{"transaction_hash": "0xminimum-fill"}],
-    }
-    reconcile_submitted_actions(store=store, execution=execution)
-    retried = retry_pending_actions(
-        store=store,
-        execution=execution,
-        allocated_cash=D("100"),
-    )
-
-    assert retried == [
-        {
-            "terminal_status": "SKIPPED",
-            "reason": "PRIOR_MINIMUM_UPSCALE_COVERS_PROPORTIONAL_BUY",
-        }
-    ]
-    assert len(execution.calls) == 1
-
-
 def test_later_same_token_action_waits_for_prior_metadata_before_sizing(
     tmp_path: Path,
 ):
@@ -3206,22 +3285,6 @@ def test_later_same_token_action_waits_for_prior_metadata_before_sizing(
         "latest_status": "PENDING_METADATA",
         "target_state": "",
     }
-
-    _fill_first_minimum_buy(store=store, execution=execution, source=earlier)
-    retried = retry_pending_actions(
-        store=store,
-        execution=execution,
-        allocated_cash=D("100"),
-    )
-
-    assert retried == [
-        {
-            "terminal_status": "SKIPPED",
-            "reason": "PRIOR_MINIMUM_UPSCALE_COVERS_PROPORTIONAL_BUY",
-        }
-    ]
-    assert len(execution.calls) == 1
-
 
 def test_unknown_submission_is_not_reposted_after_restart_or_duplicate_delivery(tmp_path: Path):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -3345,15 +3408,20 @@ def test_unknown_prepared_submission_keeps_order_hash_and_reconciles_fill(tmp_pa
     assert len(execution.prepared_submit_calls) == 1
 
     execution.error = None
-    execution.orders[execution.prepared["order_id"]] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10",
-        "size_matched": "10",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("4"),
+        vwap_price=D("0.40"),
+    )
     reconciled = reconcile_submitted_actions(store=store, execution=execution)
 
-    assert reconciled == [{"terminal_status": "FILLED", "reason": ""}]
+    assert reconciled == [
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
+    ]
     assert store.position_quantity("123") == D("10")
     assert len(execution.prepare_calls) == 1
     assert len(execution.prepared_submit_calls) == 1
@@ -3382,16 +3450,18 @@ def test_reconciled_order_response_cannot_persist_signature_material(
     )
     secret = "0x" + "cd" * 65
     execution.error = None
-    execution.orders[execution.prepared["order_id"]] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10",
-        "size_matched": "10",
-        "price": "0.40",
-        "signedOrder": {"signature": secret},
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("4"),
+        vwap_price=D("0.40"),
+    )
 
     assert reconcile_submitted_actions(store=store, execution=execution) == [
-        {"terminal_status": "FILLED", "reason": ""}
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
     ]
     with store.connect() as connection:
         persisted = "\n".join(
@@ -3873,7 +3943,7 @@ def test_submitted_buy_reserves_the_live_sleeve_cash_before_reconciliation(tmp_p
     assert first["terminal_status"] == "SUBMITTED_UNRECONCILED"
     assert second["terminal_status"] == "PENDING_CAPITAL"
     assert second["reason"] == "INSUFFICIENT_AVAILABLE_CASH"
-    assert store.available_cash_usd() == D("0")
+    assert _available_cash_usd(store) == D("0")
     assert len(execution.calls) == 1
 
 
@@ -3894,20 +3964,27 @@ def test_reconciled_fok_fill_updates_cash_and_local_inventory_once(tmp_path: Pat
         allocated_cash=D("4"),
         live_enabled=True,
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10",
-        "size_matched": "10",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("4"),
+        vwap_price=D("0.40"),
+    )
 
     results = reconcile_submitted_actions(store=store, execution=execution)
 
-    assert results == [{"terminal_status": "FILLED", "reason": ""}]
+    assert results == [
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
+    ]
     assert store.position_quantity("123") == D("10")
-    assert store.available_cash_usd() == D("0")
+    assert _available_cash_usd(store) == D("0")
     assert store.latest_transition(source)["terminal_status"] == "FILLED"
-    assert store.latest_transition(source)["details"]["matched_quantity_encoding"] == "HUMAN_SHARES"
+    assert store.latest_transition(source)["details"]["receipt_evidence"] == [
+        {"transaction_hash": "0x" + "1" * 64}
+    ]
 
 
 def test_fill_and_terminal_receipt_commit_atomically(tmp_path: Path):
@@ -3929,12 +4006,12 @@ def test_fill_and_terminal_receipt_commit_atomically(tmp_path: Path):
         allocated_cash=D("100"),
         live_enabled=True,
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10",
-        "size_matched": "10",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("4"),
+        vwap_price=D("0.40"),
+    )
     with store.connect() as connection:
         connection.execute(
             """
@@ -4167,7 +4244,7 @@ def test_canceled_order_release_and_terminal_receipt_commit_atomically(tmp_path:
             """
             CREATE TRIGGER reject_pending_terminal
             BEFORE INSERT ON action_transitions
-            WHEN NEW.status = 'PENDING_LIQUIDITY'
+            WHEN NEW.status = 'EXTERNAL_UNFILLABLE'
             BEGIN
                 SELECT RAISE(ABORT, 'injected terminal receipt failure');
             END
@@ -4329,7 +4406,6 @@ def test_buy_cash_order_one_raw_unit_rounding_dust_is_complete_not_retried(
     assert retry_pending_actions(
         store=store,
         execution=execution,
-        allocated_cash=D("10"),
     ) == []
 
 
@@ -4379,7 +4455,8 @@ def test_sell_authoritative_fill_can_never_exceed_the_requested_shares(tmp_path:
         source_open_position_value_usd=D("400"),
         observed_at_ms=1,
     )
-    store.apply_fill(
+    _seed_local_fill(
+        store=store,
         source=action(side="BUY", quantity="40", marker="8"),
         quantity=D("20"),
         price=D("0.40"),
@@ -4450,7 +4527,7 @@ def test_authoritative_fak_partial_fill_below_original_minimum_is_terminal(
         }
     ]
     assert store.position_quantity("123") == D("6")
-    assert store.available_cash_usd() == D("97.576")
+    assert _available_cash_usd(store) == D("97.576")
     latest = store.latest_transition(source)
     assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
     assert latest["reason"] == "PARTIAL_REMAINDER_BELOW_ORIGINAL_MARKET_MINIMUM"
@@ -4461,7 +4538,6 @@ def test_authoritative_fak_partial_fill_below_original_minimum_is_terminal(
     }
 
 
-@pytest.mark.parametrize("reconciliation_mode", ["authoritative", "order_status"])
 @pytest.mark.parametrize(
     ("first_minimum", "retry_minimum", "expected_terminal"),
     [
@@ -4471,7 +4547,6 @@ def test_authoritative_fak_partial_fill_below_original_minimum_is_terminal(
 )
 def test_multi_attempt_partial_remainder_uses_first_submitted_minimum(
     tmp_path: Path,
-    reconciliation_mode: str,
     first_minimum: str,
     retry_minimum: str,
     expected_terminal: str,
@@ -4502,21 +4577,12 @@ def test_multi_attempt_partial_remainder_uses_first_submitted_minimum(
         allocated_cash=D("100"),
         live_enabled=True,
     ) == {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""}
-    if reconciliation_mode == "authoritative":
-        execution.authoritative_submission_execution = lambda **_kwargs: {
-            "quantity": D("4"),
-            "notional_usd": D("1.6"),
-            "fee_usd": D("0"),
-            "vwap_price": D("0.4"),
-            "receipt_evidence": [],
-        }
-    else:
-        execution.orders["order-1"] = {
-            "status": "ORDER_STATUS_MATCHED",
-            "original_size": "10",
-            "size_matched": "4",
-            "price": "0.4",
-        }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("4"),
+        notional_usd=D("1.6"),
+        vwap_price=D("0.4"),
+    )
     assert reconcile_submitted_actions(store=store, execution=execution) == [
         {"terminal_status": "PARTIAL_PENDING", "reason": "FAK_PARTIAL_FILL"}
     ]
@@ -4530,21 +4596,12 @@ def test_multi_attempt_partial_remainder_uses_first_submitted_minimum(
         allocated_cash=D("100"),
         live_enabled=True,
     ) == {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""}
-    if reconciliation_mode == "authoritative":
-        execution.authoritative_submission_execution = lambda **_kwargs: {
-            "quantity": D("2"),
-            "notional_usd": D("0.8"),
-            "fee_usd": D("0"),
-            "vwap_price": D("0.4"),
-            "receipt_evidence": [],
-        }
-    else:
-        execution.orders["order-2"] = {
-            "status": "ORDER_STATUS_MATCHED",
-            "original_size": "6",
-            "size_matched": "2",
-            "price": "0.4",
-        }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("2"),
+        notional_usd=D("0.8"),
+        vwap_price=D("0.4"),
+    )
 
     result = reconcile_submitted_actions(store=store, execution=execution)
 
@@ -4731,7 +4788,7 @@ def test_definitive_clob_rejection_releases_cash_without_calling_it_unknown(tmp_
         "terminal_status": "ERROR_INTERNAL",
         "reason": "CLOB_REJECTED_INVALID_BUY_AMOUNT",
     }
-    assert store.available_cash_usd() == D("100")
+    assert _available_cash_usd(store) == D("100")
 
 
 def test_polyexception_invalid_tick_is_a_definitive_rejection(tmp_path: Path):
@@ -4760,10 +4817,10 @@ def test_polyexception_invalid_tick_is_a_definitive_rejection(tmp_path: Path):
         "terminal_status": "ERROR_INTERNAL",
         "reason": "CLOB_REJECTED_INVALID_TICK_SIZE",
     }
-    assert store.available_cash_usd() == D("100")
+    assert _available_cash_usd(store) == D("100")
 
 
-def test_fak_no_match_releases_cash_and_keeps_the_action_retryable(tmp_path: Path):
+def test_fak_no_match_releases_cash_and_never_reposts_the_action(tmp_path: Path):
     store = LiveStore(tmp_path / "live.sqlite3")
     initialize_scale_once(
         store=store,
@@ -4779,40 +4836,42 @@ def test_fak_no_match_releases_cash_and_keeps_the_action_retryable(tmp_path: Pat
         )
     )
 
+    source = action(quantity="40")
     result = execute_source_action(
         store=store,
-        source=action(quantity="40"),
+        source=source,
         execution=execution,
         allocated_cash=D("100"),
         live_enabled=True,
     )
 
     assert result == {
-        "terminal_status": "PENDING_LIQUIDITY",
-        "reason": "FAK_ZERO_FILL_RETRYABLE",
+        "terminal_status": "EXTERNAL_UNFILLABLE",
+        "reason": "FAK_ZERO_FILL_NOT_REOPENED",
     }
-    assert store.available_cash_usd() == D("100")
-    target = store.action_target(action(quantity="40").action_id)
-    assert target["state"] == "PENDING_LIQUIDITY"
+    assert _available_cash_usd(store) == D("100")
+    target = store.action_target(source.action_id)
+    assert target["state"] == "EXTERNAL_UNFILLABLE"
     assert target["remaining_quantity"] == D("10")
-    assert store.submission_attempt_count(action(quantity="40").action_id) == 1
+    assert store.submission_attempt_count(source.action_id) == 1
 
     execution.error = None
     execution.response = {"success": True, "orderID": "order-2"}
-    retried = execute_source_action(
+    duplicate = execute_source_action(
         store=store,
-        source=action(quantity="40"),
+        source=source,
         execution=execution,
         allocated_cash=D("100"),
         live_enabled=True,
     )
 
-    assert retried["terminal_status"] == "SUBMITTED_UNRECONCILED"
-    assert execution.calls[-1]["size"] == D("10")
-    assert store.submission_attempt_count(action(quantity="40").action_id) == 2
+    assert duplicate["terminal_status"] == result["terminal_status"]
+    assert duplicate["reason"] == result["reason"]
+    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 1
 
 
-def test_later_opposite_source_action_supersedes_only_a_fully_unfilled_pending_action(
+def test_later_opposite_source_action_never_reopens_a_terminal_zero_fill(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -4841,7 +4900,7 @@ def test_later_opposite_source_action_supersedes_only_a_fully_unfilled_pending_a
         execution=execution,
         allocated_cash=D("100"),
         live_enabled=True,
-    )["terminal_status"] == "PENDING_LIQUIDITY"
+    )["terminal_status"] == "EXTERNAL_UNFILLABLE"
     execution.error = None
     sell_result = execute_source_action(
         store=store,
@@ -4851,13 +4910,8 @@ def test_later_opposite_source_action_supersedes_only_a_fully_unfilled_pending_a
         live_enabled=True,
     )
 
-    assert store.action_target(buy.action_id)["state"] == "SUPERSEDED_UNFILLED"
-    assert store.latest_transition(buy) == {
-        "terminal_status": "SUPERSEDED_UNFILLED",
-        "reason": "LATER_OPPOSITE_SOURCE_ACTION",
-        "created_at_ms": sell.discovered_at_ms,
-        "details": {"superseding_action_id": sell.action_id},
-    }
+    assert store.action_target(buy.action_id)["state"] == "EXTERNAL_UNFILLABLE"
+    assert store.latest_transition(buy)["terminal_status"] == "EXTERNAL_UNFILLABLE"
     assert buy.action_id not in {
         pending.action_id for pending in store.retryable_actions()
     }
@@ -5309,7 +5363,7 @@ def test_receipt_inserted_later_cannot_supersede_a_later_chain_action(
     assert store.action_target(later_sell.action_id)["state"] == "PENDING_LIQUIDITY"
 
 
-def test_canonical_later_inverse_supersedes_older_zero_fill_despite_insert_order(
+def test_canonical_later_inverse_does_not_reopen_a_retired_zero_fill_target(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -5335,10 +5389,8 @@ def test_canonical_later_inverse_supersedes_older_zero_fill_despite_insert_order
         source=later_sell
     )
 
-    assert superseded == [earlier_buy.action_id]
-    assert store.action_target(earlier_buy.action_id)["state"] == (
-        "SUPERSEDED_UNFILLED"
-    )
+    assert superseded == []
+    assert store.action_target(earlier_buy.action_id)["state"] == "PENDING_LIQUIDITY"
 
 
 def test_historical_definitive_rejection_releases_only_its_own_existing_reservation(
@@ -5377,7 +5429,7 @@ def test_historical_definitive_rejection_releases_only_its_own_existing_reservat
     )
 
     assert applied is True
-    assert store.available_cash_usd() == D("100")
+    assert _available_cash_usd(store) == D("100")
     assert store.latest_transition(source) == {
         "terminal_status": "SKIPPED",
         "reason": "CLOB_REJECTED_FOK_KILLED",
@@ -5414,7 +5466,8 @@ def test_immutable_buy_fill_correction_repairs_underreported_human_share_order_o
     )
     source = action(quantity="20")
     store.record_action_receipt(source)
-    store.apply_fill(
+    _seed_local_fill(
+        store=store,
         source=source,
         quantity=D("0.000005"),
         price=D("0.40"),
@@ -5452,7 +5505,7 @@ def test_immutable_buy_fill_correction_repairs_underreported_human_share_order_o
 
     assert first is True
     assert second is False
-    assert store.fill_correction_count() == 1
+    assert _fill_correction_count(store) == 1
     assert store.position_quantity("123") == D("5")
     assert store.account_snapshot()["cash_usd"] == D("98")
     latest = store.latest_transition(source)
@@ -5517,12 +5570,12 @@ def test_reconciled_sell_uses_only_inventory_acquired_by_this_live_sleeve(tmp_pa
         allocated_cash=D("4"),
         live_enabled=True,
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10000000",
-        "size_matched": "10000000",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("4"),
+        vwap_price=D("0.40"),
+    )
     reconcile_submitted_actions(store=store, execution=execution)
     execution.response = {"success": True, "orderID": "order-2"}
     sell = action(side="SELL", quantity="1000", marker="2")
@@ -5534,16 +5587,21 @@ def test_reconciled_sell_uses_only_inventory_acquired_by_this_live_sleeve(tmp_pa
         allocated_cash=D("4"),
         live_enabled=True,
     )
-    execution.orders["order-2"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10000000",
-        "size_matched": "10000000",
-        "price": "0.30",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("3"),
+        vwap_price=D("0.30"),
+    )
     reconciled = reconcile_submitted_actions(store=store, execution=execution)
 
     assert submitted["terminal_status"] == "SUBMITTED_UNRECONCILED"
-    assert reconciled == [{"terminal_status": "FILLED", "reason": ""}]
+    assert reconciled == [
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
+    ]
     assert store.position_quantity("123") == D("0")
     assert store.account_snapshot()["cash_usd"] == D("3.00")
     assert store.account_snapshot()["realized_pnl_usd"] == D("-1.00")
@@ -5558,7 +5616,8 @@ def test_partial_followed_buy_caps_later_sell_at_actual_local_inventory(tmp_path
         observed_at_ms=1,
     )
     prior_buy = action(side="BUY", quantity="40", marker="1")
-    store.apply_fill(
+    _seed_local_fill(
+        store=store,
         source=prior_buy,
         quantity=D("6"),
         price=D("0.40"),
@@ -5599,7 +5658,8 @@ def test_shallow_sell_book_submits_fak_when_the_market_minimum_is_visible(
         observed_at_ms=1,
     )
     prior_buy = action(side="BUY", quantity="40", marker="1")
-    store.apply_fill(
+    _seed_local_fill(
+        store=store,
         source=prior_buy,
         quantity=D("10"),
         price=D("0.40"),
@@ -5649,12 +5709,12 @@ def test_fak_partial_buy_books_only_the_actual_fill_and_finalizes_unfillable_rem
         allocated_cash=D("100"),
         live_enabled=True,
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_CANCELED",
-        "original_size": "10",
-        "size_matched": "6",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("6"),
+        notional_usd=D("2.4"),
+        vwap_price=D("0.40"),
+    )
     reconciled = reconcile_submitted_actions(store=store, execution=execution)
 
     assert submitted == {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""}
@@ -5665,7 +5725,7 @@ def test_fak_partial_buy_books_only_the_actual_fill_and_finalizes_unfillable_rem
         }
     ]
     assert store.position_quantity("123") == D("6")
-    assert store.available_cash_usd() == D("97.60")
+    assert _available_cash_usd(store) == D("97.60")
     latest = store.latest_transition(source)
     assert latest["details"]["execution_order_type"] == "FAK"
     assert store.action_target(source.action_id)["remaining_quantity"] == D("4")
@@ -5674,7 +5734,7 @@ def test_fak_partial_buy_books_only_the_actual_fill_and_finalizes_unfillable_rem
     }
 
 
-def test_pending_zero_fill_is_written_off_without_a_second_order(tmp_path: Path):
+def test_finalized_zero_fill_is_terminal_without_a_second_order(tmp_path: Path):
     store = LiveStore(tmp_path / "live.sqlite3")
     initialize_scale_once(
         store=store,
@@ -5697,10 +5757,7 @@ def test_pending_zero_fill_is_written_off_without_a_second_order(tmp_path: Path)
         "size_matched": "0",
         "price": "0.40",
     }
-    reconcile_submitted_actions(store=store, execution=execution)
-    execution.response = {"success": True, "orderID": "order-2"}
-
-    results = retry_pending_actions(
+    results = reconcile_submitted_actions(
         store=store,
         execution=execution,
     )
@@ -5708,7 +5765,7 @@ def test_pending_zero_fill_is_written_off_without_a_second_order(tmp_path: Path)
     assert results == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "OPERATOR_DISABLED_ORDER_RETRY",
+            "reason": "FAK_ZERO_FILL_NOT_REOPENED",
         }
     ]
     assert len(execution.calls) == 1
@@ -5815,7 +5872,7 @@ def test_buy_above_user_price_ceiling_allows_fees_when_execution_price_has_no_lo
     assert len(execution.calls) == 1
 
 
-def test_retry_scheduler_rotates_after_external_failure_without_blocking_source_head(
+def test_retry_closure_does_not_submit_non_liquidity_pending_actions(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -5872,41 +5929,28 @@ def test_retry_scheduler_rotates_after_external_failure_without_blocking_source_
     first_head_results = retry_pending_actions(
         store=store,
         execution=execution,
-        allocated_cash=D("100"),
     )
 
-    assert first_head_results == [
-        {
-            "terminal_status": "PENDING_EXTERNAL_RETRY",
-            "reason": (
-                "BOOK_SNAPSHOT_ERROR: PolyApiException: "
-                "PolyApiException[status_code=404, error_message="
-                "No orderbook exists for the requested token id]"
-            ),
-        },
-    ]
+    assert first_head_results == []
     assert execution.calls == []
 
     restarted_store = LiveStore(store.path)
     second_head_results = retry_pending_actions(
         store=restarted_store,
         execution=execution,
-        allocated_cash=D("100"),
     )
 
-    assert second_head_results == [
-        {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""},
-    ]
-    assert [call["token_id"] for call in execution.calls] == ["456"]
+    assert second_head_results == []
+    assert execution.calls == []
     assert restarted_store.action_target(unavailable_source.action_id)["state"] == (
         "PENDING_EXTERNAL_RETRY"
     )
     assert restarted_store.action_target(later_source.action_id)["state"] == (
-        "SUBMITTED_UNRECONCILED"
+        "PENDING_EXTERNAL_RETRY"
     )
 
 
-def test_retry_scheduler_terminalizes_officially_closed_market_without_book_read(
+def test_retry_closure_does_not_submit_non_liquidity_closed_market_target(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -5953,24 +5997,16 @@ def test_retry_scheduler_terminalizes_officially_closed_market_without_book_read
     results = retry_pending_actions(
         store=store,
         execution=ClosedMarketExecution(),
-        allocated_cash=D("100"),
         market_lifecycle_resolver=current_lifecycle,
     )
 
-    assert results == [
-        {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY",
-        }
-    ]
-    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
+    assert results == []
+    assert store.action_target(source.action_id)["state"] == "PENDING_EXTERNAL_RETRY"
     latest = store.latest_transition(source)
-    assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
-    assert latest["details"]["official_market_lifecycle"]["closed"] is True
-    assert latest["details"]["new_order_submitted"] is False
+    assert latest["terminal_status"] == "PENDING_EXTERNAL_RETRY"
 
 
-def test_partial_fill_scheduler_requests_only_the_exact_remaining_quantity(
+def test_unproven_partial_order_status_does_not_trigger_a_second_order(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -6001,11 +6037,9 @@ def test_partial_fill_scheduler_requests_only_the_exact_remaining_quantity(
     retry_pending_actions(
         store=store,
         execution=execution,
-        allocated_cash=D("100"),
     )
 
-    assert execution.calls[-1]["size"] == D("5")
-    assert store.action_target(source.action_id)["remaining_quantity"] == D("5")
+    assert len(execution.calls) == 1
 
 
 def _funded_resolved_position_store(tmp_path: Path) -> tuple[LiveStore, SourceAction]:
@@ -6017,7 +6051,13 @@ def _funded_resolved_position_store(tmp_path: Path) -> tuple[LiveStore, SourceAc
         observed_at_ms=1,
     )
     source = action(quantity="1000")
-    store.apply_fill(source=source, quantity=D("10"), price=D("0.40"), fee_usd=D("0"))
+    _seed_local_fill(
+        store=store,
+        source=source,
+        quantity=D("10"),
+        price=D("0.40"),
+        fee_usd=D("0"),
+    )
     store.bind_condition_for_token(
         token_id="123",
         condition_id=FakeRedemptionAdapter.condition_id,
@@ -7360,7 +7400,7 @@ def test_pre_migration_official_redeem_reclassifies_cash_without_double_credit(
             INSERT INTO external_cash_reserve_receipts(
                 observed_at_ms, observed_collateral_usd,
                 ledger_cash_before_usd, credited_cash_usd, reason
-            ) VALUES(20_000, '10', '0', '10', 'HISTORICAL_AUDIT_ONLY')
+            ) VALUES(20000, '10', '0', '10', 'HISTORICAL_AUDIT_ONLY')
             """
         )
         connection.execute(
@@ -8137,11 +8177,15 @@ def test_source_follower_accepts_a_websocket_announced_head_without_polling_late
     result = follower.run_cycle_to_head(
         head=100,
         execution=FakeExecution(),
-        allocated_cash=D("100"),
         live_enabled=True,
     )
 
-    assert result == {"source_action_count": 0, "last_processed_block": 100, "current_head": 100}
+    assert result == {
+        "source_action_count": 0,
+        "source_action_ids": [],
+        "last_processed_block": 100,
+        "current_head": 100,
+    }
 
 
 def test_source_follower_records_definitive_profile_skip_without_submitting(
@@ -8176,7 +8220,6 @@ def test_source_follower_records_definitive_profile_skip_without_submitting(
     result = follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("300"),
         live_enabled=True,
     )
 
@@ -8221,7 +8264,6 @@ def test_source_follower_passes_the_full_action_to_action_aware_scope(
     result = follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("300"),
         live_enabled=True,
     )
 
@@ -8280,7 +8322,6 @@ def test_source_follower_executes_an_action_accepted_by_the_profile(tmp_path: Pa
     follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("300"),
         live_enabled=True,
     )
 
@@ -8337,7 +8378,6 @@ def test_wallet44b0_non_netflix_notice_records_alert_without_submitting_order(
     follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("200"),
         live_enabled=True,
     )
 
@@ -8391,7 +8431,6 @@ def test_wallet44b0_netflix_action_executes_without_topic_alert(tmp_path: Path):
     follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("200"),
         live_enabled=True,
     )
 
@@ -8410,7 +8449,7 @@ def test_wallet44b0_netflix_action_executes_without_topic_alert(tmp_path: Path):
     assert store.source_topic_alerts(unacknowledged_only=False) == []
 
 
-def test_retryable_profile_metadata_failure_does_not_advance_source_cursor(
+def test_retryable_profile_metadata_failure_is_durable_before_cursor_advance(
     tmp_path: Path,
 ):
     class UnavailableScope:
@@ -8426,20 +8465,21 @@ def test_retryable_profile_metadata_failure_does_not_advance_source_cursor(
         clock_ms=lambda: 1_700_000_000_000,
         action_scope=UnavailableScope(),
     )
-    follower._new_source_actions = lambda **_kwargs: [action()]
+    source = action()
+    follower._new_source_actions = lambda **_kwargs: [source]
 
-    with pytest.raises(ConnectionError, match="GAMMA_METADATA_UNAVAILABLE"):
-        follower.run_cycle_to_head(
-            head=100,
-            execution=FakeExecution(),
-            allocated_cash=D("300"),
-            live_enabled=True,
-        )
+    result = follower.run_cycle_to_head(
+        head=100,
+        execution=FakeExecution(),
+        live_enabled=True,
+    )
 
-    assert store.runtime_value("last_processed_block") == "99"
+    assert result["source_action_ids"] == [source.action_id]
+    assert store.runtime_value("last_processed_block") == "100"
+    assert store.latest_transition(source)["terminal_status"] == "PENDING_METADATA"
 
 
-def test_retryable_book_failure_is_pending_and_replayed_without_advancing_cursor(
+def test_retryable_book_failure_is_durable_before_cursor_advance(
     tmp_path: Path,
 ):
     class RecoveringExecution(FakeExecution):
@@ -8470,33 +8510,20 @@ def test_retryable_book_failure_is_pending_and_replayed_without_advancing_cursor
     follower._new_source_actions = lambda **_kwargs: [source]
     execution = RecoveringExecution()
 
-    with pytest.raises(ConnectionError, match="temporary book transport failure"):
-        follower.run_cycle_to_head(
-            head=100,
-            execution=execution,
-            allocated_cash=D("100"),
-            live_enabled=True,
-        )
-    assert store.runtime_value("last_processed_block") == "99"
-    assert store.latest_transition(source)["terminal_status"] == (
-        "PENDING_EXTERNAL_RETRY"
-    )
-
-    execution.fail = False
     result = follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("100"),
         live_enabled=True,
     )
-    assert result["last_processed_block"] == 100
+    assert result["source_action_ids"] == [source.action_id]
+    assert store.runtime_value("last_processed_block") == "100"
     assert store.latest_transition(source)["terminal_status"] == (
-        "SUBMITTED_UNRECONCILED"
+        "PENDING_EXTERNAL_RETRY"
     )
-    assert len(execution.calls) == 1
+    assert execution.calls == []
 
 
-def test_no_ask_book_is_pending_and_replayed_without_advancing_cursor(
+def test_no_ask_book_failure_is_durable_before_cursor_advance(
     tmp_path: Path,
 ):
     class RecoveringExecution(FakeExecution):
@@ -8527,34 +8554,20 @@ def test_no_ask_book_is_pending_and_replayed_without_advancing_cursor(
     follower._new_source_actions = lambda **_kwargs: [source]
     execution = RecoveringExecution()
 
-    with pytest.raises(RuntimeError, match="NO_ASK_BOOK_LEVEL"):
-        follower.run_cycle_to_head(
-            head=100,
-            execution=execution,
-            allocated_cash=D("100"),
-            live_enabled=True,
-        )
+    result = follower.run_cycle_to_head(
+        head=100,
+        execution=execution,
+        live_enabled=True,
+    )
 
-    assert store.runtime_value("last_processed_block") == "99"
+    assert result["source_action_ids"] == [source.action_id]
+    assert store.runtime_value("last_processed_block") == "100"
     assert store.latest_transition(source)["terminal_status"] == (
         "PENDING_EXTERNAL_RETRY"
     )
     assert store.submission_attempt_count(source.action_id) == 0
     assert execution.calls == []
 
-    execution.fail = False
-    result = follower.run_cycle_to_head(
-        head=100,
-        execution=execution,
-        allocated_cash=D("100"),
-        live_enabled=True,
-    )
-
-    assert result["last_processed_block"] == 100
-    assert store.latest_transition(source)["terminal_status"] == (
-        "SUBMITTED_UNRECONCILED"
-    )
-    assert len(execution.calls) == 1
 
 
 def test_reopen_no_book_error_preserves_history_and_restores_retryable_state(
@@ -8646,24 +8659,25 @@ def test_reopen_no_book_error_refuses_an_unresolved_submission(tmp_path: Path):
         reason="INSUFFICIENT_AVAILABLE_CASH",
         updated_at_ms=1,
     )
+    _begin_test_submission_attempt(
+        store=store,
+        source=source,
+        requested_quantity=D("10"),
+        snapshot={"best_price": "0.40"},
+        created_at_ms=3,
+    )
     store.append_transition(
         source=source,
         status="ERROR",
         reason="BOOK_SNAPSHOT_ERROR: RuntimeError: NO_ASK_BOOK_LEVEL",
         created_at_ms=2,
     )
-    store.next_submission_attempt(
-        source=source,
-        requested_quantity=D("10"),
-        snapshot={"best_price": "0.40"},
-        created_at_ms=3,
-    )
 
     assert store.reopen_pre_submission_no_book_errors(created_at_ms=4) == []
     assert store.latest_transition(source)["terminal_status"] == "ERROR"
 
 
-def test_frozen_scope_eligibility_is_not_reclassified_when_an_action_replays(
+def test_frozen_scope_eligibility_is_retained_after_book_failure(
     tmp_path: Path,
 ):
     class ChangingScope:
@@ -8717,25 +8731,17 @@ def test_frozen_scope_eligibility_is_not_reclassified_when_an_action_replays(
     follower._new_source_actions = lambda **_kwargs: [source]
     execution = RecoveringExecution()
 
-    with pytest.raises(ConnectionError):
-        follower.run_cycle_to_head(
-            head=100,
-            execution=execution,
-            allocated_cash=D("100"),
-            live_enabled=True,
-        )
-    execution.fail = False
     follower.run_cycle_to_head(
         head=100,
         execution=execution,
-        allocated_cash=D("100"),
         live_enabled=True,
     )
 
     assert scope.calls == 1
     assert store.latest_transition(source)["terminal_status"] == (
-        "SUBMITTED_UNRECONCILED"
+        "PENDING_EXTERNAL_RETRY"
     )
+    assert store.runtime_value("last_processed_block") == "100"
 
 
 def test_shared_wallet_submission_lock_excludes_another_process_descriptor(
@@ -8967,15 +8973,18 @@ def test_every_live_profile_uses_shared_wallet_cash_without_rebasing_scale(
             "user_usdc_balance": D("100"),
         }
     ]
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "120",
-        "size_matched": "120",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("120"),
+        notional_usd=D("48"),
+        vwap_price=D("0.40"),
+    )
 
     assert reconcile_submitted_actions(store=target, execution=execution) == [
-        {"terminal_status": "FILLED", "reason": ""}
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
     ]
     assert target.account_snapshot()["cash_usd"] == D("-8")
     assert target.fixed_share_scale() == original_scale
@@ -9056,7 +9065,7 @@ def test_future_buy_without_authenticated_wallet_capacity_is_terminal_not_pendin
     }
 
 
-def test_forward_retry_without_authenticated_wallet_capacity_is_terminal(
+def test_stale_forward_retry_target_fails_closed(
     tmp_path: Path,
 ):
     cd90 = LiveStore(tmp_path / "cd90.sqlite3")
@@ -9131,16 +9140,10 @@ def test_forward_retry_without_authenticated_wallet_capacity_is_terminal(
     )
 
     assert result == {
-        "terminal_status": "EXTERNAL_UNFILLABLE",
-        "reason": "INSUFFICIENT_AUTHENTICATED_ACCOUNT_CASH_AT_DISCOVERY",
+        "terminal_status": "ERROR_INTERNAL",
+        "reason": "INTERNAL_STALE_CAUSAL_TARGET",
     }
     assert execution.calls == []
-    target = tennis.action_target(source.action_id)
-    assert target is not None
-    assert target["state"] == "EXTERNAL_UNFILLABLE"
-    assert source.action_id not in {
-        pending.action_id for pending in tennis.retryable_actions()
-    }
 
 
 def test_pending_capital_action_is_not_replayed_against_a_new_book(tmp_path: Path):
@@ -9175,7 +9178,6 @@ def test_pending_capital_action_is_not_replayed_against_a_new_book(tmp_path: Pat
     assert retry_pending_actions(
         store=store,
         execution=NewBookMustNotBeRead(),
-        allocated_cash=D("100"),
     ) == []
     assert store.action_target(source.action_id)["state"] == "PENDING_CAPITAL"
 
@@ -9413,12 +9415,12 @@ def test_coordinated_buy_fill_persists_condition_ownership_for_other_sleeves(
         coordinator=coordinator,
         profile_key="tennis_atp_wta_mainline",
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "5",
-        "size_matched": "5",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("5"),
+        notional_usd=D("2"),
+        vwap_price=D("0.40"),
+    )
 
     reconcile_submitted_actions(store=tennis, execution=execution)
 
@@ -9598,7 +9600,7 @@ def test_hot_standby_waits_for_the_primary_runtime_lock_before_processing(
         live._process_hot_standby_ws_head
     ).parameters:
         kwargs["allocation"] = Decimal("1")
-    with live._exclusive_runtime_lock(tmp_path / "live.lock"):
+    with live._exclusive_runtime_lock(live._profile_runtime_lock_path(tmp_path)):
         assert live._process_hot_standby_ws_head(**kwargs) is True
 
     assert calls == []
@@ -10017,6 +10019,7 @@ def test_status_quantifies_action_fidelity_and_decision_unit_conservation(
         "partial": 0,
         "pending": 1,
         "external_or_causal_unfilled": 0,
+        "external_or_causal_unfilled_acknowledged_baseline": 0,
         "internal_error": 0,
         "unclassified_target": 0,
         "active_repair_managed_without_target": 0,
@@ -10026,6 +10029,7 @@ def test_status_quantifies_action_fidelity_and_decision_unit_conservation(
         "accounted": 2,
         "conservation_passed": True,
         "oldest_pending_updated_at_ms": second.discovered_at_ms,
+        "recoverable_legacy_stable_causal_prefix_action_count": 0,
     }
     assert payload["decision_units"] == [
         {
@@ -10470,12 +10474,12 @@ def test_post_fill_cash_refresh_is_shared_by_every_registered_status_page(
         coordinator=coordinator,
         profile_key="cd90",
     )
-    execution.orders["order-1"] = {
-        "status": "ORDER_STATUS_MATCHED",
-        "original_size": "10",
-        "size_matched": "10",
-        "price": "0.40",
-    }
+    _set_authoritative_fill(
+        execution=execution,
+        quantity=D("10"),
+        notional_usd=D("4"),
+        vwap_price=D("0.40"),
+    )
     execution.balance = D("196")
 
     class NoActionFollower:
@@ -10485,15 +10489,19 @@ def test_post_fill_cash_refresh_is_shared_by_every_registered_status_page(
         def __init__(self):
             self.coordinator = coordinator
 
-        def run_cycle_to_head(self, **_kwargs):
-            return {"source_action_count": 0}
+        def run_cycle_to_head(self, **kwargs):
+            cd90.set_runtime("last_processed_block", kwargs["head"])
+            return {
+                "source_action_count": 0,
+                "source_action_ids": [],
+                "last_processed_block": kwargs["head"],
+            }
 
     handled = live._process_live_ws_head(
         store=cd90,
         runtime_dir=tmp_path / "cd90-status",
         follower=NoActionFollower(),
         execution=execution,
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: None,
     )
@@ -10578,7 +10586,6 @@ def test_retryable_chain_read_keeps_websocket_and_does_not_starve_redemption(
         runtime_dir=tmp_path,
         follower=FailingFollower(),
         execution=FakeExecution(),
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: redemption_starts.append(True),
     )
@@ -10605,7 +10612,6 @@ def test_public_chain_reconciliation_mismatch_keeps_the_daemon_alive_and_cursor_
         runtime_dir=tmp_path,
         follower=MismatchFollower(),
         execution=FakeExecution(),
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: None,
     )
@@ -10629,7 +10635,12 @@ def test_websocket_head_processes_only_the_block_with_a_successor(tmp_path: Path
 
         def run_cycle_to_head(self, **kwargs):
             self.heads.append(kwargs["head"])
-            return {"source_action_count": 0}
+            store.set_runtime("last_processed_block", kwargs["head"])
+            return {
+                "source_action_count": 0,
+                "source_action_ids": [],
+                "last_processed_block": kwargs["head"],
+            }
 
     store = LiveStore(tmp_path / "live.sqlite3")
     follower = RecordingFollower()
@@ -10639,7 +10650,6 @@ def test_websocket_head_processes_only_the_block_with_a_successor(tmp_path: Path
         runtime_dir=tmp_path,
         follower=follower,
         execution=FakeExecution(),
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: None,
     )
@@ -10654,13 +10664,20 @@ def test_status_snapshot_sqlite_failure_does_not_restart_head_processing(
 ):
     """A non-order status snapshot must not terminate the live WS worker."""
 
+    store = LiveStore(tmp_path / "live.sqlite3")
+
     class RecordingFollower:
         wallet_lock_path = tmp_path / "shared-wallet.lock"
         coordinator = None
         profile_key = "cd90"
 
-        def run_cycle_to_head(self, **_kwargs):
-            return {"source_action_count": 0}
+        def run_cycle_to_head(self, **kwargs):
+            store.set_runtime("last_processed_block", kwargs["head"])
+            return {
+                "source_action_count": 0,
+                "source_action_ids": [],
+                "last_processed_block": kwargs["head"],
+            }
 
     def unavailable_status(*_args, **_kwargs):
         raise sqlite3.OperationalError("unable to open database file")
@@ -10668,11 +10685,10 @@ def test_status_snapshot_sqlite_failure_does_not_restart_head_processing(
     monkeypatch.setattr(live, "write_status_files", unavailable_status)
 
     handled = live._process_live_ws_head(
-        store=LiveStore(tmp_path / "live.sqlite3"),
+        store=store,
         runtime_dir=tmp_path,
         follower=RecordingFollower(),
         execution=FakeExecution(),
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: None,
     )
@@ -10684,15 +10700,21 @@ def test_websocket_head_retries_pending_actions_after_observing_new_source_actio
     tmp_path: Path, monkeypatch,
 ):
     events: list[str] = []
+    store = LiveStore(tmp_path / "live.sqlite3")
 
     class RecordingFollower:
         wallet_lock_path = tmp_path / "shared-wallet.lock"
         coordinator = None
         profile_key = "cd90"
 
-        def run_cycle_to_head(self, **_kwargs):
+        def run_cycle_to_head(self, **kwargs):
             events.append("observe_source_actions")
-            return {"source_action_count": 0}
+            store.set_runtime("last_processed_block", kwargs["head"])
+            return {
+                "source_action_count": 0,
+                "source_action_ids": [],
+                "last_processed_block": kwargs["head"],
+            }
 
     def fake_reconcile(**_kwargs):
         events.append("reconcile")
@@ -10709,19 +10731,18 @@ def test_websocket_head_retries_pending_actions_after_observing_new_source_actio
     monkeypatch.setattr(live, "retry_pending_actions", fake_retry)
 
     handled = live._process_live_ws_head(
-        store=LiveStore(tmp_path / "live.sqlite3"),
+        store=store,
         runtime_dir=tmp_path,
         follower=RecordingFollower(),
         execution=FakeExecution(),
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: None,
     )
 
     assert handled is True
     assert events == [
-        "reconcile",
         "observe_source_actions",
+        "reconcile",
         "retry_pending",
         "reconcile",
     ]
@@ -10750,7 +10771,7 @@ def test_new_zero_fill_waits_for_the_next_chain_head_before_retrying(
         coordinator = None
         profile_key = "cd90"
 
-        def run_cycle_to_head(self, **_kwargs):
+        def run_cycle_to_head(self, **kwargs):
             execute_source_action(
                 store=store,
                 source=source,
@@ -10758,21 +10779,25 @@ def test_new_zero_fill_waits_for_the_next_chain_head_before_retrying(
                 allocated_cash=D("100"),
                 live_enabled=True,
             )
-            return {"source_action_count": 1}
+            store.set_runtime("last_processed_block", kwargs["head"])
+            return {
+                "source_action_count": 1,
+                "source_action_ids": [source.action_id],
+                "last_processed_block": kwargs["head"],
+            }
 
     assert live._process_live_ws_head(
         store=store,
         runtime_dir=tmp_path,
         follower=OneActionFollower(),
         execution=execution,
-        allocation=D("100"),
         head=101,
         start_redemption_cycle=lambda: None,
     ) is True
 
     assert store.submission_attempt_count(source.action_id) == 1
     assert len(execution.calls) == 1
-    assert store.action_target(source.action_id)["state"] == "PENDING_LIQUIDITY"
+    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
 
 
 def test_duplicate_websocket_head_does_not_retry_the_same_pending_fak_twice(
@@ -10824,8 +10849,8 @@ def test_duplicate_websocket_head_does_not_retry_the_same_pending_fak_twice(
             start_redemption_cycle=lambda: None,
         ) is True
 
-    assert store.submission_attempt_count(source.action_id) == 2
-    assert len(execution.calls) == 2
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert len(execution.calls) == 1
 
 
 def test_duplicate_websocket_head_does_not_reconcile_unknown_submission_twice(
@@ -10892,7 +10917,7 @@ def test_duplicate_websocket_head_does_not_reconcile_unknown_submission_twice(
     assert len(execution.prepared_submit_calls) == 1
 
 
-def test_restart_orphaned_pending_metadata_is_retried_before_new_blocks(
+def test_restart_orphaned_pending_metadata_is_not_replayed_as_a_late_order(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -10942,13 +10967,13 @@ def test_restart_orphaned_pending_metadata_is_retried_before_new_blocks(
         start_redemption_cycle=lambda: None,
     ) is True
 
-    assert len(execution.calls) == 1
-    assert store.action_target(source.action_id)["state"] == "SUBMITTED_UNRECONCILED"
+    assert execution.calls == []
+    assert store.action_target(source.action_id) is None
     assert store.runtime_value("last_processed_block") == "101"
-    assert store.action_fidelity_summary()["metadata_pending"] == 0
+    assert store.action_fidelity_summary()["metadata_pending"] == 1
 
 
-def test_late_metadata_unfillable_never_upsizes_a_below_minimum_fixed_share_target(
+def test_late_metadata_is_not_replayed_or_upsized_without_an_action_time_book(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -10999,27 +11024,24 @@ def test_late_metadata_unfillable_never_upsizes_a_below_minimum_fixed_share_targ
         action_scope=RecoveredAfterCloseScope(),
     )
 
-    result = follower.retry_orphaned_metadata_actions(
+    follower._new_source_actions = lambda **_kwargs: []
+    assert live._process_live_ws_head(
+        store=store,
+        runtime_dir=tmp_path,
+        follower=follower,
         execution=execution,
-        allocated_cash=D("100"),
-        live_enabled=True,
-    )
+        head=102,
+        start_redemption_cycle=lambda: None,
+    ) is True
 
-    assert len(result) == 1
     assert execution.calls == []
     latest = store.latest_transition(source)
-    assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
-    assert latest["reason"] == (
-        "METADATA_RECOVERED_AFTER_MARKET_CLOSED_NO_ACTION_TIME_BOOK"
-    )
-    target = store.action_target(source.action_id)
-    assert target["proportional_quantity"] == D("1")
-    assert target["target_quantity"] == D("1")
-    assert target["state"] == "EXTERNAL_UNFILLABLE"
-    assert store.action_fidelity_summary()["conservation_passed"] is True
+    assert latest["terminal_status"] == "PENDING_METADATA"
+    assert latest["reason"] == "Gamma condition lookup returned no market"
+    assert store.action_target(source.action_id) is None
 
 
-def test_frozen_eligible_metadata_recovers_without_dynamic_refetch_or_late_order(
+def test_frozen_eligible_metadata_is_not_refetched_or_replayed_as_a_late_order(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -11081,25 +11103,21 @@ def test_frozen_eligible_metadata_recovers_without_dynamic_refetch_or_late_order
         profile_key="tennis_atp_wta_mainline",
     )
 
-    result = follower.retry_orphaned_metadata_actions(
+    follower._new_source_actions = lambda **_kwargs: []
+    assert live._process_live_ws_head(
+        store=store,
+        runtime_dir=tmp_path,
+        follower=follower,
         execution=execution,
-        allocated_cash=D("100"),
-        live_enabled=True,
-    )
+        head=102,
+        start_redemption_cycle=lambda: None,
+    ) is True
 
-    assert len(result) == 1
     assert execution.calls == []
     latest = store.latest_transition(source)
-    assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
-    assert latest["reason"] == (
-        "FROZEN_METADATA_RECOVERED_AFTER_PROFILE_DEADLINE_"
-        "NO_ACTION_TIME_BOOK"
-    )
-    target = store.action_target(source.action_id)
-    assert target["proportional_quantity"] == D("10")
-    assert target["target_quantity"] == D("10")
-    assert target["state"] == "EXTERNAL_UNFILLABLE"
-    assert store.action_fidelity_summary()["conservation_passed"] is True
+    assert latest["terminal_status"] == "PENDING_METADATA"
+    assert latest["reason"] == "interrupted after immutable metadata freeze"
+    assert store.action_target(source.action_id) is None
 
 
 def test_orphaned_metadata_external_failure_does_not_block_new_chain_heads(
@@ -11139,7 +11157,6 @@ def test_orphaned_metadata_external_failure_does_not_block_new_chain_heads(
         runtime_dir=tmp_path,
         follower=follower,
         execution=FakeExecution(),
-        allocation=D("100"),
         head=102,
         start_redemption_cycle=lambda: None,
     ) is True
@@ -11150,7 +11167,7 @@ def test_orphaned_metadata_external_failure_does_not_block_new_chain_heads(
     assert latest["reason"] == "temporary metadata endpoint failure"
 
 
-def test_restart_orphaned_observed_action_is_closed_without_a_late_order(
+def test_restart_orphaned_observed_action_is_not_replayed_as_a_late_order(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -11185,8 +11202,7 @@ def test_restart_orphaned_observed_action_is_closed_without_a_late_order(
 
     assert execution.calls == []
     latest = store.latest_transition(source)
-    assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
-    assert latest["reason"] == "OPERATOR_DISABLED_ORDER_RETRY"
+    assert latest["terminal_status"] == "OBSERVED"
     assert store.runtime_value("last_processed_block") == "101"
 
 
@@ -11209,17 +11225,23 @@ def test_partial_pending_fill_counts_as_a_cash_mutation_for_shared_refresh(
 def test_external_head_failure_is_aggregated_into_one_incident_and_one_recovery(
     tmp_path: Path,
 ):
+    store = LiveStore(tmp_path / "live.sqlite3")
+
     class RecoveringFollower:
         def __init__(self):
             self.calls = 0
 
-        def run_cycle_to_head(self, **_kwargs):
+        def run_cycle_to_head(self, **kwargs):
             self.calls += 1
             if self.calls <= 2:
                 raise ConnectionError("same temporary RPC incident")
-            return {"source_action_count": 0}
+            store.set_runtime("last_processed_block", kwargs["head"])
+            return {
+                "source_action_count": 0,
+                "source_action_ids": [],
+                "last_processed_block": kwargs["head"],
+            }
 
-    store = LiveStore(tmp_path / "live.sqlite3")
     follower = RecoveringFollower()
     for head in (101, 102, 103):
         live._process_live_ws_head(
@@ -11227,7 +11249,6 @@ def test_external_head_failure_is_aggregated_into_one_incident_and_one_recovery(
             runtime_dir=tmp_path,
             follower=follower,
             execution=FakeExecution(),
-            allocation=D("100"),
             head=head,
             start_redemption_cycle=lambda: None,
         )
@@ -11459,35 +11480,23 @@ def test_partial_without_persisted_chain_receipt_never_enters_retry(
     assert len(execution.calls) == 1
 
 
-def test_v2_second_finalized_zero_fill_stays_recoverable_without_overfill(
+def test_finalized_zero_fill_is_closed_once_without_overfill(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
-    execution.response = {"success": True, "orderID": "order-2"}
-
-    assert _retry_through_execution(store=store, execution=execution)[0][
-        "terminal_status"
-    ] == "SUBMITTED_UNRECONCILED"
-    assert reconcile_submitted_actions(store=store, execution=execution) == [
+    assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "PENDING_CONFIRMED_ZERO_FILL",
-            "reason": "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE",
+            "terminal_status": "EXTERNAL_UNFILLABLE",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
-
-    execution.response = {"success": True, "orderID": "order-3"}
-    assert _retry_through_execution(store=store, execution=execution)[0][
-        "terminal_status"
-    ] == "SUBMITTED_UNRECONCILED"
-    assert store.submission_attempt_count(source.action_id) == 3
-    assert [call["size"] for call in execution.calls] == [D("10")] * 3
-    assert all(
-        call.get("quantity_mode") == "EXACT_SHARES"
-        for call in execution.calls[1:]
-    )
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert len(execution.calls) == 1
 
 
-def test_v2_retry_unknown_after_restart_is_never_reposted(tmp_path: Path):
+def test_finalized_zero_fill_restart_does_not_submit_an_unknown_replacement(
+    tmp_path: Path,
+):
     store, source, _initial_execution = _v2_zero_fill_store(tmp_path)
     restarted = LiveStore(store.path)
     retry_execution = FakeExecution(
@@ -11505,16 +11514,18 @@ def test_v2_retry_unknown_after_restart_is_never_reposted(tmp_path: Path):
 
     assert first == [
         {
-            "terminal_status": "UNKNOWN_SUBMISSION",
-            "reason": "SUBMISSION_TRANSPORT_UNKNOWN:TimeoutError",
+            "terminal_status": "EXTERNAL_UNFILLABLE",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
     assert second == []
-    assert len(retry_execution.calls) == 1
-    assert restarted.submission_attempt_count(source.action_id) == 2
+    assert retry_execution.calls == []
+    assert restarted.submission_attempt_count(source.action_id) == 1
 
 
-def test_v2_duplicate_websocket_head_never_retries_twice(tmp_path: Path):
+def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
+    tmp_path: Path,
+):
     store, source, execution = _v2_zero_fill_store(tmp_path)
     store.set_runtime("last_processed_block", "100")
     execution.response = {"success": True, "orderID": "order-2"}
@@ -11562,8 +11573,8 @@ def test_v2_duplicate_websocket_head_never_retries_twice(tmp_path: Path):
             start_redemption_cycle=lambda: None,
         ) is True
 
-    assert store.submission_attempt_count(source.action_id) == 2
-    assert len(execution.calls) == 2
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert len(execution.calls) == 1
 
     execution.response = {"success": True, "orderID": "order-3"}
     assert live._process_live_ws_head(
@@ -11574,11 +11585,11 @@ def test_v2_duplicate_websocket_head_never_retries_twice(tmp_path: Path):
         head=103,
         start_redemption_cycle=lambda: None,
     ) is True
-    assert store.submission_attempt_count(source.action_id) == 3
-    assert len(execution.calls) == 3
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert len(execution.calls) == 1
 
 
-def test_retry_waits_when_book_is_worse_then_submits_after_price_recovers(
+def test_finalized_zero_fill_does_not_wait_for_a_better_book(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11591,22 +11602,14 @@ def test_retry_waits_when_book_is_worse_then_submits_after_price_recovers(
         return value
 
     execution.snapshot = snapshot
-    execution.response = {"success": True, "orderID": "order-2"}
-
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "PENDING_PRICE_PROTECTION",
-            "reason": "CURRENT_BOOK_OUTSIDE_FIRST_ATTEMPT_PRICE",
+            "terminal_status": "EXTERNAL_UNFILLABLE",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
     assert len(execution.calls) == 1
-    assert store.action_target(source.action_id)["state"] == "PENDING_PRICE_PROTECTION"
-
-    current_price["value"] = "0.40"
-    assert _retry_through_execution(store=store, execution=execution)[0][
-        "terminal_status"
-    ] == "SUBMITTED_UNRECONCILED"
-    assert len(execution.calls) == 2
+    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
 
 
 def test_liquidity_retry_ignores_unknown_and_pre_boundary_actions(tmp_path: Path):
@@ -11629,7 +11632,7 @@ def test_liquidity_retry_ignores_unknown_and_pre_boundary_actions(tmp_path: Path
     assert store.submission_attempt_count(source.action_id) == 1
 
 
-def test_liquidity_retry_terminalizes_closed_market_without_book_or_order(
+def test_finalized_zero_fill_closes_without_reading_a_closed_market(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11654,14 +11657,14 @@ def test_liquidity_retry_terminalizes_closed_market_without_book_or_order(
     assert result == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
     assert len(execution.calls) == before_calls
     assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
 
 
-def test_liquidity_retry_without_official_lifecycle_keeps_waiting_and_submits_zero(
+def test_finalized_zero_fill_closes_without_a_lifecycle_refetch(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11676,16 +11679,12 @@ def test_liquidity_retry_without_official_lifecycle_keeps_waiting_and_submits_ze
 
     assert result == [
         {
-            "terminal_status": "PENDING_CONFIRMED_ZERO_FILL",
-            "reason": (
-                "OFFICIAL_MARKET_STATE_RESOLVER_UNAVAILABLE_FOR_LIQUIDITY_RETRY"
-            ),
+            "terminal_status": "EXTERNAL_UNFILLABLE",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
     assert len(execution.calls) == before_calls
-    assert store.action_target(source.action_id)["state"] == (
-        "PENDING_CONFIRMED_ZERO_FILL"
-    )
+    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
 
 
 def test_later_opposite_terminates_v2_partial_remainder_but_preserves_fill(
@@ -11864,7 +11863,7 @@ def test_v2_retry_uses_an_exact_share_fak_limit_order(tmp_path: Path):
     assert created.price == 0.4
 
 
-def test_v2_retry_cash_shortage_is_terminal_and_never_waits_for_later_cash(
+def test_finalized_zero_fill_closes_without_a_new_cash_check(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11875,7 +11874,7 @@ def test_v2_retry_cash_shortage_is_terminal_and_never_waits_for_later_cash(
     assert result == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "INSUFFICIENT_AUTHENTICATED_ACCOUNT_CASH_AT_RETRY",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
     assert len(execution.calls) == 1
@@ -11961,7 +11960,7 @@ def test_v2_retry_remainder_below_current_minimum_is_terminal_without_upscale(
     assert len(execution.calls) == 1
 
 
-def test_v2_retry_high_price_loss_is_terminal_but_fee_only_cost_is_allowed(
+def test_finalized_zero_fill_closes_before_new_price_or_fee_checks(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -12002,42 +12001,18 @@ def test_v2_retry_high_price_loss_is_terminal_but_fee_only_cost_is_allowed(
         "finality": "polygon_finalized_block",
     }
     reconcile_submitted_actions(store=store, execution=execution)
-    execution.response = {"success": True, "orderID": "order-2"}
-
-    # The fee is explicitly excluded from price loss, so equal unit price may retry.
-    assert _retry_through_execution(store=store, execution=execution)[0][
-        "terminal_status"
-    ] == "SUBMITTED_UNRECONCILED"
-
-    store2 = LiveStore(tmp_path / "loss.sqlite3")
-    initialize_scale_once(
-        store=store2,
-        allocation_usd=D("100"),
-        source_open_position_value_usd=D("400"),
-        observed_at_ms=1,
-    )
-    _activate_liquidity_retry_v2(store2)
-    execution2 = HighPriceExecution()
-    execute_source_action(
-        store=store2, source=source, execution=execution2, live_enabled=True
-    )
-    execution2.authoritative_submission_execution = lambda **_kwargs: None
-    execution2.authoritative_order_hash_execution = (
-        execution.authoritative_order_hash_execution
-    )
-    reconcile_submitted_actions(store=store2, execution=execution2)
-    execution2.current_price = "0.92"
-
-    assert _retry_through_execution(store=store2, execution=execution2) == [
+    assert _retry_through_execution(store=store, execution=execution) == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "BUY_PRICE_ABOVE_0_90_WITH_EXECUTION_LOSS",
+            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
         }
     ]
-    assert len(execution2.calls) == 1
+    assert len(execution.calls) == 1
 
 
-def test_v2_status_counts_closed_market_termination(tmp_path: Path):
+def test_liquidity_retry_status_counts_gtd_replacement_termination(
+    tmp_path: Path,
+):
     store, _source, execution = _v2_zero_fill_store(tmp_path)
     _retry_through_execution(
         store=store,
@@ -12052,5 +12027,5 @@ def test_v2_status_counts_closed_market_termination(tmp_path: Path):
     summary = store.liquidity_retry_summary()
 
     assert summary["termination_counts"] == {
-        "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY": 1
+        "GTD_POLICY_REPLACED_LIQUIDITY_RETRY": 1
     }
