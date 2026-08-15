@@ -73,10 +73,6 @@ def test_release_always_contains_canonical_version_authority_verifier():
     assert (
         release.Path(release.__file__).resolve().parent.parent / relative
     ).is_file()
-    assert "pytest.ini" in release.REQUIRED_ASSETS
-    assert (
-        release.Path(release.__file__).resolve().parent.parent / "pytest.ini"
-    ).is_file()
 
 
 def test_version_verifier_uses_noninteractive_sudo_only_after_permission_denied(

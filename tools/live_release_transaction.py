@@ -129,7 +129,6 @@ HEALTH_BRIDGE = "polymarket-server-health"
 REQUIRED_ASSETS = frozenset(
     {
         "CANDIDATE_TEST_RECEIPT.json",
-        "pytest.ini",
         "app/cd90_live_copy.py",
         "app/cd90_live_sizing.py",
         "app/live_action_fidelity.py",
