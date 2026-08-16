@@ -1,9 +1,9 @@
 {
-  "change_id": "buy60-sell-fak-v3.14-20260816T073058Z",
-  "committed_at_utc": "2026-08-16T07:38:21.199756Z",
-  "coverage_commit": "c15802e9c8bd5118bbdfc945956154aaf68030f080b987ade57cc96d81aee45e",
-  "previous_release": "/opt/polymarket-live/releases/20260815T201200Z-active-cancel-nonblocking-v3.13",
-  "release": "/opt/polymarket-live/releases/20260816T073058Z-buy60-sell-fak-v3.14",
+  "change_id": "dynamic-buy-depth-v3.15-20260816T114310Z",
+  "committed_at_utc": "2026-08-16T11:46:31.779538Z",
+  "coverage_commit": "93be8c695a2f5fa4f5c7404fa1771d23a96423a8899b7051fa29dc7335e32e77",
+  "previous_release": "/opt/polymarket-live/releases/20260816T073058Z-buy60-sell-fak-v3.14",
+  "release": "/opt/polymarket-live/releases/20260816T114310Z-dynamic-buy-depth-v3.15",
   "result": "VERIFIED_FIXED",
   "safety": {
     "executor_restart_performed": true,
@@ -12,22 +12,23 @@
     "manual_order_submitted": false,
     "unknown_submission_reposted": false
   },
-  "scope": "BUY source actions use nonblocking GTC active-cancel with a user-specified 60-second window. SELL source actions bypass the resting window and use immediate FAK with existing price, inventory, reconciliation, and retry protections.",
-  "semantic_repair_version": "3.14",
+  "scope": "BUY source actions use full Ask depth to choose the marginal executable limit while retaining 60 percent of source upside; confirmed zero or partial fills retry only the exact remaining shares with cumulative official-fill price budgeting. BUY above 0.90 remains zero-price-loss only. SELL remains immediate FAK.",
+  "semantic_repair_version": "3.15",
   "sha256": {
-    "MANIFEST.sha256": "3099a8ea9666c8da302f6eab58096cb8d3505467d892826576f3d2a6bfdf6b41",
-    "app/cd90_live_copy.py": "c15802e9c8bd5118bbdfc945956154aaf68030f080b987ade57cc96d81aee45e",
+    "MANIFEST.sha256": "15a211883ebdbc28012dc6fe1b3ff573581b40d97d5fc29bb8d4446ad1efb2c0",
+    "app/cd90_live_copy.py": "93be8c695a2f5fa4f5c7404fa1771d23a96423a8899b7051fa29dc7335e32e77",
+    "release_transaction_COMMITTED.json": "0118f6d9926a534b1af98b5c9e5302f4b3bd4989708193f379b1daa42ffd896d",
     "tools/live_release_transaction.py": "b9e2ab2534ac1e9679a88388c968520a9d0251f5eed565aea8a9e0988a9a43d0"
   },
   "verification": {
     "active_executor_services": 4,
     "active_executor_services_expected": 4,
+    "buy_active_cancel_window_seconds": 60,
     "candidate_static_compile_passed": true,
     "cd90_user_paused": true,
-    "copy_and_release_tests_passed": 319,
+    "copy_and_release_tests_passed": 312,
     "official_authenticated_open_orders": 0,
     "real_order_submissions": 0,
-    "sell_resting_window_seconds": 0,
-    "buy_active_cancel_window_seconds": 60
+    "sell_resting_window_seconds": 0
   }
 }

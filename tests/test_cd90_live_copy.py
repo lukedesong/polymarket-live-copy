@@ -11463,7 +11463,9 @@ def test_liquidity_retry_v2_is_prospective_has_no_deadline_and_preserves_v1(
     ) is None
 
 
-def test_finalized_zero_fill_is_closed_without_resubmit(tmp_path: Path):
+def test_finalized_zero_fill_retries_exact_remaining_quantity_without_deadline(
+    tmp_path: Path,
+):
     store, source, execution = _v2_zero_fill_store(tmp_path)
     execution.response = {"success": True, "orderID": "order-2"}
 
@@ -11471,15 +11473,59 @@ def test_finalized_zero_fill_is_closed_without_resubmit(tmp_path: Path):
 
     assert result == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert len(execution.calls) == 1
-    assert store.submission_attempt_count(source.action_id) == 1
+    assert len(execution.calls) == 2
+    assert execution.calls[-1]["size"] == D("10")
+    assert store.submission_attempt_count(source.action_id) == 2
 
 
-def test_gtd_closes_legacy_partial_remainder_without_resubmitting(
+def test_dynamic_buy_limit_uses_depth_and_retains_sixty_percent_of_source_upside():
+    result = live.dynamic_buy_limit_price(
+        source_average_price=D("0.7095365837"),
+        target_quantity=D("21.5788731"),
+        cumulative_filled_quantity=D("0"),
+        cumulative_filled_notional_usd=D("0"),
+        current_best_ask=D("0.74"),
+        tick_size=D("0.01"),
+        raw_asks=[
+            {"price": "0.74", "size": "7.69"},
+            {"price": "0.75", "size": "35"},
+            {"price": "0.90", "size": "20"},
+        ],
+        preserve_first_attempt_price=True,
+    )
+
+    assert result["retained_upside_ratio"] == D("0.60")
+    assert result["average_price_cap"] == D("0.82572195022")
+    assert result["safe_worst_price"] == D("0.82")
+    assert result["order_limit_price"] == D("0.75")
+    assert result["snapshot_projected_vwap"] == D(
+        "0.7464363291983027603049391861"
+    )
+
+
+def test_dynamic_buy_limit_spends_only_proven_price_surplus_on_a_later_retry():
+    result = live.dynamic_buy_limit_price(
+        source_average_price=D("0.70"),
+        target_quantity=D("10"),
+        cumulative_filled_quantity=D("5"),
+        cumulative_filled_notional_usd=D("3.70"),
+        current_best_ask=D("0.90"),
+        tick_size=D("0.01"),
+        raw_asks=[{"price": "0.90", "size": "5"}],
+        preserve_first_attempt_price=False,
+    )
+
+    assert result["average_price_cap"] == D("0.82")
+    assert result["safe_worst_price"] == D("0.90")
+    assert result["order_limit_price"] == D("0.90")
+    assert result["snapshot_projected_total_vwap"] == D("0.82")
+
+
+def test_active_cancel_retries_the_exact_partial_remainder(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -11512,15 +11558,15 @@ def test_gtd_closes_legacy_partial_remainder_without_resubmitting(
     target = store.action_target(source.action_id)
     assert result == [
         {
-            "terminal_status": "PARTIAL",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert [call["size"] for call in execution.calls] == [D("10")]
+    assert [call["size"] for call in execution.calls] == [D("10"), D("5")]
     assert target["target_quantity"] == D("10")
     assert target["cumulative_filled_quantity"] == D("5")
     assert target["remaining_quantity"] == D("5")
-    assert target["state"] == "PARTIAL"
+    assert target["state"] == "SUBMITTED_UNRECONCILED"
 
 
 def test_partial_without_persisted_chain_receipt_never_enters_retry(
@@ -11558,18 +11604,20 @@ def test_partial_without_persisted_chain_receipt_never_enters_retry(
     assert len(execution.calls) == 1
 
 
-def test_finalized_zero_fill_is_closed_once_without_overfill(
+def test_finalized_zero_fill_retries_once_without_overfill(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
+    execution.response = {"success": True, "orderID": "order-2"}
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert store.submission_attempt_count(source.action_id) == 1
-    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 2
+    assert len(execution.calls) == 2
+    assert _retry_through_execution(store=store, execution=execution) == []
 
 
 def test_finalized_zero_fill_restart_does_not_submit_an_unknown_replacement(
@@ -11592,13 +11640,13 @@ def test_finalized_zero_fill_restart_does_not_submit_an_unknown_replacement(
 
     assert first == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "UNKNOWN_SUBMISSION",
+            "reason": "SUBMISSION_TRANSPORT_UNKNOWN:TimeoutError",
         }
     ]
     assert second == []
-    assert retry_execution.calls == []
-    assert restarted.submission_attempt_count(source.action_id) == 1
+    assert len(retry_execution.calls) == 1
+    assert restarted.submission_attempt_count(source.action_id) == 2
 
 
 def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
@@ -11651,8 +11699,8 @@ def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
             start_redemption_cycle=lambda: None,
         ) is True
 
-    assert store.submission_attempt_count(source.action_id) == 1
-    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 2
+    assert len(execution.calls) == 2
 
     execution.response = {"success": True, "orderID": "order-3"}
     assert live._process_live_ws_head(
@@ -11663,11 +11711,11 @@ def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
         head=103,
         start_redemption_cycle=lambda: None,
     ) is True
-    assert store.submission_attempt_count(source.action_id) == 1
-    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 3
+    assert len(execution.calls) == 3
 
 
-def test_finalized_zero_fill_does_not_wait_for_a_better_book(
+def test_finalized_zero_fill_retries_at_the_current_safe_book(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11680,14 +11728,16 @@ def test_finalized_zero_fill_does_not_wait_for_a_better_book(
         return value
 
     execution.snapshot = snapshot
+    execution.response = {"success": True, "orderID": "order-2"}
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert len(execution.calls) == 1
-    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
+    assert len(execution.calls) == 2
+    assert execution.calls[-1]["price"] == D("0.64")
+    assert store.action_target(source.action_id)["state"] == "SUBMITTED_UNRECONCILED"
 
 
 def test_liquidity_retry_ignores_unknown_and_pre_boundary_actions(tmp_path: Path):
@@ -11735,7 +11785,7 @@ def test_finalized_zero_fill_closes_without_reading_a_closed_market(
     assert result == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "reason": "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY",
         }
     ]
     assert len(execution.calls) == before_calls
@@ -11757,12 +11807,12 @@ def test_finalized_zero_fill_closes_without_a_lifecycle_refetch(
 
     assert result == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "PENDING_CONFIRMED_ZERO_FILL",
+            "reason": "OFFICIAL_MARKET_STATE_RESOLVER_UNAVAILABLE_FOR_LIQUIDITY_RETRY",
         }
     ]
     assert len(execution.calls) == before_calls
-    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
+    assert store.action_target(source.action_id)["state"] == "PENDING_CONFIRMED_ZERO_FILL"
 
 
 def test_later_opposite_terminates_v2_partial_remainder_but_preserves_fill(
@@ -11941,7 +11991,7 @@ def test_v2_retry_uses_an_exact_share_fak_limit_order(tmp_path: Path):
     assert created.price == 0.4
 
 
-def test_finalized_zero_fill_closes_without_a_new_cash_check(
+def test_finalized_zero_fill_rechecks_cash_before_retry(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11952,14 +12002,14 @@ def test_finalized_zero_fill_closes_without_a_new_cash_check(
     assert result == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "reason": "INSUFFICIENT_AUTHENTICATED_ACCOUNT_CASH_AT_RETRY",
         }
     ]
     assert len(execution.calls) == 1
     assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
 
 
-def test_gtd_closes_a_legacy_sell_retry_without_reposting(
+def test_sell_retry_without_inventory_remains_unfillable_without_reposting(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -11997,7 +12047,7 @@ def test_gtd_closes_a_legacy_sell_retry_without_reposting(
     assert _retry_through_execution(store=store, execution=execution) == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "reason": "NO_LOCAL_INVENTORY_PRE_WATERMARK_OR_PRIOR_MISS",
         }
     ]
     assert len(execution.calls) == 1
@@ -12038,7 +12088,7 @@ def test_v2_retry_remainder_below_current_minimum_is_terminal_without_upscale(
     assert len(execution.calls) == 1
 
 
-def test_finalized_zero_fill_closes_before_new_price_or_fee_checks(
+def test_finalized_zero_fill_above_ninety_retries_only_at_source_price(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -12079,16 +12129,18 @@ def test_finalized_zero_fill_closes_before_new_price_or_fee_checks(
         "finality": "polygon_finalized_block",
     }
     reconcile_submitted_actions(store=store, execution=execution)
+    execution.response = {"success": True, "orderID": "order-2"}
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert len(execution.calls) == 1
+    assert len(execution.calls) == 2
+    assert execution.calls[-1]["price"] == D("0.91")
 
 
-def test_liquidity_retry_status_counts_gtd_replacement_termination(
+def test_liquidity_retry_status_counts_official_market_close_termination(
     tmp_path: Path,
 ):
     store, _source, execution = _v2_zero_fill_store(tmp_path)
@@ -12105,7 +12157,7 @@ def test_liquidity_retry_status_counts_gtd_replacement_termination(
     summary = store.liquidity_retry_summary()
 
     assert summary["termination_counts"] == {
-        "GTD_POLICY_REPLACED_LIQUIDITY_RETRY": 1
+        "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY": 1
     }
 
 

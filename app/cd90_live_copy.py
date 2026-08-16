@@ -205,6 +205,137 @@ LIQUIDITY_RETRY_POLICY_ID = "LIQUIDITY_ONLY_RETRY_V2"
 # source wallet's observed price per share.  The user explicitly excludes
 # protocol fees from this price-loss comparison.
 USER_SPECIFIED_HIGH_PRICE_BUY_CEILING = Decimal("0.90")
+# User-confirmed prospective BUY pricing rule (2026-08-16).  Preserve sixty
+# percent of the source wallet's remaining one-dollar payout upside.  Protocol
+# fees stay outside this price-loss comparison and remain reserved separately.
+DYNAMIC_BUY_RETAINED_UPSIDE_RATIO = Decimal("0.60")
+
+
+def dynamic_buy_limit_price(
+    *,
+    source_average_price: Decimal,
+    target_quantity: Decimal,
+    cumulative_filled_quantity: Decimal,
+    cumulative_filled_notional_usd: Decimal,
+    current_best_ask: Decimal,
+    tick_size: Decimal,
+    raw_asks: Any,
+    preserve_first_attempt_price: bool,
+) -> dict[str, Any]:
+    """Return a depth-aware exact-share BUY limit without overspending edge.
+
+    The total action budget is frozen from the source price.  A later retry may
+    spend only price surplus proved by earlier official fills.  The first
+    attempt retains the existing eligible best-Ask submission so this repair
+    cannot turn a previously submittable action into a local price skip.
+    """
+
+    source_price = Decimal(str(source_average_price))
+    target = Decimal(str(target_quantity))
+    filled = Decimal(str(cumulative_filled_quantity))
+    filled_notional = Decimal(str(cumulative_filled_notional_usd))
+    best = Decimal(str(current_best_ask))
+    tick = Decimal(str(tick_size))
+    values = (source_price, target, filled, filled_notional, best, tick)
+    if any(not value.is_finite() for value in values):
+        raise LiveConfigurationError("INVALID_DYNAMIC_BUY_PRICE_INPUT")
+    if (
+        source_price <= ZERO
+        or source_price > Decimal("1")
+        or target <= ZERO
+        or filled < ZERO
+        or filled >= target
+        or filled_notional < ZERO
+        or best <= ZERO
+        or best > Decimal("1")
+        or tick <= ZERO
+    ):
+        raise LiveConfigurationError("INVALID_DYNAMIC_BUY_PRICE_INPUT")
+
+    if source_price > USER_SPECIFIED_HIGH_PRICE_BUY_CEILING:
+        average_cap = source_price
+        absolute_ceiling = source_price
+    else:
+        average_cap = min(
+            USER_SPECIFIED_HIGH_PRICE_BUY_CEILING,
+            Decimal("1")
+            - DYNAMIC_BUY_RETAINED_UPSIDE_RATIO
+            * (Decimal("1") - source_price),
+        )
+        absolute_ceiling = USER_SPECIFIED_HIGH_PRICE_BUY_CEILING
+
+    remaining = target - filled
+    remaining_budget = target * average_cap - filled_notional
+    raw_safe_price = min(absolute_ceiling, remaining_budget / remaining)
+    baseline_override = bool(
+        preserve_first_attempt_price
+        and best <= absolute_ceiling
+        and best > raw_safe_price
+    )
+    if baseline_override:
+        raw_safe_price = best
+    safe_price = (
+        raw_safe_price / tick
+    ).to_integral_value(rounding=ROUND_FLOOR) * tick
+    if safe_price <= ZERO:
+        raise LiveConfigurationError("DYNAMIC_BUY_PRICE_BUDGET_EXHAUSTED")
+
+    parsed: list[tuple[Decimal, Decimal]] = []
+    if isinstance(raw_asks, list):
+        for level in raw_asks:
+            if not isinstance(level, Mapping):
+                continue
+            try:
+                price = Decimal(str(level["price"]))
+                quantity = Decimal(str(level["size"]))
+            except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+                raise LiveConfigurationError(
+                    "INVALID_DYNAMIC_BUY_ASK_LEVEL"
+                ) from exc
+            if price > ZERO and quantity > ZERO and price <= safe_price:
+                parsed.append((price, quantity))
+    parsed.sort(key=lambda item: item[0])
+
+    visible_quantity = ZERO
+    visible_notional = ZERO
+    marginal_price: Decimal | None = None
+    for price, quantity in parsed:
+        take = min(quantity, remaining - visible_quantity)
+        if take <= ZERO:
+            break
+        visible_quantity += take
+        visible_notional += take * price
+        marginal_price = price
+        if visible_quantity == remaining:
+            break
+    order_limit = (
+        marginal_price
+        if visible_quantity == remaining and marginal_price is not None
+        else best
+        if not parsed and preserve_first_attempt_price
+        else safe_price
+    )
+    projected_vwap = (
+        visible_notional / visible_quantity if visible_quantity > ZERO else None
+    )
+    projected_total_vwap = (
+        (filled_notional + visible_notional) / (filled + visible_quantity)
+        if filled + visible_quantity > ZERO
+        else None
+    )
+    return {
+        "retained_upside_ratio": DYNAMIC_BUY_RETAINED_UPSIDE_RATIO,
+        "average_price_cap": average_cap,
+        "absolute_price_ceiling": absolute_ceiling,
+        "safe_worst_price": safe_price,
+        "order_limit_price": order_limit,
+        "remaining_quantity": remaining,
+        "remaining_price_budget_usd": remaining_budget,
+        "snapshot_visible_quantity": visible_quantity,
+        "snapshot_projected_vwap": projected_vwap,
+        "snapshot_projected_total_vwap": projected_total_vwap,
+        "first_attempt_no_regression_override": baseline_override,
+    }
 
 
 def now_ms() -> int:
@@ -7090,6 +7221,37 @@ class LiveStore:
             "updated_at_ms": int(row["updated_at_ms"]),
         }
 
+    def action_filled_notional_usd(self, action_id: str) -> Decimal:
+        """Sum only authoritative fill transitions for one source action."""
+
+        self.initialize()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT details_json FROM action_transitions
+                WHERE action_id = ?
+                  AND status IN ('FILLED', 'PARTIAL', 'PARTIAL_PENDING')
+                ORDER BY id
+                """,
+                (str(action_id),),
+            ).fetchall()
+        total = ZERO
+        for row in rows:
+            details = json.loads(str(row["details_json"] or "{}"))
+            raw_notional = details.get("matched_notional_usd")
+            if raw_notional in {None, ""}:
+                continue
+            try:
+                notional = Decimal(str(raw_notional))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise LiveConfigurationError(
+                    "INVALID_ACTION_FILL_NOTIONAL"
+                ) from exc
+            if not notional.is_finite() or notional <= ZERO:
+                raise LiveConfigurationError("INVALID_ACTION_FILL_NOTIONAL")
+            total += notional
+        return total
+
     def original_submission_minimum_order_size(
         self, *, action_id: str
     ) -> Decimal | None:
@@ -8368,6 +8530,7 @@ class LiveStore:
                 WHERE action_id=? AND (
                     reason IN (
                         'FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE',
+                        'GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE',
                         'OFFICIAL_CONFIRMED_ZERO_FILL_RETRYABLE',
                         'FAK_PARTIAL_FILL'
                     )
@@ -8387,7 +8550,10 @@ class LiveStore:
             parsed = json.loads(str(row["details_json"]))
             reason = str(row["reason"])
             if (
-                reason == "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE"
+                reason in {
+                    "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE",
+                    "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE",
+                }
                 and parsed.get("chain_scan", {}).get("finality") is not None
             ):
                 has_zero_fill_proof = True
@@ -13138,6 +13304,69 @@ def _execute_source_action_locked(
         planning_source_quantity = remaining
         planning_scale = Decimal("1")
         allow_minimum_upscale = False
+    base_snapshot = snapshot
+    dynamic_buy_pricing: dict[str, Any] | None = None
+    if (
+        source.side == "BUY"
+        and not allow_minimum_upscale
+        and sizing_mode != SIZING_MODE_SOURCE_NOTIONAL
+    ):
+        target_for_price = planning_source_quantity * planning_scale
+        cumulative_filled = (
+            ZERO
+            if existing_target is None
+            else Decimal(str(existing_target["cumulative_filled_quantity"]))
+        )
+        try:
+            dynamic_buy_pricing = dynamic_buy_limit_price(
+                source_average_price=source_vwap,
+                target_quantity=(
+                    target_for_price
+                    if existing_target is None
+                    else Decimal(str(existing_target["target_quantity"]))
+                ),
+                cumulative_filled_quantity=cumulative_filled,
+                cumulative_filled_notional_usd=(
+                    ZERO
+                    if existing_target is None
+                    else store.action_filled_notional_usd(source.action_id)
+                ),
+                current_best_ask=Decimal(str(snapshot["best_price"])),
+                tick_size=Decimal(str(snapshot["tick_size"])),
+                raw_asks=(snapshot.get("raw_book") or {}).get("asks"),
+                preserve_first_attempt_price=existing_target is None,
+            )
+        except LiveConfigurationError as exc:
+            if str(exc) != "DYNAMIC_BUY_PRICE_BUDGET_EXHAUSTED":
+                raise
+            retained_state = (
+                "PENDING_PRICE_PROTECTION"
+                if existing_target is not None
+                else "EXTERNAL_UNFILLABLE"
+            )
+            reason = "DYNAMIC_BUY_PRICE_BUDGET_EXHAUSTED"
+            if existing_target is not None:
+                store.set_action_target_state(
+                    source=source,
+                    state=retained_state,
+                    reason=reason,
+                    updated_at_ms=now_ms(),
+                )
+            store.append_transition(
+                source=source,
+                status=retained_state,
+                reason=reason,
+                details={"new_order_submitted": False},
+            )
+            return {"terminal_status": retained_state, "reason": reason}
+        snapshot = {
+            **snapshot,
+            "best_price": str(dynamic_buy_pricing["order_limit_price"]),
+            "dynamic_buy_pricing": {
+                key: str(value) if isinstance(value, Decimal) else value
+                for key, value in dynamic_buy_pricing.items()
+            },
+        }
     plan = plan_action(
         side=source.side,
         source_quantity=planning_source_quantity,
@@ -13155,6 +13384,42 @@ def _execute_source_action_locked(
         fee_exponent=Decimal(str(snapshot.get("fee_exponent", "1"))),
         allow_minimum_upscale=allow_minimum_upscale,
     )
+    if (
+        source.side == "BUY"
+        and existing_target is None
+        and dynamic_buy_pricing is not None
+        and plan.terminal_status == "PENDING_CAPITAL"
+    ):
+        # The new price improvement path must not turn an order that the old
+        # best-Ask plan could fund into a new local capital skip.
+        baseline_plan = plan_action(
+            side=source.side,
+            source_quantity=planning_source_quantity,
+            scale=planning_scale,
+            held_quantity=store.available_position_quantity(source.token_id),
+            minimum_order_size=Decimal(str(base_snapshot["minimum_order_size"])),
+            minimum_marketable_buy_notional_usd=Decimal(
+                str(base_snapshot["minimum_marketable_buy_notional_usd"])
+            ),
+            best_price=Decimal(str(base_snapshot["best_price"])),
+            minimum_fill_price=Decimal(str(base_snapshot["tick_size"])),
+            visible_best_level_size=Decimal(
+                str(base_snapshot["visible_best_level_size"])
+            ),
+            taker_fee_bps=Decimal(str(base_snapshot["fee_bps"])),
+            available_cash=effective_cash,
+            fee_exponent=Decimal(str(base_snapshot.get("fee_exponent", "1"))),
+            allow_minimum_upscale=False,
+        )
+        if baseline_plan.terminal_status == "READY":
+            plan = baseline_plan
+            snapshot = {
+                **base_snapshot,
+                "dynamic_buy_pricing": {
+                    **snapshot["dynamic_buy_pricing"],
+                    "cash_no_regression_fallback": True,
+                },
+            }
 
     if (
         source.side == "BUY"
@@ -13220,12 +13485,6 @@ def _execute_source_action_locked(
 
     liquidity_retry_details: dict[str, Any] | None = None
     if liquidity_retry is not None:
-        frozen_price = Decimal(str(liquidity_retry["frozen_worst_price"]))
-        price_blocked = (
-            source.side == "BUY" and plan.worst_price > frozen_price
-        ) or (
-            source.side == "SELL" and plan.worst_price < frozen_price
-        )
         liquidity_retry_details = {
             **liquidity_retry,
             "observed_current_worst_price": str(plan.worst_price),
@@ -13235,17 +13494,11 @@ def _execute_source_action_locked(
                 else "MINIMUM_SELL_PRICE"
             ),
         }
-        if plan.terminal_status == "READY" and price_blocked:
-            plan = ActionPlan(
-                terminal_status="PENDING_PRICE_PROTECTION",
-                reason="CURRENT_BOOK_OUTSIDE_FIRST_ATTEMPT_PRICE",
-                side=plan.side,
-                proportional_quantity=plan.proportional_quantity,
-                requested_quantity=plan.requested_quantity,
-                order_amount_usd=plan.order_amount_usd,
-                worst_price=plan.worst_price,
-                reserved_cash_usd=plan.reserved_cash_usd,
-            )
+        if dynamic_buy_pricing is not None:
+            liquidity_retry_details["dynamic_buy_pricing"] = {
+                key: str(value) if isinstance(value, Decimal) else value
+                for key, value in dynamic_buy_pricing.items()
+            }
 
     # When the authenticated account could not fund this newly discovered BUY,
     # retaining it
@@ -13752,33 +14005,6 @@ def retry_pending_actions(
     if not pending_sources:
         return results
 
-    # GTD replaces the old liquidity-retry policy. Close every proven old
-    # remainder without submitting another order, then let future actions use
-    # one fresh GTD order only.
-    for source in pending_sources:
-        target = store.action_target(source.action_id)
-        if target is None:
-            raise LiveConfigurationError("RETRYABLE_TARGET_MISSING")
-        filled = Decimal(str(target["cumulative_filled_quantity"]))
-        terminal = "PARTIAL" if filled > ZERO else "EXTERNAL_UNFILLABLE"
-        reason = "GTD_POLICY_REPLACED_LIQUIDITY_RETRY"
-        closed_at_ms = now_ms()
-        store.set_action_target_state(
-            source=source,
-            state=terminal,
-            reason=reason,
-            updated_at_ms=closed_at_ms,
-        )
-        store.append_transition(
-            source=source,
-            status=terminal,
-            reason=reason,
-            created_at_ms=closed_at_ms,
-            details={"new_order_submitted": False},
-        )
-        results.append({"terminal_status": terminal, "reason": reason})
-    return results
-
     def causal_key(source: SourceAction) -> tuple[int, int, int, str, str, str, str]:
         return (
             int(source.block_number),
@@ -14269,15 +14495,15 @@ def reconcile_submitted_actions(
                         source
                     )
                     terminal_status = (
-                        "EXTERNAL_UNFILLABLE"
-                        if execution_order_type in {"GTD", "GTC_ACTIVE_CANCEL"}
-                        else
                         "PENDING_CONFIRMED_ZERO_FILL"
                         if liquidity_policy is not None
                         else "EXTERNAL_UNFILLABLE"
                     )
                     reason = (
-                        "GTC_ACTIVE_CANCEL_ZERO_FILL"
+                        "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE"
+                        if execution_order_type == "GTC_ACTIVE_CANCEL"
+                        and liquidity_policy is not None
+                        else "GTC_ACTIVE_CANCEL_ZERO_FILL"
                         if execution_order_type == "GTC_ACTIVE_CANCEL"
                         else "GTD_EXPIRED_ZERO_FILL"
                         if execution_order_type == "GTD"
@@ -14419,6 +14645,13 @@ def reconcile_submitted_actions(
                 terminal = (
                     "FILLED"
                     if quantity >= remaining or buy_cash_order_complete
+                    else "PARTIAL_PENDING"
+                    if (
+                        execution_order_type == "GTC_ACTIVE_CANCEL"
+                        and target is not None
+                        and store.liquidity_retry_policy_for_source(source)
+                        is not None
+                    )
                     else "PARTIAL"
                     if execution_order_type in {"GTD", "GTC_ACTIVE_CANCEL"}
                     else "PARTIAL" if target is None else "PARTIAL_PENDING"
