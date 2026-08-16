@@ -8545,16 +8545,64 @@ class LiveStore:
             for row in attempts
         ):
             return None
+
+        def has_gtc_active_cancel_finality_proof(
+            parsed: Mapping[str, Any],
+        ) -> bool:
+            proof = parsed.get("gtc_active_cancel_zero_fill_proof")
+            chain_scan = parsed.get("chain_scan", {})
+            try:
+                cancel_head_block = int(str(proof.get("cancel_head_block")))
+                scan_to_block = int(str(proof.get("scan_to_block")))
+                chain_scan_to_block = int(str(chain_scan.get("to_block")))
+                matched_quantity = Decimal(
+                    str(proof.get("official_matched_quantity"))
+                )
+            except (AttributeError, InvalidOperation, TypeError, ValueError):
+                return False
+            return bool(
+                isinstance(proof, Mapping)
+                and proof.get("schema") == "GTC_ACTIVE_CANCEL_FINALITY_V1"
+                and proof.get("active_cancel_verified") is True
+                and scan_to_block >= cancel_head_block
+                and str(proof.get("official_status", "")).upper()
+                in {
+                    "ORDER_STATUS_INVALID",
+                    "ORDER_STATUS_CANCELED",
+                    "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+                    "MATCHED",
+                    "INVALID",
+                    "CANCELED",
+                }
+                and matched_quantity >= ZERO
+                and isinstance(chain_scan, Mapping)
+                and chain_scan.get("finality") is not None
+                and chain_scan_to_block == scan_to_block
+            )
+
         has_zero_fill_proof = False
         for row in proof_rows:
             parsed = json.loads(str(row["details_json"]))
             reason = str(row["reason"])
+            chain_scan = parsed.get("chain_scan", {})
             if (
-                reason in {
-                    "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE",
-                    "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE",
-                }
-                and parsed.get("chain_scan", {}).get("finality") is not None
+                reason == "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE"
+                and isinstance(chain_scan, Mapping)
+                and chain_scan.get("finality") is not None
+            ):
+                has_zero_fill_proof = True
+                break
+            if (
+                reason == "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE"
+                and has_gtc_active_cancel_finality_proof(parsed)
+                and Decimal(
+                    str(
+                        parsed["gtc_active_cancel_zero_fill_proof"][
+                            "official_matched_quantity"
+                        ]
+                    )
+                )
+                == ZERO
             ):
                 has_zero_fill_proof = True
                 break
@@ -8562,6 +8610,12 @@ class LiveStore:
             str(row["status"]) == "PARTIAL_PENDING"
             and _has_chain_receipt_evidence(
                 json.loads(str(row["details_json"])).get("receipt_evidence")
+            )
+            and (
+                str(row["reason"]) != "GTC_ACTIVE_CANCEL_PARTIAL_FILL"
+                or has_gtc_active_cancel_finality_proof(
+                    json.loads(str(row["details_json"]))
+                )
             )
             for row in proof_rows
         )
@@ -10852,9 +10906,16 @@ class CLOBExecutionAdapter:
         )
         if still_open:
             raise RuntimeError("ACTIVE_CANCEL_ORDER_STILL_OPEN")
+        latest_block_number = getattr(self.receipt_reader, "latest_block_number", None)
+        if not callable(latest_block_number):
+            raise RuntimeError("ACTIVE_CANCEL_CHAIN_HEAD_READER_UNAVAILABLE")
+        observed_head_block = int(latest_block_number())
+        if observed_head_block < 0:
+            raise RuntimeError("ACTIVE_CANCEL_CHAIN_HEAD_INVALID")
         return {
             "active_cancel_response": cancel_response,
             "active_cancel_verified": True,
+            "active_cancel_observed_head_block": observed_head_block,
             "active_cancel_wait_seconds": BUY_ACTIVE_CANCEL_WAIT_SECONDS,
         }
 
@@ -11078,7 +11139,16 @@ class CLOBExecutionAdapter:
         quantity = Decimal(total_quantity_raw) / TOKEN_SCALE
         notional = Decimal(total_notional_raw) / TOKEN_SCALE
         fee = Decimal(total_fee_raw) / TOKEN_SCALE
-        return {"quantity": quantity, "notional_usd": notional, "fee_usd": fee, "vwap_price": notional / quantity, "receipt_evidence": evidence}
+        return {
+            "quantity": quantity,
+            "notional_usd": notional,
+            "fee_usd": fee,
+            "vwap_price": notional / quantity,
+            "receipt_evidence": evidence,
+            "scan_from_block": int(source.block_number),
+            "scan_to_block": scan_to_block,
+            "finality": "polygon_finalized_block",
+        }
 
     def get_associated_trades(
         self,
@@ -14451,10 +14521,36 @@ def reconcile_submitted_actions(
                         {"terminal_status": "PENDING", "reason": "GTD_ORDER_STILL_OPEN"}
                     )
                     continue
+        gtc_active_cancel_observed_head_block: int | None = None
+        if execution_order_type == "GTC_ACTIVE_CANCEL":
+            if not active_cancel_verified:
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_AWAITING_CANCEL_OR_FILL",
+                    }
+                )
+                continue
+            try:
+                gtc_active_cancel_observed_head_block = int(
+                    str(
+                        recorded_response.get(
+                            "active_cancel_observed_head_block"
+                        )
+                    )
+                )
+            except (AttributeError, TypeError, ValueError):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_FINALITY_BOUNDARY_MISSING",
+                    }
+                )
+                continue
         response = recorded_response
         authoritative_reader = getattr(execution, "authoritative_submission_execution", None)
         authoritative: dict[str, Any] | None = None
-        if callable(authoritative_reader):
+        if execution_order_type != "GTC_ACTIVE_CANCEL" and callable(authoritative_reader):
             try:
                 authoritative = authoritative_reader(
                     source=source,
@@ -14476,6 +14572,16 @@ def reconcile_submitted_actions(
                 # from Polygon RPCs.  Preserve the external error, then use
                 # the finalized order-hash scan below before leaving PENDING.
         order_hash_reader = getattr(execution, "authoritative_order_hash_execution", None)
+        if execution_order_type == "GTC_ACTIVE_CANCEL" and not callable(
+            order_hash_reader
+        ):
+            results.append(
+                {
+                    "terminal_status": "PENDING",
+                    "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF",
+                }
+            )
+            continue
         if authoritative is None and callable(order_hash_reader):
             try:
                 authoritative = order_hash_reader(source=source, order_id=order_id)
@@ -14486,8 +14592,108 @@ def reconcile_submitted_actions(
                     message=f"{type(exc).__name__}: {exc}",
                     details={"order_id": order_id, "action_id": source.action_id},
                 )
+        gtc_active_cancel_finality_proof = None
+        if execution_order_type == "GTC_ACTIVE_CANCEL":
+            if not isinstance(authoritative, Mapping):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF",
+                    }
+                )
+                continue
+            try:
+                scan_to_block = int(str(authoritative.get("scan_to_block")))
+            except (TypeError, ValueError):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_FINALITY_BOUNDARY_MISSING",
+                    }
+                )
+                continue
+            if scan_to_block < int(gtc_active_cancel_observed_head_block):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALITY",
+                    }
+                )
+                continue
         if authoritative is not None:
                 if authoritative.get("authoritative_no_fill") is True:
+                    gtc_active_cancel_zero_fill_proof = None
+                    if execution_order_type == "GTC_ACTIVE_CANCEL":
+                        try:
+                            cancel_head_block = int(
+                                str(
+                                    recorded_response.get(
+                                        "active_cancel_observed_head_block"
+                                    )
+                                )
+                            )
+                            scan_to_block = int(
+                                str(authoritative.get("scan_to_block"))
+                            )
+                        except (TypeError, ValueError):
+                            results.append(
+                                {
+                                    "terminal_status": "PENDING",
+                                    "reason": "GTC_ACTIVE_CANCEL_FINALITY_BOUNDARY_MISSING",
+                                }
+                            )
+                            continue
+                        if scan_to_block < cancel_head_block:
+                            results.append(
+                                {
+                                    "terminal_status": "PENDING",
+                                    "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALITY",
+                                }
+                            )
+                            continue
+                        canceled_statuses = {
+                            "ORDER_STATUS_INVALID",
+                            "ORDER_STATUS_CANCELED",
+                            "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+                            "INVALID",
+                            "CANCELED",
+                        }
+                        try:
+                            official_matched_quantity = (
+                                ZERO
+                                if prefetched_order is None
+                                else _matched_shares(
+                                    prefetched_order,
+                                    expected_quantity=expected,
+                                )[0]
+                            )
+                        except Exception:
+                            official_matched_quantity = Decimal("-1")
+                        if (
+                            prefetched_order is None
+                            or str(prefetched_order.get("status", "")).upper()
+                            not in canceled_statuses
+                            or official_matched_quantity != ZERO
+                        ):
+                            results.append(
+                                {
+                                    "terminal_status": "PENDING",
+                                    "reason": "GTC_ACTIVE_CANCEL_OFFICIAL_ZERO_FILL_NOT_PROVEN",
+                                }
+                            )
+                            continue
+                        gtc_active_cancel_zero_fill_proof = {
+                            "schema": "GTC_ACTIVE_CANCEL_FINALITY_V1",
+                            "active_cancel_verified": True,
+                            "cancel_head_block": cancel_head_block,
+                            "scan_to_block": scan_to_block,
+                            "official_status": str(
+                                prefetched_order.get("status", "")
+                            ).upper(),
+                            "official_matched_quantity": str(
+                                official_matched_quantity
+                            ),
+                        }
                     attempt_id = str(details.get("attempt_id") or "")
                     if not attempt_id:
                         raise LiveConfigurationError("MISSING_ATTEMPT_ID_FOR_RECONCILIATION")
@@ -14529,6 +14735,15 @@ def reconcile_submitted_actions(
                             },
                             "historical_repost": False,
                             "liquidity_retry_policy": liquidity_policy,
+                            **(
+                                {
+                                    "gtc_active_cancel_zero_fill_proof": (
+                                        gtc_active_cancel_zero_fill_proof
+                                    )
+                                }
+                                if gtc_active_cancel_zero_fill_proof is not None
+                                else {}
+                            ),
                         },
                         attempt_id=attempt_id,
                         attempt_state="NO_FILL",
@@ -14550,6 +14765,21 @@ def reconcile_submitted_actions(
                     raise LiveConfigurationError("INVALID_AUTHORITATIVE_FILL_RESULT") from exc
                 if quantity <= ZERO or notional <= ZERO or fee < ZERO or vwap <= ZERO:
                     raise LiveConfigurationError("INVALID_AUTHORITATIVE_FILL_RESULT")
+                if execution_order_type == "GTC_ACTIVE_CANCEL":
+                    gtc_active_cancel_finality_proof = {
+                        "schema": "GTC_ACTIVE_CANCEL_FINALITY_V1",
+                        "active_cancel_verified": True,
+                        "cancel_head_block": int(
+                            gtc_active_cancel_observed_head_block
+                        ),
+                        "scan_to_block": int(
+                            str(authoritative.get("scan_to_block"))
+                        ),
+                        "official_status": str(
+                            (prefetched_order or {}).get("status", "")
+                        ).upper(),
+                        "official_matched_quantity": str(quantity),
+                    }
                 target = store.action_target(source.action_id)
                 remaining = (
                     expected
@@ -14732,6 +14962,24 @@ def reconcile_submitted_actions(
                             else ZERO
                         ),
                         "partial_remainder_evidence": partial_remainder_evidence,
+                        **(
+                            {
+                                "gtc_active_cancel_zero_fill_proof": (
+                                    gtc_active_cancel_finality_proof
+                                ),
+                                "chain_scan": {
+                                    "from_block": authoritative.get(
+                                        "scan_from_block"
+                                    ),
+                                    "to_block": authoritative.get(
+                                        "scan_to_block"
+                                    ),
+                                    "finality": authoritative.get("finality"),
+                                },
+                            }
+                            if gtc_active_cancel_finality_proof is not None
+                            else {}
+                        ),
                     },
                     maximum_buy_notional_usd=(
                         maximum_buy_notional
@@ -15077,6 +15325,16 @@ def reconcile_submitted_actions(
             "INVALID",
             "CANCELED",
         }:
+            if execution_order_type == "GTC_ACTIVE_CANCEL":
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": (
+                            "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF"
+                        ),
+                    }
+                )
+                continue
             liquidity_policy = store.liquidity_retry_policy_for_source(source)
             bounded_retry = (
                 None

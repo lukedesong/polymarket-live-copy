@@ -7799,8 +7799,18 @@ def test_clob_adapter_submits_a_fak_market_order_with_buy_amount_derived_from_ex
 
 def test_clob_adapter_posts_multiple_active_cancel_orders_without_waiting(monkeypatch):
     client = FakeCLOBClient()
+
+    class ReceiptReader:
+        @staticmethod
+        def latest_block_number():
+            assert client.cancellations
+            assert client.get_open_orders() == []
+            return 101
+
     adapter = CLOBExecutionAdapter(
-        client, minimum_marketable_buy_notional_usd=D("1")
+        client,
+        minimum_marketable_buy_notional_usd=D("1"),
+        receipt_reader=ReceiptReader(),
     )
     adapter.snapshot(token_id="123", side="BUY")
 
@@ -7837,8 +7847,10 @@ def test_clob_adapter_posts_multiple_active_cancel_orders_without_waiting(monkey
     assert len(client.created_orders) == 2
     assert len(client.submissions) == 2
 
-    adapter.cancel_active_gtd_order(first_response["orderID"])
-    adapter.cancel_active_gtd_order(second_response["orderID"])
+    first_cancel = adapter.cancel_active_gtd_order(first_response["orderID"])
+    second_cancel = adapter.cancel_active_gtd_order(second_response["orderID"])
+    assert first_cancel["active_cancel_observed_head_block"] == 101
+    assert second_cancel["active_cancel_observed_head_block"] == 101
     assert client.cancellations == [
         first_response["orderID"],
         second_response["orderID"],
@@ -7967,6 +7979,9 @@ def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
     assert result["quantity"] == D("10")
     assert result["notional_usd"] == D("4")
     assert result["vwap_price"] == D("0.4")
+    assert result["scan_from_block"] == 100
+    assert result["scan_to_block"] == 101
+    assert result["finality"] == "polygon_finalized_block"
 
 
 def test_websocket_liveness_timeout_is_independent_from_order_retry_policy():
@@ -11438,6 +11453,311 @@ def _v2_zero_fill_store(tmp_path: Path):
         }
     ]
     return store, source, execution
+
+
+class DelayedActiveCancelExecution(FakePreparedExecution):
+    def __init__(self):
+        super().__init__()
+        self.prepared["order_type"] = "GTC"
+        self.response = {
+            "success": True,
+            "status": "delayed",
+            "orderID": self.prepared["order_id"],
+        }
+        self.orders[self.prepared["order_id"]] = {
+            "status": "MATCHED",
+            "size_matched": "0",
+            "original_size": "10",
+        }
+
+    prepare_gtd_limit = FakePreparedExecution.prepare_fak_market
+    submit_prepared_gtd_limit = FakePreparedExecution.submit_prepared_fak_market
+
+
+def _delayed_active_cancel_store(tmp_path: Path):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    _activate_liquidity_retry_v2(store)
+    source = action(quantity="40")
+    execution = DelayedActiveCancelExecution()
+    assert execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )["terminal_status"] == "SUBMITTED_UNRECONCILED"
+    execution.authoritative_submission_execution = lambda **_kwargs: None
+    return store, source, execution
+
+
+def test_delayed_gtc_without_completed_cancel_never_becomes_retryable_zero_fill(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "authoritative_no_fill": True,
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_CANCEL_OR_FILL",
+        }
+    ]
+    with store.connect() as connection:
+        attempt = connection.execute(
+            "SELECT state FROM submission_attempts WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    assert attempt["state"] == "SUBMITTED_UNRECONCILED"
+    assert int(reservation["active"]) == 1
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+
+
+def test_canceled_gtc_waits_until_finalized_scan_covers_cancel_head(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "0",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "authoritative_no_fill": True,
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 9,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALITY",
+        }
+    ]
+    assert store.submission_attempt_count(source.action_id) == 1
+
+
+def test_canceled_gtc_zero_fill_retries_only_after_finalized_cancel_boundary(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "0",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "authoritative_no_fill": True,
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 10,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING_CONFIRMED_ZERO_FILL",
+            "reason": "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE",
+        }
+    ]
+    assert store.liquidity_retry_evidence(source) is not None
+
+
+def test_partial_gtc_stays_reserved_and_cannot_retry_before_active_cancel(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "quantity": D("5"),
+        "notional_usd": D("2"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "4" * 64}],
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 1,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_CANCEL_OR_FILL",
+        }
+    ]
+    with store.connect() as connection:
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    assert int(reservation["active"]) == 1
+    assert store.liquidity_retry_evidence(source) is None
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+
+
+def test_partial_gtc_retries_exact_remainder_only_after_post_cancel_finality(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "5",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "quantity": D("5"),
+        "notional_usd": D("2"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "5" * 64}],
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 10,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PARTIAL_PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_PARTIAL_FILL",
+        }
+    ]
+    evidence = store.liquidity_retry_evidence(source)
+    assert evidence is not None
+    assert evidence["cumulative_official_filled_quantity"] == "5"
+    execution.prepared["order_id"] = "0x" + "8" * 64
+    execution.prepared["order_type"] = "FAK"
+    execution.response = {
+        "success": True,
+        "orderID": execution.prepared["order_id"],
+    }
+
+    assert _retry_through_execution(store=store, execution=execution) == [
+        {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""}
+    ]
+    assert execution.prepare_calls[-1]["size"] == D("5")
+
+
+def test_legacy_gtc_zero_fill_without_post_cancel_proof_is_not_retryable(
+    tmp_path: Path,
+):
+    store, source, _execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    store.release_reservation_and_finalize(
+        source=source,
+        terminal_status="PENDING_CONFIRMED_ZERO_FILL",
+        reason="GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE",
+        created_at_ms=2,
+        details={
+            "order_id": attempt["order_id"],
+            "attempt_id": attempt["attempt_id"],
+            "chain_scan": {
+                "from_block": source.block_number,
+                "to_block": source.block_number + 10,
+                "order_filled_log_count": 0,
+                "finality": "polygon_finalized_block",
+            },
+        },
+        attempt_id=attempt["attempt_id"],
+        attempt_state="NO_FILL",
+        attempt_response={"result": "legacy_zero_fill"},
+    )
+
+    assert store.liquidity_retry_evidence(source) is None
+
+
+def test_canceled_gtc_without_finalized_order_hash_proof_keeps_reservation(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "0",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: None
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF",
+        }
+    ]
+    with store.connect() as connection:
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    assert int(reservation["active"]) == 1
 
 
 def test_liquidity_retry_v2_is_prospective_has_no_deadline_and_preserves_v1(
