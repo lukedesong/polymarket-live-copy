@@ -12304,8 +12304,31 @@ def cancel_due_active_gtd_orders(
             active_cancel_due_at_ms = int(str(raw_due_at_ms))
         except (TypeError, ValueError):
             raise LiveConfigurationError("ACTIVE_CANCEL_DUE_AT_MS_MISSING")
-        if active_cancel_due_at_ms > int(due_at_ms):
-            continue
+        deadline_elapsed = active_cancel_due_at_ms <= int(due_at_ms)
+        partial_matched_quantity: Decimal | None = None
+        if not deadline_elapsed:
+            get_order = getattr(execution, "get_order", None)
+            if not callable(get_order):
+                continue
+            try:
+                plan = details.get("plan")
+                if not isinstance(plan, Mapping):
+                    continue
+                expected_quantity = Decimal(
+                    str(plan.get("requested_quantity", "0"))
+                )
+                observed_order = get_order(order_id)
+                if not isinstance(observed_order, Mapping):
+                    continue
+                matched_quantity, _encoding = _matched_shares(
+                    dict(observed_order),
+                    expected_quantity=expected_quantity,
+                )
+            except (InvalidOperation, RuntimeError, TypeError, ValueError):
+                continue
+            if not (ZERO < matched_quantity < expected_quantity):
+                continue
+            partial_matched_quantity = matched_quantity
         if not callable(cancel):
             raise LiveConfigurationError("ACTIVE_CANCEL_EXECUTION_UNAVAILABLE")
         cancellation = cancel(order_id)
@@ -12318,6 +12341,15 @@ def cancel_due_active_gtd_orders(
             ),
             "active_cancel_verified": True,
         }
+        if partial_matched_quantity is not None:
+            updated_response.update(
+                {
+                    "active_cancel_trigger": "PARTIAL_FILL_DETECTED",
+                    "active_cancel_trigger_matched_quantity": str(
+                        partial_matched_quantity
+                    ),
+                }
+            )
         store.update_attempt_state(
             attempt_id=str(details.get("attempt_id") or ""),
             state="SUBMITTED_UNRECONCILED",
@@ -12327,12 +12359,21 @@ def cancel_due_active_gtd_orders(
         store.append_transition(
             source=source,
             status="ACTIVE_CANCEL_COMPLETED",
-            reason="GTC_ACTIVE_CANCEL_WINDOW_ELAPSED",
+            reason=(
+                "GTC_ACTIVE_CANCEL_PARTIAL_FILL_DETECTED"
+                if partial_matched_quantity is not None
+                else "GTC_ACTIVE_CANCEL_WINDOW_ELAPSED"
+            ),
             created_at_ms=int(due_at_ms),
             details={
                 "attempt_id": str(details.get("attempt_id") or ""),
                 "order_id": order_id,
                 "active_cancel_due_at_ms": active_cancel_due_at_ms,
+                "active_cancel_trigger_matched_quantity": (
+                    str(partial_matched_quantity)
+                    if partial_matched_quantity is not None
+                    else ""
+                ),
             },
         )
         results.append({"order_id": order_id, "terminal_status": "CANCELED"})

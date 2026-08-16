@@ -7920,6 +7920,111 @@ def test_due_active_cancel_is_run_after_nonblocking_submission():
     assert store.transitions[0]["status"] == "ACTIVE_CANCEL_COMPLETED"
 
 
+def test_partial_gtc_is_canceled_before_the_active_cancel_deadline():
+    source = action(marker="partial")
+
+    class PartialStore:
+        def __init__(self):
+            self.updated = []
+            self.transitions = []
+
+        def unreconciled_submissions(self):
+            return [
+                (
+                    source,
+                    {
+                        "attempt_id": "attempt-partial",
+                        "order_id": "order-partial",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "plan": {"requested_quantity": "10"},
+                        "response": {"active_cancel_due_at_ms": 1_000},
+                    },
+                )
+            ]
+
+        def update_attempt_state(self, **kwargs):
+            self.updated.append(kwargs)
+
+        def append_transition(self, **kwargs):
+            self.transitions.append(kwargs)
+
+    class Execution:
+        def __init__(self):
+            self.cancelled = []
+
+        @staticmethod
+        def get_order(order_id):
+            assert order_id == "order-partial"
+            return {
+                "status": "MATCHED",
+                "size_matched": "2",
+                "original_size": "10",
+            }
+
+        def cancel_active_gtd_order(self, order_id):
+            self.cancelled.append(order_id)
+            return {
+                "active_cancel_verified": True,
+                "active_cancel_observed_head_block": 101,
+            }
+
+    store = PartialStore()
+    execution = Execution()
+
+    result = live.cancel_due_active_gtd_orders(
+        store=store, execution=execution, due_at_ms=100
+    )
+
+    assert result == [{"order_id": "order-partial", "terminal_status": "CANCELED"}]
+    assert execution.cancelled == ["order-partial"]
+    assert store.updated[0]["response"]["active_cancel_trigger"] == (
+        "PARTIAL_FILL_DETECTED"
+    )
+    assert store.updated[0]["response"][
+        "active_cancel_trigger_matched_quantity"
+    ] == "2"
+    assert store.transitions[0]["reason"] == (
+        "GTC_ACTIVE_CANCEL_PARTIAL_FILL_DETECTED"
+    )
+
+
+def test_zero_or_full_gtc_is_not_canceled_before_the_active_cancel_deadline():
+    source = action(marker="not-partial")
+
+    class Store:
+        def unreconciled_submissions(self):
+            return [
+                (
+                    source,
+                    {
+                        "attempt_id": "attempt-not-partial",
+                        "order_id": "order-not-partial",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "plan": {"requested_quantity": "10"},
+                        "response": {"active_cancel_due_at_ms": 1_000},
+                    },
+                )
+            ]
+
+    for matched_quantity in ("0", "10"):
+        class Execution:
+            @staticmethod
+            def get_order(_order_id):
+                return {
+                    "status": "MATCHED",
+                    "size_matched": matched_quantity,
+                    "original_size": "10",
+                }
+
+            @staticmethod
+            def cancel_active_gtd_order(_order_id):
+                raise AssertionError("zero/full fill must not cancel early")
+
+        assert live.cancel_due_active_gtd_orders(
+            store=Store(), execution=Execution(), due_at_ms=100
+        ) == []
+
+
 def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
     from eth_abi import encode
 
