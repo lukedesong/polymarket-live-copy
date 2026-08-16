@@ -8025,6 +8025,43 @@ def test_zero_or_full_gtc_is_not_canceled_before_the_active_cancel_deadline():
         ) == []
 
 
+def test_sell_gtc_is_not_canceled_before_the_active_cancel_deadline():
+    source = action(side="SELL", marker="sell-not-partial")
+
+    class Store:
+        @staticmethod
+        def unreconciled_submissions():
+            return [
+                (
+                    source,
+                    {
+                        "attempt_id": "attempt-sell",
+                        "order_id": "order-sell",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "plan": {"requested_quantity": "10"},
+                        "response": {"active_cancel_due_at_ms": 1_000},
+                    },
+                )
+            ]
+
+    class Execution:
+        @staticmethod
+        def get_order(_order_id):
+            return {
+                "status": "MATCHED",
+                "size_matched": "2",
+                "original_size": "10",
+            }
+
+        @staticmethod
+        def cancel_active_gtd_order(_order_id):
+            raise AssertionError("SELL must not use the BUY early-cancel trigger")
+
+    assert live.cancel_due_active_gtd_orders(
+        store=Store(), execution=Execution(), due_at_ms=100
+    ) == []
+
+
 def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
     from eth_abi import encode
 
@@ -11796,6 +11833,58 @@ def test_partial_gtc_retries_exact_remainder_only_after_post_cancel_finality(
         {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""}
     ]
     assert execution.prepare_calls[-1]["size"] == D("5")
+
+
+def test_partial_gtc_that_fills_during_cancel_finalizes_without_retry(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    order_id = execution.prepared["order_id"]
+    execution.orders[order_id] = {
+        "status": "MATCHED",
+        "size_matched": "2",
+        "original_size": "10",
+    }
+
+    def cancel_active_gtd_order(observed_order_id):
+        assert observed_order_id == order_id
+        return {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+
+    execution.cancel_active_gtd_order = cancel_active_gtd_order
+    assert live.cancel_due_active_gtd_orders(
+        store=store,
+        execution=execution,
+        due_at_ms=0,
+    ) == [{"order_id": order_id, "terminal_status": "CANCELED"}]
+
+    execution.orders[order_id] = {
+        "status": "CANCELED",
+        "size_matched": "10",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "quantity": D("10"),
+        "notional_usd": D("4"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "6" * 64}],
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 10,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
+    ]
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
 
 
 def test_legacy_gtc_zero_fill_without_post_cancel_proof_is_not_retryable(

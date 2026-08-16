@@ -12307,6 +12307,8 @@ def cancel_due_active_gtd_orders(
         deadline_elapsed = active_cancel_due_at_ms <= int(due_at_ms)
         partial_matched_quantity: Decimal | None = None
         if not deadline_elapsed:
+            if str(source.side).upper() != "BUY":
+                continue
             get_order = getattr(execution, "get_order", None)
             if not callable(get_order):
                 continue
