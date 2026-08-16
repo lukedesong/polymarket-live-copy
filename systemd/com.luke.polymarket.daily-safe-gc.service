@@ -1,0 +1,20 @@
+[Unit]
+Description=Polymarket daily receipt-proven release snapshot cleanup
+After=local-fs.target
+ConditionPathIsDirectory=/var/lib/polymarket-live-release-snapshots
+ConditionPathIsDirectory=/srv/polymarket-live/runtime/server_health
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/sbin/polymarket-daily-safe-gc --apply
+NoNewPrivileges=true
+PrivateTmp=false
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=full
+PrivateNetwork=true
+ReadWritePaths=/var/lib/polymarket-live-release-snapshots
+ReadWritePaths=/srv/polymarket-live/runtime/server_health

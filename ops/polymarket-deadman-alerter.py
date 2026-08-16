@@ -57,13 +57,49 @@ PROFILE_DISPLAY_NAMES = {
 }
 
 
+def _latest_audit_payload() -> dict | None:
+    """Read the current health authority once; callers fail closed on absence."""
+
+    try:
+        last = None
+        with AUDIT_JSONL.open("rb") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    last = line
+        if last is None:
+            return None
+        payload = json.loads(last)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def expected_active_units() -> tuple[str, ...]:
+    """Use the current health registry so an operator-paused sleeve is silent."""
+
+    payload = _latest_audit_payload()
+    profiles = payload.get("profiles") if payload else None
+    if not isinstance(profiles, dict):
+        return REQUIRED_UNITS
+    units = []
+    for row in profiles.values():
+        if not isinstance(row, dict) or row.get("paused") is True:
+            continue
+        for field in ("unit", "hot_standby_unit"):
+            unit = row.get(field)
+            if isinstance(unit, str) and unit in REQUIRED_UNITS and unit not in units:
+                units.append(unit)
+    return tuple(units) if units else REQUIRED_UNITS
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
 def check_units() -> list[str]:
     problems = []
-    for unit in REQUIRED_UNITS:
+    for unit in expected_active_units():
         try:
             out = subprocess.run(
                 ["systemctl", "is-active", unit],

@@ -116,7 +116,7 @@ def test_external_unfilled_warning_is_plain_chinese_and_explains_impact(
     assert "overall_state" not in warning
 
 
-def test_deadman_covers_all_running_profiles():
+def test_deadman_covers_all_registered_profiles_by_default():
     assert set(alerter.REQUIRED_UNITS) == {
         "com.luke.polymarket.cd90-live.service",
         "com.luke.polymarket.cd90-live-hot-standby.service",
@@ -125,6 +125,39 @@ def test_deadman_covers_all_running_profiles():
         "com.luke.polymarket.wallet-9506-live.service",
         "com.luke.polymarket.wallet-9506-live-hot-standby.service",
     }
+
+
+def test_user_paused_profile_is_not_treated_as_a_dead_executor(tmp_path, monkeypatch):
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text(
+        json.dumps(
+            {
+                "profiles": {
+                    "cd90": {
+                        "paused": True,
+                        "unit": "com.luke.polymarket.cd90-live.service",
+                        "hot_standby_unit": (
+                            "com.luke.polymarket.cd90-live-hot-standby.service"
+                        ),
+                    },
+                    "zockdo_full_wallet": {
+                        "paused": False,
+                        "unit": "com.luke.polymarket.zockdo-live.service",
+                        "hot_standby_unit": (
+                            "com.luke.polymarket.zockdo-live-hot-standby.service"
+                        ),
+                    },
+                }
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(alerter, "AUDIT_JSONL", audit_path)
+
+    assert alerter.expected_active_units() == (
+        "com.luke.polymarket.zockdo-live.service",
+        "com.luke.polymarket.zockdo-live-hot-standby.service",
+    )
 
 
 def test_live_unresolved_submission_warning_explains_exact_safety_state(

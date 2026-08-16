@@ -91,7 +91,21 @@ LIVE_REQUIRED_ENV = (
 )
 AUTO_REDEMPTION_ENV = "CD90_AUTO_REDEEM_ENABLED"
 IMMEDIATE_ORDER_TYPE = "GTC_ACTIVE_CANCEL"
-ACTIVE_CANCEL_WAIT_SECONDS = 30
+BUY_ACTIVE_CANCEL_WAIT_SECONDS = 60
+
+
+def _uses_active_cancel_limit(
+    *, side: str, prepare_gtd: Any, submit_prepared_gtd: Any
+) -> bool:
+    """Only BUY may rest; SELL must use immediate fill-and-cancel."""
+
+    return (
+        str(side).upper() == "BUY"
+        and callable(prepare_gtd)
+        and callable(submit_prepared_gtd)
+    )
+
+
 MINIMUM_SIZE_POLICY_UPSCALE_TO_MINIMUM = "UPSCALE_TO_CURRENT_MARKET_MINIMUM"
 MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM = "SKIP_BELOW_CURRENT_MARKET_MINIMUM"
 MINIMUM_SIZE_POLICIES = frozenset(
@@ -10614,10 +10628,16 @@ class CLOBExecutionAdapter:
     def submit_prepared_gtd_limit(
         self, prepared_order: Mapping[str, Any]
     ) -> Any:
-        """POST one GTC order, wait 30 seconds, then cancel its remainder."""
+        """POST one GTC order without blocking later source actions.
+
+        The durable action loop records the accepted order immediately.  A
+        later maintenance pass cancels the still-open remainder after the
+        configured active window, so the submission lock is never held while
+        waiting for liquidity.
+        """
 
         try:
-            from py_clob_client_v2.clob_types import OrderPayload, OrderType
+            from py_clob_client_v2.clob_types import OrderType
         except ImportError as exc:
             raise RuntimeError("CLOB_ORDER_TYPE_DEPENDENCY_UNAVAILABLE") from exc
         if str(prepared_order.get("order_type", "")).upper() != "GTC":
@@ -10641,7 +10661,18 @@ class CLOBExecutionAdapter:
         )
         if not order_id:
             raise RuntimeError("ACTIVE_CANCEL_RESPONSE_ORDER_ID_MISSING")
-        time.sleep(ACTIVE_CANCEL_WAIT_SECONDS)
+        return response
+
+    def cancel_active_gtd_order(self, order_id: str) -> dict[str, Any]:
+        """Cancel one previously accepted GTC order and prove it is not open."""
+
+        try:
+            from py_clob_client_v2.clob_types import OrderPayload
+        except ImportError as exc:
+            raise RuntimeError("CLOB_ORDER_TYPE_DEPENDENCY_UNAVAILABLE") from exc
+        normalized_order_id = str(order_id).strip().lower()
+        if not normalized_order_id:
+            raise RuntimeError("ACTIVE_CANCEL_ORDER_ID_MISSING")
         cancel_response = self.client.cancel_order(OrderPayload(orderID=order_id))
         still_open = any(
             str(
@@ -10650,19 +10681,16 @@ class CLOBExecutionAdapter:
                 or order.get("orderId")
                 or ""
             ).lower()
-            == order_id
+            == normalized_order_id
             for order in self.client.get_open_orders()
         )
         if still_open:
             raise RuntimeError("ACTIVE_CANCEL_ORDER_STILL_OPEN")
-        if isinstance(response, Mapping):
-            return {
-                **dict(response),
-                "active_cancel_response": cancel_response,
-                "active_cancel_verified": True,
-                "active_cancel_wait_seconds": ACTIVE_CANCEL_WAIT_SECONDS,
-            }
-        return response
+        return {
+            "active_cancel_response": cancel_response,
+            "active_cancel_verified": True,
+            "active_cancel_wait_seconds": BUY_ACTIVE_CANCEL_WAIT_SECONDS,
+        }
 
     def submit_prepared_fak_market(
         self, prepared_order: Mapping[str, Any]
@@ -12008,6 +12036,73 @@ def _reconcile_submissions_and_refresh_cash(
         return reconcile_locked()
 
 
+def cancel_due_active_gtd_orders(
+    *,
+    store: LiveStore,
+    execution: Any,
+    due_at_ms: int,
+) -> list[dict[str, Any]]:
+    """Cancel only GTC remainders whose already-recorded active window elapsed.
+
+    This is intentionally separate from source-action submission.  The GTC
+    order and its cancellation deadline are durable before this maintenance
+    pass runs, so a later block or restart can finish the cancellation without
+    holding the source-action submission path open.
+    """
+
+    cancel = getattr(execution, "cancel_active_gtd_order", None)
+    results: list[dict[str, Any]] = []
+    for source, details in store.unreconciled_submissions():
+        if str(details.get("execution_order_type") or "").upper() != (
+            "GTC_ACTIVE_CANCEL"
+        ):
+            continue
+        order_id = str(details.get("order_id") or "").strip()
+        response = details.get("response")
+        if not order_id or not isinstance(response, Mapping):
+            continue
+        if response.get("active_cancel_verified") is True:
+            continue
+        raw_due_at_ms = response.get("active_cancel_due_at_ms")
+        try:
+            active_cancel_due_at_ms = int(str(raw_due_at_ms))
+        except (TypeError, ValueError):
+            raise LiveConfigurationError("ACTIVE_CANCEL_DUE_AT_MS_MISSING")
+        if active_cancel_due_at_ms > int(due_at_ms):
+            continue
+        if not callable(cancel):
+            raise LiveConfigurationError("ACTIVE_CANCEL_EXECUTION_UNAVAILABLE")
+        cancellation = cancel(order_id)
+        updated_response = {
+            **dict(response),
+            **(
+                dict(cancellation)
+                if isinstance(cancellation, Mapping)
+                else {"active_cancel_response": cancellation}
+            ),
+            "active_cancel_verified": True,
+        }
+        store.update_attempt_state(
+            attempt_id=str(details.get("attempt_id") or ""),
+            state="SUBMITTED_UNRECONCILED",
+            response=updated_response,
+            updated_at_ms=int(due_at_ms),
+        )
+        store.append_transition(
+            source=source,
+            status="ACTIVE_CANCEL_COMPLETED",
+            reason="GTC_ACTIVE_CANCEL_WINDOW_ELAPSED",
+            created_at_ms=int(due_at_ms),
+            details={
+                "attempt_id": str(details.get("attempt_id") or ""),
+                "order_id": order_id,
+                "active_cancel_due_at_ms": active_cancel_due_at_ms,
+            },
+        )
+        results.append({"order_id": order_id, "terminal_status": "CANCELED"})
+    return results
+
+
 def execute_source_action(
     *,
     store: LiveStore,
@@ -13224,7 +13319,11 @@ def _execute_source_action_locked(
 
     prepare_gtd = getattr(execution, "prepare_gtd_limit", None)
     submit_prepared_gtd = getattr(execution, "submit_prepared_gtd_limit", None)
-    use_active_cancel_limit = callable(prepare_gtd) and callable(submit_prepared_gtd)
+    use_active_cancel_limit = _uses_active_cancel_limit(
+        side=source.side,
+        prepare_gtd=prepare_gtd,
+        submit_prepared_gtd=submit_prepared_gtd,
+    )
     plan_details = {
         **_plan_details(
             plan,
@@ -13486,6 +13585,14 @@ def _execute_source_action_locked(
         return {
             "terminal_status": "UNKNOWN_SUBMISSION",
             "reason": transport_reason,
+        }
+
+    if use_active_cancel_limit and isinstance(response, Mapping):
+        response = {
+            **dict(response),
+            "active_cancel_due_at_ms": (
+                int(started_at_ms) + BUY_ACTIVE_CANCEL_WAIT_SECONDS * 1000
+            ),
         }
 
     response_order_id = _submission_order_id(response)
@@ -16834,6 +16941,21 @@ def _process_live_ws_head(
         source_traceback = None
         current_intake_action_ids: set[str] = set()
         current_intake_token_ids: set[str] = set()
+        if has_new_processable_block:
+            cancellation_at_ms = now_ms()
+            if wallet_lock_path is None:
+                cancel_due_active_gtd_orders(
+                    store=store,
+                    execution=execution,
+                    due_at_ms=cancellation_at_ms,
+                )
+            else:
+                with _shared_wallet_submission_lock(wallet_lock_path):
+                    cancel_due_active_gtd_orders(
+                        store=store,
+                        execution=execution,
+                        due_at_ms=cancellation_at_ms,
+                    )
         try:
             source_cycle_result = follower.run_cycle_to_head(
                 head=processable_head,

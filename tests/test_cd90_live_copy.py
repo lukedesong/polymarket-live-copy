@@ -7797,7 +7797,7 @@ def test_clob_adapter_submits_a_fak_market_order_with_buy_amount_derived_from_ex
     assert str(submitted["order_type"]) == "FAK"
 
 
-def test_clob_adapter_actively_cancels_resting_order_after_30_seconds(monkeypatch):
+def test_clob_adapter_posts_multiple_active_cancel_orders_without_waiting(monkeypatch):
     client = FakeCLOBClient()
     adapter = CLOBExecutionAdapter(
         client, minimum_marketable_buy_notional_usd=D("1")
@@ -7820,14 +7820,92 @@ def test_clob_adapter_actively_cancels_resting_order_after_30_seconds(monkeypatc
     assert len(prepared["order_id"]) == 66
     assert prepared["order_fields"]["salt"] == "123"
     assert "signature" not in prepared["order_fields"]
-    response = adapter.submit_prepared_gtd_limit(prepared)
-    assert response["success"] is True
-    assert response["active_cancel_verified"] is True
-    assert waits == [30]
-    assert client.cancellations == [response["orderID"]]
+    adapter.snapshot(token_id="123", side="BUY")
+    second = adapter.prepare_gtd_limit(
+        token_id="123",
+        side="BUY",
+        price=D("0.40"),
+        size=D("10"),
+    )
+    first_response = adapter.submit_prepared_gtd_limit(prepared)
+    second_response = adapter.submit_prepared_gtd_limit(second)
+
+    assert first_response["success"] is True
+    assert second_response["success"] is True
+    assert waits == []
+    assert client.cancellations == []
+    assert len(client.created_orders) == 2
+    assert len(client.submissions) == 2
+
+    adapter.cancel_active_gtd_order(first_response["orderID"])
+    adapter.cancel_active_gtd_order(second_response["orderID"])
+    assert client.cancellations == [
+        first_response["orderID"],
+        second_response["orderID"],
+    ]
     assert client.get_open_orders() == []
-    assert len(client.created_orders) == 1
-    assert len(client.submissions) == 1
+
+
+def test_due_active_cancel_is_run_after_nonblocking_submission():
+    first = action(marker="a")
+    second = action(marker="b")
+
+    class DueStore:
+        def __init__(self):
+            self.updated = []
+            self.transitions = []
+
+        def unreconciled_submissions(self):
+            return [
+                (
+                    first,
+                    {
+                        "attempt_id": "attempt-a",
+                        "order_id": "order-a",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "response": {"active_cancel_due_at_ms": 100},
+                    },
+                ),
+                (
+                    second,
+                    {
+                        "attempt_id": "attempt-b",
+                        "order_id": "order-b",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "response": {"active_cancel_due_at_ms": 101},
+                    },
+                ),
+            ]
+
+        def update_attempt_state(self, **kwargs):
+            self.updated.append(kwargs)
+
+        def append_transition(self, **kwargs):
+            self.transitions.append(kwargs)
+
+    class Execution:
+        def __init__(self):
+            self.cancelled = []
+
+        def cancel_active_gtd_order(self, order_id):
+            self.cancelled.append(order_id)
+            return {"active_cancel_verified": True}
+
+    store = DueStore()
+    execution = Execution()
+
+    result = live.cancel_due_active_gtd_orders(
+        store=store, execution=execution, due_at_ms=100
+    )
+
+    assert result == [{"order_id": "order-a", "terminal_status": "CANCELED"}]
+    assert execution.cancelled == ["order-a"]
+    assert store.updated[0]["attempt_id"] == "attempt-a"
+    assert store.updated[0]["response"] == {
+        "active_cancel_due_at_ms": 100,
+        "active_cancel_verified": True,
+    }
+    assert store.transitions[0]["status"] == "ACTIVE_CANCEL_COMPLETED"
 
 
 def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
@@ -12029,3 +12107,20 @@ def test_liquidity_retry_status_counts_gtd_replacement_termination(
     assert summary["termination_counts"] == {
         "GTD_POLICY_REPLACED_LIQUIDITY_RETRY": 1
     }
+
+
+def test_buy_uses_60_second_active_cancel_but_sell_uses_immediate_fak():
+    prepare_gtd = lambda **_kwargs: None
+    submit_gtd = lambda _prepared: None
+
+    assert live.BUY_ACTIVE_CANCEL_WAIT_SECONDS == 60
+    assert live._uses_active_cancel_limit(
+        side="BUY",
+        prepare_gtd=prepare_gtd,
+        submit_prepared_gtd=submit_gtd,
+    ) is True
+    assert live._uses_active_cancel_limit(
+        side="SELL",
+        prepare_gtd=prepare_gtd,
+        submit_prepared_gtd=submit_gtd,
+    ) is False

@@ -1,32 +1,33 @@
 {
-  "change_id": "version-authority-private-timeline-v3.10-20260815",
-  "committed_at_utc": "2026-08-15T12:55:14Z",
-  "previous_release": "/opt/polymarket-live/releases/20260815T123908Z-gtc-active-cancel-v3.9",
-  "release": "/opt/polymarket-live/releases/20260815T130000Z-version-authority-private-timeline-v3.10",
+  "change_id": "buy60-sell-fak-v3.14-20260816T073058Z",
+  "committed_at_utc": "2026-08-16T07:38:21.199756Z",
+  "coverage_commit": "c15802e9c8bd5118bbdfc945956154aaf68030f080b987ade57cc96d81aee45e",
+  "previous_release": "/opt/polymarket-live/releases/20260815T201200Z-active-cancel-nonblocking-v3.13",
+  "release": "/opt/polymarket-live/releases/20260816T073058Z-buy60-sell-fak-v3.14",
   "result": "VERIFIED_FIXED",
   "safety": {
-    "executor_restart_performed": false,
+    "executor_restart_performed": true,
     "historical_replay_performed": false,
     "live_ledger_rewritten": false,
     "manual_order_submitted": false,
     "unknown_submission_reposted": false
   },
-  "scope": "Allow the canonical version verifier to read the private repair timeline through fixed non-interactive sudo without widening runtime-directory permissions. No trading runtime, policy, service, or ledger change.",
-  "semantic_repair_version": "3.10",
+  "scope": "BUY source actions use nonblocking GTC active-cancel with a user-specified 60-second window. SELL source actions bypass the resting window and use immediate FAK with existing price, inventory, reconciliation, and retry protections.",
+  "semantic_repair_version": "3.14",
   "sha256": {
-    "MANIFEST.sha256": "eff6321a53c79dd28f2110783344615be76c85c00f5f24e47b00b49d1f7c9b8f",
-    "verify_repair_version_authority.py": "d9e2355bfd2f29fdb8faabfed9f6754be2c1218092f63bd94544f605994fa384"
+    "MANIFEST.sha256": "3099a8ea9666c8da302f6eab58096cb8d3505467d892826576f3d2a6bfdf6b41",
+    "app/cd90_live_copy.py": "c15802e9c8bd5118bbdfc945956154aaf68030f080b987ade57cc96d81aee45e",
+    "tools/live_release_transaction.py": "b9e2ab2534ac1e9679a88388c968520a9d0251f5eed565aea8a9e0988a9a43d0"
   },
   "verification": {
     "active_executor_services": 4,
     "active_executor_services_expected": 4,
-    "canonical_nonroot_verifier_passed_before_cutover": true,
+    "candidate_static_compile_passed": true,
     "cd90_user_paused": true,
-    "live_sqlite_integrity_passed": 4,
-    "live_sqlite_integrity_total": 4,
-    "runtime_asset_groups_identical": 3,
-    "runtime_asset_groups_total": 3,
-    "targeted_tests_passed": 2,
-    "targeted_tests_total": 2
+    "copy_and_release_tests_passed": 319,
+    "official_authenticated_open_orders": 0,
+    "real_order_submissions": 0,
+    "sell_resting_window_seconds": 0,
+    "buy_active_cancel_window_seconds": 60
   }
 }

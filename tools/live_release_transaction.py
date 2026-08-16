@@ -6053,6 +6053,10 @@ exec /usr/bin/setpriv --reuid=polymarket-live --regid=polymarket-live --clear-gr
                 "key": spec.key,
                 "database": f"{spec.key}.sqlite3",
                 "change_env": f"CHANGE_ID_{spec.key.upper()}",
+                # A user-paused profile must stay paused through an unrelated
+                # core release.  Its ledger is still staged and verified, but
+                # it must not receive a forward-resume marker.
+                "resume": self._profile_original_mode(spec) == "ACTIVE",
             }
             for spec in PROFILE_SPECS
         ]
@@ -6089,12 +6093,13 @@ for item in {profiles!r}:
         activated_at_ms=changed_at_ms,
         change_id=os.environ[item['change_env']],
     )
-    arm_pre_repair_forward_recovery(
-        store=store,
-        change_id=os.environ[item['change_env']],
-        reason='single-transaction-cutover-forward-recovery',
-        armed_at_ms=changed_at_ms,
-    )
+    if item['resume']:
+        arm_pre_repair_forward_recovery(
+            store=store,
+            change_id=os.environ[item['change_env']],
+            reason='single-transaction-cutover-forward-recovery',
+            armed_at_ms=changed_at_ms,
+        )
 print('OFFLINE_STAGE_COMPLETE')
 """
 
@@ -6119,6 +6124,10 @@ print('CANDIDATE_IMPORT_COMPLETE')
     def _verify_stage_resume(self) -> None:
         for spec in PROFILE_SPECS:
             database = self.migration_stage / f"{spec.key}.sqlite3"
+            if self._profile_original_mode(spec) != "ACTIVE":
+                # The profile was explicitly paused before this transaction;
+                # it is not a recovery candidate and must not be armed.
+                continue
             expected_change = f"{self.config.change_id}-{spec.change_suffix}"
             expected = {
                 "operator_planned_resume_change_id": expected_change,
@@ -6176,9 +6185,12 @@ print('CANDIDATE_IMPORT_COMPLETE')
                 raise ContractViolation(
                     f"offline stage liquidity retry cursor invalid:{spec.key}"
                 ) from exc
-            if liquidity_retry_boundary_int != cursor_int:
+            # The policy boundary is immutable.  A live cursor is expected to
+            # move forward after a prior release, so only a future boundary is
+            # invalid; requiring equality makes every later release fail.
+            if liquidity_retry_boundary_int > cursor_int:
                 raise ContractViolation(
-                    f"offline stage liquidity retry cursor mismatch:{spec.key}"
+                    f"offline stage liquidity retry cursor ahead:{spec.key}"
                 )
 
     def _install_and_verify_candidate(self) -> None:
@@ -6657,7 +6669,9 @@ print('CANDIDATE_IMPORT_COMPLETE')
             spec, label="candidate"
         )
         database = self._live_database(spec)
-        expected_change = f"{self.config.change_id}-{spec.change_suffix}"
+        baseline = self.baselines.get(spec.key)
+        if not isinstance(baseline, Mapping):
+            raise ContractViolation(f"paused runtime baseline missing:{spec.key}")
         runtime = self._runtime_snapshot(
             database,
             (
@@ -6679,12 +6693,18 @@ print('CANDIDATE_IMPORT_COMPLETE')
                 f"runtime value is not integer:last_processed_block:"
                 f"{runtime['last_processed_block']}"
             ) from exc
-        if resume_change != expected_change:
-            raise ContractViolation(f"paused candidate resume change mismatch:{spec.key}")
-        if resume_state != "PENDING" or resume_armed != "true":
-            raise ContractViolation(f"paused candidate resume state is unsafe:{spec.key}")
-        if resume_from != str(cursor):
-            raise ContractViolation(f"paused candidate resume cursor mismatch:{spec.key}")
+        if cursor < int(baseline["last_processed_block"]):
+            raise ContractViolation(f"paused candidate cursor regressed:{spec.key}")
+        for key, actual in (
+            ("operator_planned_resume_change_id", resume_change),
+            ("operator_planned_resume_state", resume_state),
+            ("operator_planned_resume_from_block", resume_from),
+            ("operator_pre_repair_forward_recovery_armed", resume_armed),
+        ):
+            if actual != str(baseline.get(key) or ""):
+                raise ContractViolation(
+                    f"paused candidate resume evidence drift:{spec.key}:{key}"
+                )
         return {
             "mode": "PAUSED",
             "paused": True,
@@ -6692,8 +6712,8 @@ print('CANDIDATE_IMPORT_COMPLETE')
             "cursor": cursor,
             "resume_change_id": resume_change,
             "resume_state": resume_state,
-            "resume_from_block": int(resume_from),
-            "resume_armed": True,
+            "resume_from_block": resume_from,
+            "resume_armed": resume_armed == "true",
         }
 
     def _verify_candidate_acceptance_once(

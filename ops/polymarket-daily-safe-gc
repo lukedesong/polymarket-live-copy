@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Safely remove only receipt-proven successful Polymarket release snapshots."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, ContextManager
+
+
+SNAPSHOT_ROOT = Path("/var/lib/polymarket-live-release-snapshots")
+RECEIPT_DIR = Path("/srv/polymarket-live/runtime/server_health")
+TMPFILES_COMMAND = ("/usr/bin/systemd-tmpfiles", "--clean")
+RELEASE_TRANSACTION_LOCK = Path("/run/lock/polymarket-live-release.lock")
+
+
+class CleanupError(RuntimeError):
+    """Raised when a deletion target does not satisfy the safety contract."""
+
+
+@dataclass(frozen=True)
+class CleanupItem:
+    snapshot: Path
+    stage: Path | None
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    exit_code: int
+    plan: list[CleanupItem]
+    receipt_path: Path | None
+    planned_snapshot_count: int
+
+
+def lstat_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def require_non_symlink_directory(path: Path) -> Path:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as error:
+        raise CleanupError(f"missing required directory: {path}") from error
+    if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+        raise CleanupError(f"unsafe required directory: {path}")
+    return path
+
+
+def is_direct_non_symlink_directory(path: Path, root: Path) -> bool:
+    if path.parent != root:
+        return False
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
+
+
+def eligible_snapshot(path: Path, root: Path) -> bool:
+    return (
+        is_direct_non_symlink_directory(path, root)
+        and is_regular_file(path / "COMMITTED.json")
+        and is_regular_file(path / "ACCEPTED.json")
+        and not lstat_exists(path / "FAILED.json")
+    )
+
+
+def build_cleanup_plan(snapshot_root: Path) -> list[CleanupItem]:
+    root = require_non_symlink_directory(snapshot_root)
+    plan: list[CleanupItem] = []
+    with os.scandir(root) as entries:
+        for entry in sorted(entries, key=lambda item: item.name):
+            candidate = root / entry.name
+            if not entry.is_dir(follow_symlinks=False) or not eligible_snapshot(candidate, root):
+                continue
+            stage = root / f"{entry.name}.migration-stage"
+            if lstat_exists(stage) and not is_direct_non_symlink_directory(stage, root):
+                raise CleanupError(f"unsafe stage path: {stage}")
+            plan.append(CleanupItem(snapshot=candidate, stage=stage if lstat_exists(stage) else None))
+    return plan
+
+
+def walk_entries(path: Path):
+    yield path, path.lstat()
+    with os.scandir(path) as entries:
+        for entry in entries:
+            child = Path(entry.path)
+            child_stat = child.lstat()
+            yield child, child_stat
+            if stat.S_ISDIR(child_stat.st_mode):
+                yield from walk_entries(child)
+
+
+def validate_tree_device(path: Path, expected_device: int) -> None:
+    for candidate, candidate_stat in walk_entries(path):
+        if stat.S_ISDIR(candidate_stat.st_mode) and candidate_stat.st_dev != expected_device:
+            raise CleanupError(f"cross-device directory refused: {candidate}")
+
+
+def tree_size_bytes(path: Path) -> int:
+    return sum(candidate_stat.st_size for _, candidate_stat in walk_entries(path))
+
+
+def unlink_tree_without_following_links(path: Path) -> None:
+    current_stat = path.lstat()
+    if not stat.S_ISDIR(current_stat.st_mode):
+        os.unlink(path)
+        return
+    with os.scandir(path) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        child = path / name
+        child_stat = child.lstat()
+        if stat.S_ISDIR(child_stat.st_mode):
+            unlink_tree_without_following_links(child)
+        else:
+            os.unlink(child)
+    os.rmdir(path)
+
+
+def delete_validated_tree(path: Path, root: Path) -> int:
+    if not is_direct_non_symlink_directory(path, root):
+        raise CleanupError(f"unsafe delete path: {path}")
+    device = path.lstat().st_dev
+    validate_tree_device(path, device)
+    deleted_bytes = tree_size_bytes(path)
+    unlink_tree_without_following_links(path)
+    return deleted_bytes
+
+
+def run_tmpfiles() -> CommandResult:
+    completed = subprocess.run(
+        TMPFILES_COMMAND,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return CommandResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+@contextmanager
+def hold_release_transaction_lock():
+    """Join the production release transaction's exclusive lock without waiting."""
+    handle = None
+    locked = False
+    try:
+        RELEASE_TRANSACTION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            RELEASE_TRANSACTION_LOCK,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        handle = os.fdopen(descriptor, "a+")
+        lock_stat = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600
+        ):
+            raise CleanupError(f"unsafe release transaction lock: {RELEASE_TRANSACTION_LOCK}")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CleanupError("release transaction lock is held") from error
+        locked = True
+        yield
+    except OSError as error:
+        raise CleanupError(f"unable to acquire release transaction lock: {error}") from error
+    finally:
+        if handle is not None:
+            if locked:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+def timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def write_receipt(receipt_dir: Path, payload: dict) -> Path:
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    name = f"daily_safe_gc-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{os.getpid()}.json"
+    destination = receipt_dir / name
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=receipt_dir,
+        prefix=".daily_safe_gc-",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        json.dump(payload, stream, sort_keys=True)
+        stream.write("\n")
+        temporary = Path(stream.name)
+    os.replace(temporary, destination)
+    return destination
+
+
+DeleteTree = Callable[[Path, Path], int]
+TmpfilesRunner = Callable[[], CommandResult]
+ReleaseLock = Callable[[], ContextManager[None]]
+
+
+def run_cleanup(
+    snapshot_root: Path,
+    receipt_dir: Path,
+    apply: bool,
+    delete_tree: DeleteTree = delete_validated_tree,
+    release_lock: ReleaseLock = hold_release_transaction_lock,
+    tmpfiles_runner: TmpfilesRunner = run_tmpfiles,
+) -> CleanupResult:
+    if not apply:
+        plan = build_cleanup_plan(snapshot_root)
+        return CleanupResult(
+            exit_code=0,
+            plan=plan,
+            receipt_path=None,
+            planned_snapshot_count=len(plan),
+        )
+
+    started_at = timestamp()
+    plan: list[CleanupItem] = []
+    operations: list[dict] = []
+    deleted_bytes = 0
+    deleted_snapshot_count = 0
+    tmpfiles_payload: dict | None = None
+    status = "success"
+    error_text: str | None = None
+
+    try:
+        with release_lock():
+            plan = build_cleanup_plan(snapshot_root)
+            for item in plan:
+                if not eligible_snapshot(item.snapshot, snapshot_root):
+                    raise CleanupError(f"snapshot is no longer eligible: {item.snapshot}")
+                if item.stage is not None:
+                    if not is_direct_non_symlink_directory(item.stage, snapshot_root):
+                        raise CleanupError(f"unsafe stage path: {item.stage}")
+                    stage_bytes = delete_tree(item.stage, snapshot_root)
+                    deleted_bytes += stage_bytes
+                    operations.append(
+                        {"kind": "migration_stage", "path": str(item.stage), "deleted_bytes": stage_bytes}
+                    )
+                if not eligible_snapshot(item.snapshot, snapshot_root):
+                    raise CleanupError(f"snapshot is no longer eligible: {item.snapshot}")
+                snapshot_bytes = delete_tree(item.snapshot, snapshot_root)
+                deleted_bytes += snapshot_bytes
+                deleted_snapshot_count += 1
+                operations.append(
+                    {"kind": "snapshot", "path": str(item.snapshot), "deleted_bytes": snapshot_bytes}
+                )
+
+            tmpfiles_result = tmpfiles_runner()
+            tmpfiles_payload = {
+                "returncode": tmpfiles_result.returncode,
+                "stdout": tmpfiles_result.stdout,
+                "stderr": tmpfiles_result.stderr,
+            }
+            if tmpfiles_result.returncode != 0:
+                raise CleanupError(f"systemd-tmpfiles failed with exit code {tmpfiles_result.returncode}")
+    except Exception as error:  # Receipt the exact failure; do not retry automatically.
+        status = "failure"
+        error_text = str(error)
+
+    payload = {
+        "started_at": started_at,
+        "finished_at": timestamp(),
+        "mode": "apply",
+        "status": status,
+        "planned": [
+            {
+                "snapshot": str(item.snapshot),
+                "migration_stage": str(item.stage) if item.stage is not None else None,
+            }
+            for item in plan
+        ],
+        "operations": operations,
+        "deleted_snapshot_count": deleted_snapshot_count,
+        "deleted_bytes": deleted_bytes,
+        "tmpfiles": tmpfiles_payload,
+        "error": error_text,
+    }
+    receipt_path = write_receipt(receipt_dir, payload)
+    return CleanupResult(
+        exit_code=0 if status == "success" else 1,
+        plan=plan,
+        receipt_path=receipt_path,
+        planned_snapshot_count=len(plan),
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="perform the validated cleanup")
+    mode.add_argument("--dry-run", action="store_true", help="list only; this is the default")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        result = run_cleanup(
+            snapshot_root=SNAPSHOT_ROOT,
+            receipt_dir=RECEIPT_DIR,
+            apply=args.apply,
+        )
+    except CleanupError as error:
+        print(json.dumps({"status": "failure", "error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "status": "success" if result.exit_code == 0 else "failure",
+                "mode": "apply" if args.apply else "dry-run",
+                "planned_snapshot_count": result.planned_snapshot_count,
+                "planned": [
+                    {
+                        "snapshot": str(item.snapshot),
+                        "migration_stage": str(item.stage) if item.stage is not None else None,
+                    }
+                    for item in result.plan
+                ],
+                "receipt_path": str(result.receipt_path) if result.receipt_path else None,
+            },
+            sort_keys=True,
+        )
+    )
+    return result.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

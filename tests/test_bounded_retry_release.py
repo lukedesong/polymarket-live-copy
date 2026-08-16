@@ -172,9 +172,40 @@ def test_offline_release_stage_maps_all_profiles_and_activates_at_cursor():
     source = release.Path(release.__file__).read_text(encoding="utf-8")
     assert '"database": f"{spec.key}.sqlite3"' in source
     assert "ensure_liquidity_retry_policy_at_current_cursor" in source
-    assert "offline stage liquidity retry cursor mismatch" in source
+    assert "offline stage liquidity retry cursor ahead" in source
     assert "ensure_bounded_retry_policy_at_current_cursor" in source
     assert "offline stage bounded retry cursor ahead" in source
+
+
+def test_offline_release_stage_does_not_arm_a_user_paused_profile(tmp_path):
+    transaction = release.ReleaseTransaction(
+        release.TransactionConfig(
+            new_release=tmp_path / "candidate",
+            expected_manifest_digest="0" * 64,
+            change_id="paused-profile-stage",
+            snapshot=tmp_path / "snapshot",
+            production=False,
+        )
+    )
+    cd90 = next(spec for spec in release.PROFILE_SPECS if spec.key == "cd90")
+    transaction.original_activity = {
+        unit: "active" for unit in release.EXECUTOR_UNITS
+    }
+    transaction.original_enablement = {
+        **{unit: "enabled" for unit in release.EXECUTOR_UNITS},
+        release.HEALTH_TIMER: "disabled",
+    }
+    for unit in (cd90.primary_unit, cd90.standby_unit):
+        transaction.original_activity[unit] = "inactive"
+        transaction.original_enablement[unit] = "disabled"
+
+    program = transaction._offline_migration_program()
+    source = release.Path(release.__file__).read_text(encoding="utf-8")
+
+    assert "if item['resume']:" in program
+    assert "'key': 'cd90', 'database': 'cd90.sqlite3', 'change_env': 'CHANGE_ID_CD90', 'resume': False" in program
+    assert "'resume': True" in program
+    assert "paused candidate resume evidence drift" in source
 
 
 def test_live_store_repairs_database_mode_without_replacing_ledger(tmp_path):
