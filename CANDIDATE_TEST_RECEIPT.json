@@ -1,0 +1,12 @@
+{
+  "candidate_commit": "c15802e9c8bd5118bbdfc945956154aaf68030f080b987ade57cc96d81aee45e",
+  "change_id": "buy60-sell-fak-v3.14-20260816T073058Z",
+  "created_at_utc": "2026-08-16T07:34:56Z",
+  "ledger_copy_rehearsal_exit_code": 0,
+  "real_order_submissions": 0,
+  "schema": "polymarket-candidate-test-receipt-v1",
+  "test_exit_code": 0,
+  "test_scope": "core copy and profile wrappers; BUY 60-second active cancel; SELL immediate FAK; latency and bounded retry",
+  "tested_manifest_payload_sha256": "cab7f3566254806d1da21a7c11ed9fad8d8f703c04c433f11ac5e52acefe8bbe",
+  "tests_passed": 319
+}

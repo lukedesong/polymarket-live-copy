@@ -1,0 +1,11 @@
+[Unit]
+Description=Polymarket hourly cash-live multi-wallet health audit
+
+[Timer]
+OnBootSec=0
+OnUnitActiveSec=1h
+Persistent=true
+Unit=com.luke.polymarket.live-health.service
+
+[Install]
+WantedBy=timers.target

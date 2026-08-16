@@ -1,0 +1,30 @@
+[Unit]
+Description=Polymarket cash-live multi-wallet invariant audit
+Wants=network-online.target
+After=network-online.target com.luke.polymarket.cd90-live.service com.luke.polymarket.zockdo-live.service com.luke.polymarket.wallet-9506-live.service com.luke.polymarket.cd90-live-hot-standby.service com.luke.polymarket.zockdo-live-hot-standby.service com.luke.polymarket.wallet-9506-live-hot-standby.service
+
+[Service]
+Type=oneshot
+User=polymarket-live
+Group=polymarket-live
+ExecStart=/usr/local/sbin/polymarket-server-health
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/polymarket-live/runtime/server_health
+# SQLite WAL readers update read marks in the existing -shm file even when
+# every database connection uses mode=ro.  Limit that exception to the active
+# registered ledger directories; the root-owned health code never opens them
+# in write mode.
+ReadWritePaths=/srv/polymarket-live/runtime/cd90_live
+ReadWritePaths=/srv/polymarket-live/runtime/zockdo_live
+ReadWritePaths=/srv/polymarket-live/runtime/wallet_9506_live
+ReadWritePaths=/srv/polymarket-live/runtime/shared_wallet
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateDevices=true

@@ -1,31 +1,5 @@
 .DS_Store
-**/__pycache__/
-**/.pytest_cache/
+._*
+__pycache__/
 *.py[cod]
-*.log
-*.pid
-*.lock
-*.egg-info/
-
-# Secrets and local runtime configuration
-.env
-.env.*
-!.env.example
-!.env.*.example
-
-# Generated research, runtime state, and local data
-.codex_tmp/
-outputs/
-sim/
-
-# Local dependency environments
-work/polymarket-api-py312-venv
-work/polymarket-api-js/node_modules/
-work/CloddsBot/node_modules/
-work/wallet_copy_paper/runtime/
-
-# New World Cup collector runtime data
-data/
-
-# Isolated feature workspaces
-.worktrees/
+.pytest_cache/

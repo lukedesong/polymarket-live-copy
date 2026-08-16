@@ -1,0 +1,38 @@
+[Unit]
+Description=Polymarket cash copier: CD90 fixed-scale sleeve
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/polymarket-live/cd90-live.env
+
+[Service]
+Type=simple
+User=polymarket-live
+Group=polymarket-live
+WorkingDirectory=/opt/polymarket-live/current/app
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYMARKET_SERVICE_MANAGER=systemd
+Environment=POLYMARKET_SHARED_WALLET_LOCK_PATH=/srv/polymarket-live/runtime/authenticated-wallet.lock
+Environment=POLYMARKET_SHARED_WALLET_COORDINATOR_PATH=/srv/polymarket-live/runtime/shared_wallet/coordinator.sqlite3
+EnvironmentFile=/etc/polymarket-live/cd90-live.env
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy POLYMARKET_PROXY_URL
+UMask=0077
+ExecStart=/opt/polymarket-live/venv/bin/python /opt/polymarket-live/current/app/cd90_live_copy.py --run --runtime-dir /srv/polymarket-live/runtime/cd90_live
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/polymarket-live/runtime/cd90_live /srv/polymarket-live/runtime/zockdo_live /srv/polymarket-live/runtime/wallet_9506_live /srv/polymarket-live/runtime/shared_wallet /srv/polymarket-live/runtime/authenticated-wallet.lock /srv/polymarket-live/runtime/cd90_live.lock
+# Every shared-wallet coordinator read traverses every registered SQLite WAL.
+# Keep each registered ledger directory writable for WAL read marks without
+# making the root lock namespace replaceable by the service account.
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
