@@ -34,6 +34,14 @@ DEFAULT_COORDINATOR_PATH = Path(
 CURRENT_VERSION_INDEX = Path("/opt/polymarket-live/CURRENT_REPAIR_VERSION.json")
 
 HEALTH_TIMER_UNIT = "com.luke.polymarket.live-health.timer"
+SUCCESS_CYCLE_OUTCOMES = frozenset(
+    {
+        "SUCCESS",
+        "SUCCESS_REDEMPTION_MAINTENANCE_PENDING",
+        "EXTERNAL_HEAD_RETRY_PENDING",
+        "EXTERNAL_WS_RECONNECTING",
+    }
+)
 
 
 def _as_text(value: Any) -> str:
@@ -425,12 +433,24 @@ def exact_external_redemption_cycle_retry(
 
 
 def profile_registry_issues(
-    *, expected_profiles: set[str], monitored_profiles: set[str]
+    *,
+    expected_profiles: set[str],
+    monitored_profiles: set[str],
+    residual_profiles: set[str] | None = None,
 ) -> list[str]:
-    """Require monitoring coverage to equal the coordinator sleeve registry."""
+    """Require live-copy monitoring to cover every non-residual coordinator sleeve.
 
+    A residual sleeve is shared-wallet leftover accounting, not a copy
+    executor. It may stay registered in the coordinator without a live-profile
+    or systemd unit after that wallet's follower is deleted.
+    """
+
+    residual_profiles = set(residual_profiles or ())
+    expected_for_coverage = expected_profiles - (
+        residual_profiles - monitored_profiles
+    )
     issues: list[str] = []
-    missing = sorted(expected_profiles - monitored_profiles)
+    missing = sorted(expected_for_coverage - monitored_profiles)
     extra = sorted(monitored_profiles - expected_profiles)
     if missing:
         issues.append("UNMONITORED_COORDINATOR_PROFILES:" + ",".join(missing))
@@ -666,6 +686,31 @@ def current_version_action_counts(
     return counts
 
 
+def recovered_internal_before_success(
+    *,
+    internal_event_count: int,
+    code_repair_event_count: int,
+    latest_internal_occurred_at_ms: int,
+    last_successful_cycle_at_ms: int,
+    last_cycle_outcome: str,
+) -> bool:
+    """True when a post-release internal error is already behind a later success.
+
+    Matches the closed-loop release pre-stop recovery rule: a latched internal
+    event must not keep the fleet INTERNAL after a later successful cycle,
+    unless it still carries CODE_REPAIR_REQUIRED.
+    """
+
+    return (
+        internal_event_count > 0
+        and code_repair_event_count == 0
+        and str(last_cycle_outcome or "").strip().upper() in SUCCESS_CYCLE_OUTCOMES
+        and 0 < int(latest_internal_occurred_at_ms or 0) < int(
+            last_successful_cycle_at_ms or 0
+        )
+    )
+
+
 def release_runtime_error_audit(
     path: Path,
     *,
@@ -674,22 +719,26 @@ def release_runtime_error_audit(
     """Latch every immutable runtime error written during this release session."""
 
     baseline = _as_int(release_started_at_ms)
+    empty = {
+        "state": "INVALID_BASELINE",
+        "release_started_at_ms": release_started_at_ms,
+        "event_count": 0,
+        "internal_event_count": 0,
+        "external_event_count": 0,
+        "code_repair_event_count": 0,
+        "latest_category": "",
+        "latest_internal_occurred_at_ms": 0,
+        "last_successful_cycle_at_ms": 0,
+        "last_cycle_outcome": "",
+        "category_counts": {},
+    }
     if baseline is None or baseline < 0:
-        return {
-            "state": "INVALID_BASELINE",
-            "release_started_at_ms": release_started_at_ms,
-            "event_count": 0,
-            "internal_event_count": 0,
-            "external_event_count": 0,
-            "code_repair_event_count": 0,
-            "latest_category": "",
-            "category_counts": {},
-        }
+        return empty
     try:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10) as connection:
             rows = connection.execute(
                 """
-                SELECT id, category, message, details_json
+                SELECT id, category, message, details_json, occurred_at_ms
                 FROM runtime_errors
                 WHERE occurred_at_ms >= ?
                 ORDER BY id
@@ -704,6 +753,18 @@ def release_runtime_error_audit(
                     (baseline,),
                 ).fetchall()
             }
+            try:
+                cycle_rows = {
+                    str(row[0]): str(row[1] or "")
+                    for row in connection.execute(
+                        "SELECT key, value FROM runtime_state "
+                        "WHERE key IN ("
+                        "'last_successful_cycle_at_ms','last_cycle_outcome'"
+                        ")"
+                    ).fetchall()
+                }
+            except sqlite3.Error:
+                cycle_rows = {}
     except sqlite3.Error as exc:
         return {
             "state": "READ_ERROR",
@@ -713,6 +774,9 @@ def release_runtime_error_audit(
             "external_event_count": 0,
             "code_repair_event_count": 0,
             "latest_category": "",
+            "latest_internal_occurred_at_ms": 0,
+            "last_successful_cycle_at_ms": 0,
+            "last_cycle_outcome": "",
             "category_counts": {},
             "detail": f"{type(exc).__name__}:{exc}",
         }
@@ -730,7 +794,8 @@ def release_runtime_error_audit(
     category_counts: dict[str, int] = {}
     code_repair_event_count = 0
     safety_gate_event_count = 0
-    for _row_id, category, message, details_json in rows:
+    latest_internal_occurred_at_ms = 0
+    for _row_id, category, message, details_json, occurred_at_ms in rows:
         normalized_category = str(category)
         category_counts[normalized_category] = (
             category_counts.get(normalized_category, 0) + 1
@@ -745,6 +810,10 @@ def release_runtime_error_audit(
             and str(message) == "BLOCK_ACTIVE_WALLET_RESERVATIONS"
         ):
             safety_gate_event_count += 1
+        if not normalized_category.upper().startswith("EXTERNAL_"):
+            occurred = _as_int(occurred_at_ms) or 0
+            if occurred > latest_internal_occurred_at_ms:
+                latest_internal_occurred_at_ms = occurred
     external = sum(
         count
         for category, count in category_counts.items()
@@ -752,6 +821,10 @@ def release_runtime_error_audit(
     )
     total = sum(category_counts.values())
     internal = total - external - safety_gate_event_count
+    last_successful_cycle_at_ms = _as_int(
+        cycle_rows.get("last_successful_cycle_at_ms")
+    ) or 0
+    last_cycle_outcome = str(cycle_rows.get("last_cycle_outcome") or "").upper()
     return {
         "state": "OK" if total == 0 else "ERRORS_OBSERVED",
         "release_started_at_ms": baseline,
@@ -761,6 +834,9 @@ def release_runtime_error_audit(
         "safety_gate_event_count": safety_gate_event_count,
         "code_repair_event_count": code_repair_event_count,
         "latest_category": "" if not rows else str(rows[-1][1]),
+        "latest_internal_occurred_at_ms": latest_internal_occurred_at_ms,
+        "last_successful_cycle_at_ms": last_successful_cycle_at_ms,
+        "last_cycle_outcome": last_cycle_outcome,
         "category_counts": category_counts,
     }
 
@@ -960,6 +1036,11 @@ def coordinator_health(
                 issues.append("COORDINATOR_CURRENT_RECEIPT_HASH_MISMATCH")
 
     registered = {str(row["profile_key"]) for row in sleeve_rows}
+    residual = {
+        str(row["profile_key"])
+        for row in sleeve_rows
+        if str(row["role"]) == "RESIDUAL"
+    }
     submission_lock_path = (
         None if contract_row is None else str(contract_row["submission_lock_path"])
     )
@@ -971,6 +1052,7 @@ def coordinator_health(
         profile_registry_issues(
             expected_profiles=registered,
             monitored_profiles=set(monitored_profiles),
+            residual_profiles=residual,
         )
     )
     for row in sleeve_rows:
@@ -1231,7 +1313,20 @@ def build_payload(
             issues.append(
                 f"{prefix}_RELEASE_ERROR_AUDIT_{error_audit['state']}"
             )
-        if not paused and error_audit["internal_event_count"]:
+        recovered_internal = recovered_internal_before_success(
+            internal_event_count=int(error_audit.get("internal_event_count") or 0),
+            code_repair_event_count=int(
+                error_audit.get("code_repair_event_count") or 0
+            ),
+            latest_internal_occurred_at_ms=int(
+                error_audit.get("latest_internal_occurred_at_ms") or 0
+            ),
+            last_successful_cycle_at_ms=int(
+                error_audit.get("last_successful_cycle_at_ms") or 0
+            ),
+            last_cycle_outcome=str(error_audit.get("last_cycle_outcome") or ""),
+        )
+        if not paused and error_audit["internal_event_count"] and not recovered_internal:
             issues.append(
                 f"{prefix}_POST_RELEASE_INTERNAL_ERROR_EVENTS:"
                 f"{error_audit['internal_event_count']}"
@@ -1306,6 +1401,23 @@ def build_payload(
             "external_limitations": external,
             "external_limitation_count": len(external),
             "release_runtime_error_audit": error_audit,
+            "recovered_internal_error_evidence": (
+                {
+                    "state": "RECOVERED_BEFORE_LAST_SUCCESSFUL_CYCLE",
+                    "event_count": int(error_audit.get("internal_event_count") or 0),
+                    "latest_occurred_at_ms": int(
+                        error_audit.get("latest_internal_occurred_at_ms") or 0
+                    ),
+                    "last_successful_cycle_at_ms": int(
+                        error_audit.get("last_successful_cycle_at_ms") or 0
+                    ),
+                    "current_outcome": str(
+                        error_audit.get("last_cycle_outcome") or ""
+                    ),
+                }
+                if recovered_internal
+                else None
+            ),
             "current_version_cutover_ms": version_cutover_ms,
             "current_version_action_counts": version_counts,
             "sqlite_integrity": _sqlite_integrity(ledger_path),

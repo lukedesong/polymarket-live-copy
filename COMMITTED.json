@@ -1,9 +1,9 @@
 {
-  "change_id": "dynamic-buy-depth-v3.15-20260816T114310Z",
-  "committed_at_utc": "2026-08-16T11:46:31.779538Z",
-  "coverage_commit": "93be8c695a2f5fa4f5c7404fa1771d23a96423a8899b7051fa29dc7335e32e77",
-  "previous_release": "/opt/polymarket-live/releases/20260816T073058Z-buy60-sell-fak-v3.14",
-  "release": "/opt/polymarket-live/releases/20260816T114310Z-dynamic-buy-depth-v3.15",
+  "change_id": "high-price-vwap-truncation-v3.21-20260817T052230Z",
+  "committed_at_utc": "2026-08-17T05:30:29.404905Z",
+  "coverage_commit": "bca3fe0156647e756db976c583009451a299ab3d6ce23003c61ccddda4f88207",
+  "previous_release": "/opt/polymarket-live/releases/20260816T210331Z-bark-human-briefing-v3.20",
+  "release": "/opt/polymarket-live/releases/20260817T052230Z-high-price-vwap-truncation-v3.21",
   "result": "VERIFIED_FIXED",
   "safety": {
     "executor_restart_performed": true,
@@ -12,23 +12,21 @@
     "manual_order_submitted": false,
     "unknown_submission_reposted": false
   },
-  "scope": "BUY source actions use full Ask depth to choose the marginal executable limit while retaining 60 percent of source upside; confirmed zero or partial fills retry only the exact remaining shares with cumulative official-fill price budgeting. BUY above 0.90 remains zero-price-loss only. SELL remains immediate FAK.",
-  "semantic_repair_version": "3.15",
+  "scope": "BUY 0.90 same-price follow tolerates on-chain 1e-6 VWAP truncation; genuine worse Ask still blocked. SELL unchanged.",
+  "semantic_repair_version": "3.21",
   "sha256": {
-    "MANIFEST.sha256": "15a211883ebdbc28012dc6fe1b3ff573581b40d97d5fc29bb8d4446ad1efb2c0",
-    "app/cd90_live_copy.py": "93be8c695a2f5fa4f5c7404fa1771d23a96423a8899b7051fa29dc7335e32e77",
-    "release_transaction_COMMITTED.json": "0118f6d9926a534b1af98b5c9e5302f4b3bd4989708193f379b1daa42ffd896d",
-    "tools/live_release_transaction.py": "b9e2ab2534ac1e9679a88388c968520a9d0251f5eed565aea8a9e0988a9a43d0"
+    "MANIFEST.sha256": "f2536d676a8c7a514320ae054e4225b1b3d3ab64e088adb9cb89727c56044ddf",
+    "app/cd90_live_copy.py": "bca3fe0156647e756db976c583009451a299ab3d6ce23003c61ccddda4f88207",
+    "release_transaction_COMMITTED.json": "0619452ec9a66a93a30651a508efb6afc6ef809c51a1bf9c116a03c17041cc08",
+    "tests/test_cd90_live_copy.py": "daaae1884e9fcdcaacb5a378053c96eaadb128e1b85f65d206621ba930c35b5b"
   },
   "verification": {
     "active_executor_services": 4,
     "active_executor_services_expected": 4,
-    "buy_active_cancel_window_seconds": 60,
     "candidate_static_compile_passed": true,
-    "cd90_user_paused": true,
-    "copy_and_release_tests_passed": 312,
+    "cd90_follower_retired": true,
+    "copy_and_release_tests_passed": 347,
     "official_authenticated_open_orders": 0,
-    "real_order_submissions": 0,
-    "sell_resting_window_seconds": 0
+    "real_order_submissions_during_verification": 0
   }
 }

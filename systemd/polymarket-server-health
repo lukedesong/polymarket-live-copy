@@ -9,6 +9,5 @@ exec /opt/polymarket-live/venv/bin/python \
   --runtime-dir /srv/polymarket-live/runtime/server_health \
   --cd90-runtime-dir /srv/polymarket-live/runtime/cd90_live \
   --coordinator-path /srv/polymarket-live/runtime/shared_wallet/coordinator.sqlite3 \
-  --live-profile cd90=com.luke.polymarket.cd90-live.service=/srv/polymarket-live/runtime/cd90_live=com.luke.polymarket.cd90-live-hot-standby.service \
   --live-profile zockdo_full_wallet=com.luke.polymarket.zockdo-live.service=/srv/polymarket-live/runtime/zockdo_live=com.luke.polymarket.zockdo-live-hot-standby.service \
   --live-profile wallet_9506_full_wallet=com.luke.polymarket.wallet-9506-live.service=/srv/polymarket-live/runtime/wallet_9506_live=com.luke.polymarket.wallet-9506-live-hot-standby.service

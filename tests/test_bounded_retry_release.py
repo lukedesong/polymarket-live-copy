@@ -8,13 +8,21 @@ import stat
 from cd90_live_copy import LiveStore, SourceAction
 
 
-def test_release_controller_registers_all_three_profile_executor_pairs():
+def test_release_controller_registers_copy_executors_and_residual_ledger():
     assert release.PROFILE_KEYS == (
         "cd90",
         "zockdo_full_wallet",
         "wallet_9506_full_wallet",
     )
-    assert len(release.EXECUTOR_UNITS) == 6
+    assert len(release.EXECUTOR_UNITS) == 4
+    assert release.RETIRED_CD90_PRIMARY_UNIT not in release.EXECUTOR_UNITS
+    assert release.RETIRED_CD90_STANDBY_UNIT not in release.EXECUTOR_UNITS
+    cd90 = next(spec for spec in release.PROFILE_SPECS if spec.key == "cd90")
+    assert cd90.has_executor is False
+    assert {spec.key for spec in release.executor_specs()} == {
+        "zockdo_full_wallet",
+        "wallet_9506_full_wallet",
+    }
     assert release.EXPECTED_SLEEVE_ROLES == {
         "cd90": "RESIDUAL",
         "zockdo_full_wallet": "RESERVED",
@@ -25,37 +33,72 @@ def test_release_controller_registers_all_three_profile_executor_pairs():
         "systemd/com.luke.polymarket.deadman-alerter.service"
         in release.REQUIRED_ASSETS
     )
+    assert "systemd/com.luke.polymarket.cd90-live.service" not in release.REQUIRED_ASSETS
 
 
-def test_release_controller_preserves_a_fully_paused_cd90_profile(tmp_path):
-    """A deliberate CD90 pause must not be mistaken for a missing executor."""
+def test_pre_stop_health_strips_retired_cd90_from_n_minus_one_payload():
+    payload = {
+        "overall_state": "INTERNAL_DEGRADED",
+        "profiles": {
+            "cd90": {"paused": True, "status_issues": ["CD90_HOT_STANDBY_INACTIVE"]},
+            "zockdo_full_wallet": {"paused": False, "status_issues": []},
+            "wallet_9506_full_wallet": {"paused": False, "status_issues": []},
+        },
+        "services": [
+            {"unit": release.RETIRED_CD90_PRIMARY_UNIT, "ActiveState": "inactive"},
+            {"unit": release.RETIRED_CD90_STANDBY_UNIT, "ActiveState": "inactive"},
+            {"unit": release.EXECUTOR_UNITS[0], "ActiveState": "active"},
+            {"unit": release.EXECUTOR_UNITS[1], "ActiveState": "active"},
+            {"unit": release.EXECUTOR_UNITS[2], "ActiveState": "active"},
+            {"unit": release.EXECUTOR_UNITS[3], "ActiveState": "active"},
+        ],
+        "paused_profiles": ["cd90"],
+        "service_paused_units": [
+            release.RETIRED_CD90_PRIMARY_UNIT,
+            release.RETIRED_CD90_STANDBY_UNIT,
+        ],
+        "service_inactive_units": [release.RETIRED_CD90_PRIMARY_UNIT],
+        "failed_polymarket_units": [release.RETIRED_CD90_STANDBY_UNIT],
+        "failed_polymarket_unit_count": 1,
+        "monitored_profile_count": 3,
+        "service_expected_count": 6,
+    }
+
+    stripped = release.strip_retired_profiles_from_health_payload(payload)
+
+    assert set(stripped["profiles"]) == {
+        "zockdo_full_wallet",
+        "wallet_9506_full_wallet",
+    }
+    assert {item["unit"] for item in stripped["services"]} == set(release.EXECUTOR_UNITS)
+    assert stripped["paused_profiles"] == []
+    assert stripped["service_paused_units"] == []
+    assert stripped["service_inactive_units"] == []
+    assert stripped["failed_polymarket_units"] == []
+    assert stripped["failed_polymarket_unit_count"] == 0
+    assert stripped["monitored_profile_count"] == 2
+    assert stripped["service_expected_count"] == 4
+    assert stripped["service_active_count"] == 4
+
+
+def test_release_controller_does_not_treat_deleted_cd90_as_an_executor(tmp_path):
+    """Deleting the CD90 follower must not leave a startable executor pair."""
 
     transaction = release.ReleaseTransaction(
         release.TransactionConfig(
             new_release=tmp_path / "candidate",
             expected_manifest_digest="0" * 64,
-            change_id="paused-cd90-coverage",
+            change_id="deleted-cd90-coverage",
             snapshot=tmp_path / "snapshot",
             production=False,
         )
     )
     cd90 = next(spec for spec in release.PROFILE_SPECS if spec.key == "cd90")
-    transaction.original_activity = {
-        unit: "active" for unit in release.EXECUTOR_UNITS
-    }
-    transaction.original_enablement = {
-        **{unit: "enabled" for unit in release.EXECUTOR_UNITS},
-        release.HEALTH_TIMER: "disabled",
-    }
-    for unit in (cd90.primary_unit, cd90.standby_unit):
-        transaction.original_activity[unit] = "inactive"
-        transaction.original_enablement[unit] = "disabled"
-
     transaction._validate_original_executor_policy()
 
-    assert transaction._profile_original_mode(cd90) == "PAUSED"
-    assert set(transaction._original_active_executor_units()) == (
-        set(release.EXECUTOR_UNITS) - {cd90.primary_unit, cd90.standby_unit}
+    assert transaction._profile_original_mode(cd90) == "RETIRED"
+    assert set(transaction._original_active_executor_units()) == set(
+        release.EXECUTOR_UNITS
     )
 
 
@@ -177,27 +220,16 @@ def test_offline_release_stage_maps_all_profiles_and_activates_at_cursor():
     assert "offline stage bounded retry cursor ahead" in source
 
 
-def test_offline_release_stage_does_not_arm_a_user_paused_profile(tmp_path):
+def test_offline_release_stage_does_not_arm_the_deleted_cd90_follower(tmp_path):
     transaction = release.ReleaseTransaction(
         release.TransactionConfig(
             new_release=tmp_path / "candidate",
             expected_manifest_digest="0" * 64,
-            change_id="paused-profile-stage",
+            change_id="retired-cd90-stage",
             snapshot=tmp_path / "snapshot",
             production=False,
         )
     )
-    cd90 = next(spec for spec in release.PROFILE_SPECS if spec.key == "cd90")
-    transaction.original_activity = {
-        unit: "active" for unit in release.EXECUTOR_UNITS
-    }
-    transaction.original_enablement = {
-        **{unit: "enabled" for unit in release.EXECUTOR_UNITS},
-        release.HEALTH_TIMER: "disabled",
-    }
-    for unit in (cd90.primary_unit, cd90.standby_unit):
-        transaction.original_activity[unit] = "inactive"
-        transaction.original_enablement[unit] = "disabled"
 
     program = transaction._offline_migration_program()
     source = release.Path(release.__file__).read_text(encoding="utf-8")

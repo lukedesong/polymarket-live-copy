@@ -10905,7 +10905,11 @@ class CLOBExecutionAdapter:
             for order in self.client.get_open_orders()
         )
         if still_open:
-            raise RuntimeError("ACTIVE_CANCEL_ORDER_STILL_OPEN")
+            return {
+                "active_cancel_response": cancel_response,
+                "active_cancel_verified": False,
+                "active_cancel_still_open": True,
+            }
         latest_block_number = getattr(self.receipt_reader, "latest_block_number", None)
         if not callable(latest_block_number):
             raise RuntimeError("ACTIVE_CANCEL_CHAIN_HEAD_READER_UNAVAILABLE")
@@ -12333,14 +12337,58 @@ def cancel_due_active_gtd_orders(
             partial_matched_quantity = matched_quantity
         if not callable(cancel):
             raise LiveConfigurationError("ACTIVE_CANCEL_EXECUTION_UNAVAILABLE")
-        cancellation = cancel(order_id)
+        try:
+            cancellation = cancel(order_id)
+        except RuntimeError as exc:
+            if str(exc) != "ACTIVE_CANCEL_ORDER_STILL_OPEN":
+                raise
+            cancellation = {
+                "active_cancel_verified": False,
+                "active_cancel_still_open": True,
+            }
+        if not (
+            isinstance(cancellation, Mapping)
+            and cancellation.get("active_cancel_verified") is True
+        ):
+            still_open_response = {
+                **dict(response),
+                **(
+                    dict(cancellation)
+                    if isinstance(cancellation, Mapping)
+                    else {"active_cancel_response": cancellation}
+                ),
+                "active_cancel_verified": False,
+                "active_cancel_still_open": True,
+            }
+            store.update_attempt_state(
+                attempt_id=str(details.get("attempt_id") or ""),
+                state="SUBMITTED_UNRECONCILED",
+                response=still_open_response,
+                updated_at_ms=int(due_at_ms),
+            )
+            store.append_transition(
+                source=source,
+                status="ACTIVE_CANCEL_ORDER_STILL_OPEN",
+                reason="GTC_ACTIVE_CANCEL_STILL_OPEN_AFTER_REQUEST",
+                created_at_ms=int(due_at_ms),
+                details={
+                    "attempt_id": str(details.get("attempt_id") or ""),
+                    "order_id": order_id,
+                    "active_cancel_due_at_ms": active_cancel_due_at_ms,
+                    "new_order_submitted": False,
+                    "reservation_released": False,
+                },
+            )
+            results.append(
+                {
+                    "order_id": order_id,
+                    "terminal_status": "ACTIVE_CANCEL_ORDER_STILL_OPEN",
+                }
+            )
+            continue
         updated_response = {
             **dict(response),
-            **(
-                dict(cancellation)
-                if isinstance(cancellation, Mapping)
-                else {"active_cancel_response": cancellation}
-            ),
+            **dict(cancellation),
             "active_cancel_verified": True,
         }
         if partial_matched_quantity is not None:
@@ -13534,11 +13582,19 @@ def _execute_source_action_locked(
                 },
             }
 
+    # ``source_vwap`` is reconstructed from on-chain raw amounts floored to
+    # one raw token unit, so it can understate the true source order price by
+    # at most one raw unit spread across the source quantity (live
+    # counterexample: 92.729998 / 99.709676 = 0.92999999318... for a real
+    # 0.93 order).  Tolerate exactly that truncation bound so a same-price
+    # follow is not misclassified as an execution loss; any genuine price gap
+    # remains blocked.
+    source_vwap_truncation_bound = TOKEN_RAW_UNIT / source.source_quantity
     if (
         source.side == "BUY"
         and plan.terminal_status == "READY"
         and plan.worst_price > USER_SPECIFIED_HIGH_PRICE_BUY_CEILING
-        and plan.worst_price > source_vwap
+        and plan.worst_price > source_vwap + source_vwap_truncation_bound
     ):
         plan = ActionPlan(
             terminal_status="EXTERNAL_UNFILLABLE",

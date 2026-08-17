@@ -1,4 +1,58 @@
-from app.server_health_heartbeat import live_status_issues
+from app.server_health_heartbeat import (
+    live_status_issues,
+    profile_registry_issues,
+    recovered_internal_before_success,
+)
+
+
+def test_residual_coordinator_sleeve_may_be_unmonitored():
+    assert profile_registry_issues(
+        expected_profiles={"cd90", "zockdo_full_wallet", "wallet_9506_full_wallet"},
+        monitored_profiles={"zockdo_full_wallet", "wallet_9506_full_wallet"},
+        residual_profiles={"cd90"},
+    ) == []
+
+
+def test_recovered_internal_before_later_success_does_not_latch():
+    assert recovered_internal_before_success(
+        internal_event_count=1,
+        code_repair_event_count=0,
+        latest_internal_occurred_at_ms=100,
+        last_successful_cycle_at_ms=200,
+        last_cycle_outcome="SUCCESS",
+    ) is True
+
+
+def test_unrecovered_or_code_repair_internal_still_latches():
+    assert recovered_internal_before_success(
+        internal_event_count=1,
+        code_repair_event_count=1,
+        latest_internal_occurred_at_ms=100,
+        last_successful_cycle_at_ms=200,
+        last_cycle_outcome="SUCCESS",
+    ) is False
+    assert recovered_internal_before_success(
+        internal_event_count=1,
+        code_repair_event_count=0,
+        latest_internal_occurred_at_ms=300,
+        last_successful_cycle_at_ms=200,
+        last_cycle_outcome="SUCCESS",
+    ) is False
+    assert recovered_internal_before_success(
+        internal_event_count=1,
+        code_repair_event_count=0,
+        latest_internal_occurred_at_ms=100,
+        last_successful_cycle_at_ms=200,
+        last_cycle_outcome="ERROR",
+    ) is False
+
+
+def test_reserved_coordinator_sleeve_cannot_drop_out_of_health():
+    assert profile_registry_issues(
+        expected_profiles={"cd90", "zockdo_full_wallet", "wallet_9506_full_wallet"},
+        monitored_profiles={"wallet_9506_full_wallet"},
+        residual_profiles={"cd90"},
+    ) == ["UNMONITORED_COORDINATOR_PROFILES:zockdo_full_wallet"]
 
 
 def _payload() -> dict:

@@ -1198,7 +1198,8 @@ class FakeCLOBClient:
 
     def cancel_order(self, payload):
         self.cancellations.append(payload.orderID)
-        self.open_order_ids.discard(payload.orderID)
+        if not getattr(self, "keep_open_after_cancel", False):
+            self.open_order_ids.discard(payload.orderID)
         return {"canceled": [payload.orderID], "not_canceled": {}}
 
     def get_open_orders(self):
@@ -5872,6 +5873,90 @@ def test_buy_above_user_price_ceiling_allows_fees_when_execution_price_has_no_lo
     assert len(execution.calls) == 1
 
 
+def test_buy_above_user_price_ceiling_tolerates_raw_unit_vwap_truncation(
+    tmp_path: Path,
+):
+    """A same-tick BUY must not be blocked by integer raw-amount truncation.
+
+    Live counterexample (wallet 9506, Shanghai 29C 2026-08-16): the source
+    order price was 0.93, but on-chain maker/taker raw amounts are floored to
+    1e-6, so notional/quantity reconstructs 0.9299999931... and a 0.93 Ask was
+    misjudged as an execution loss.  The reconstructed VWAP can understate the
+    true order price by at most one raw unit spread across the quantity.
+    """
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+
+    class HighPriceExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            snapshot = super().snapshot(token_id=token_id, side=side)
+            snapshot["best_price"] = "0.93"
+            return snapshot
+
+    execution = HighPriceExecution()
+    # 92.729998 / 99.709676 = 0.92999999318... (true source order price 0.93)
+    source = replace(
+        action(quantity="99.709676"),
+        source_notional=D("92.729998"),
+    )
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result["terminal_status"] == "SUBMITTED_UNRECONCILED"
+    assert len(execution.calls) == 1
+
+
+def test_buy_above_user_price_ceiling_still_blocks_a_real_price_loss(
+    tmp_path: Path,
+):
+    """The raw-unit tolerance must not admit a genuinely higher Ask."""
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+
+    class HighPriceExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            snapshot = super().snapshot(token_id=token_id, side=side)
+            snapshot["best_price"] = "0.95"
+            return snapshot
+
+    execution = HighPriceExecution()
+    # 181.949988 / 193.18104 = 0.9418625... (real gap to 0.95, not noise)
+    source = replace(
+        action(quantity="193.18104"),
+        source_notional=D("181.949988"),
+    )
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "EXTERNAL_UNFILLABLE",
+        "reason": "BUY_PRICE_ABOVE_0_90_WITH_EXECUTION_LOSS",
+    }
+    assert execution.calls == []
+
+
 def test_retry_closure_does_not_submit_non_liquidity_pending_actions(
     tmp_path: Path,
 ):
@@ -7858,6 +7943,36 @@ def test_clob_adapter_posts_multiple_active_cancel_orders_without_waiting(monkey
     assert client.get_open_orders() == []
 
 
+def test_clob_adapter_cancel_still_open_is_unverified_not_fatal():
+    client = FakeCLOBClient()
+    client.keep_open_after_cancel = True
+
+    class ReceiptReader:
+        @staticmethod
+        def latest_block_number():
+            raise AssertionError("still-open cancel must not claim a finalized head")
+
+    adapter = CLOBExecutionAdapter(
+        client,
+        minimum_marketable_buy_notional_usd=D("1"),
+        receipt_reader=ReceiptReader(),
+    )
+    adapter.snapshot(token_id="123", side="BUY")
+    prepared = adapter.prepare_gtd_limit(
+        token_id="123",
+        side="BUY",
+        price=D("0.40"),
+        size=D("10"),
+    )
+    response = adapter.submit_prepared_gtd_limit(prepared)
+    result = adapter.cancel_active_gtd_order(response["orderID"])
+
+    assert result["active_cancel_verified"] is False
+    assert result["active_cancel_still_open"] is True
+    assert client.cancellations == [response["orderID"]]
+    assert client.get_open_orders() == [{"id": response["orderID"]}]
+
+
 def test_due_active_cancel_is_run_after_nonblocking_submission():
     first = action(marker="a")
     second = action(marker="b")
@@ -8060,6 +8175,67 @@ def test_sell_gtc_is_not_canceled_before_the_active_cancel_deadline():
     assert live.cancel_due_active_gtd_orders(
         store=Store(), execution=Execution(), due_at_ms=100
     ) == []
+
+
+def test_partial_gtc_cancel_still_open_does_not_crash_release_or_repost(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    order_id = execution.prepared["order_id"]
+    execution.orders[order_id] = {
+        "status": "MATCHED",
+        "size_matched": "2",
+        "original_size": "10",
+    }
+
+    def cancel_active_gtd_order(observed_order_id):
+        assert observed_order_id == order_id
+        raise RuntimeError("ACTIVE_CANCEL_ORDER_STILL_OPEN")
+
+    execution.cancel_active_gtd_order = cancel_active_gtd_order
+    result = live.cancel_due_active_gtd_orders(
+        store=store,
+        execution=execution,
+        due_at_ms=0,
+    )
+
+    assert result == [
+        {
+            "order_id": order_id,
+            "terminal_status": "ACTIVE_CANCEL_ORDER_STILL_OPEN",
+        }
+    ]
+    with store.connect() as connection:
+        attempt = connection.execute(
+            "SELECT state, response_json FROM submission_attempts WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    response = json.loads(attempt["response_json"])
+    assert attempt["state"] == "SUBMITTED_UNRECONCILED"
+    assert response.get("active_cancel_verified") is not True
+    assert response.get("active_cancel_still_open") is True
+    assert int(reservation["active"]) == 1
+    assert store.latest_transition(source)["terminal_status"] == (
+        "ACTIVE_CANCEL_ORDER_STILL_OPEN"
+    )
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+    assert live.cancel_due_active_gtd_orders(
+        store=store,
+        execution=execution,
+        due_at_ms=0,
+    ) == [
+        {
+            "order_id": order_id,
+            "terminal_status": "ACTIVE_CANCEL_ORDER_STILL_OPEN",
+        }
+    ]
+    assert store.submission_attempt_count(source.action_id) == 1
 
 
 def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
