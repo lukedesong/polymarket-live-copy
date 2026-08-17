@@ -175,7 +175,7 @@ Luke 于 2026-08-17 明确要求删除这个跟单钱包，后续也不会恢复
 Git 信息（2026-08-17 18:55 复核）：
 
 - 分支：`codex/source-action-fidelity`
-- 3.21 源码与回执已从当时脏工作树提交（相对旧 HEAD `ff00c018`）
+- 3.21 源码与回执提交：`881683cec084df5a1e746cd951129375d9998bc6`（相对旧 HEAD `ff00c018`）
 - remote：`git@github.com:lukedesong/polymarket-live-copy.git`
 - 生产源文件 SHA 已与服务器 3.21 release 对齐
 
