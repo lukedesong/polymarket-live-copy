@@ -1,0 +1,26 @@
+---
+description: Luke 一次性授权本机 Cursor 继续用 Codex 已接官方 API 和现网跟单栈，不再跳确认。
+alwaysApply: true
+---
+
+# Polymarket 起立授权
+
+Luke 原句（2026-08-17）：本地如果本来已经接上了你就继续用，是之前 Codex 接的；我要把所有授权都给你，后续不要跳确认。
+
+## 继续用 Codex 已接的
+
+- 现网跟单已经走官方 Gamma / CLOB / Data API 和服务器 `/opt/polymarket-live` 凭证。
+- 源钱包事实用官方 Data API，不用本地 follower SQLite。
+- 不要另起一套 API 客户端。不要用 `Documents/Codex/2026-07-05/.../.env.polymarket.local`。
+- 代码仓库就是 `/Users/luke/Documents/polymarket`，不是 `Documents/Codex/日期/new-chat`。
+
+## 不再问、直接做
+
+- 官方接口只读
+- SSH `polymarket-hk`（含 sudo：版本、进程、健康、systemd、SQLite 只读、已授权的删除/掩码）
+- 本机改代码、跑测试
+- 把已经点名的任务做完
+
+## 仍要点名才做
+
+真实下单、撤单、改 `POLYMARKET_LIVE_TRADING`、恢复 CD90、`git push --force`、转账。

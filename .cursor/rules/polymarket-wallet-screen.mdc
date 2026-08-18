@@ -1,0 +1,20 @@
+---
+description: 新钱包筛选目标是 NEAR_LIVE_COPY（接近现网可跟），不是表上赚钱。完整合同见 docs/新钱包筛选标准.md。
+alwaysApply: true
+---
+
+# Polymarket 钱包筛选
+
+完整逐步合同：`docs/新钱包筛选标准.md`（桌面有副本）。筛名单/主页/CSV 时按那一份。对用户只说实盘跟单。
+
+只把 **`NEAR_LIVE_COPY`** 当成「找出来接近可以实盘」。`SOURCE_CANDIDATE` 不是可跟。未做延迟盘口、用户未点名，不得接入、不得改 `POLYMARKET_LIVE_TRADING`。
+
+## 权威
+
+官方 Data API：`/closed-positions`、`/positions?sizeThreshold=0&includeArchived=true`、`/value`、`/trades?takerOnly=false`。CSV/r2/月榜/排行榜/活动页不是账。现网已跟：Zockdo `0xcd741947…`、wallet9506 `0x9506e646…`。
+
+## 接近实盘（须全过）
+
+源：周/月事件各 >=10、Σpnl 与去最大后都 >0、周 max_share<0.30、近 3 日/本周未完未实质转亏、未平仓未吃掉周利润、月亏损事件占比<0.40。  
+复制：官方 200 笔 `gap_median>=400` 秒、`buy_share>=0.90`、`rev_lt_60<=2`、主袖套>=60%。  
+达不到就不要对用户说接近可跟。2026-08-17 稳涨 CSV 按此条 **NEAR_LIVE_COPY N=0**；clazzy1 只是 SOURCE_CANDIDATE。
