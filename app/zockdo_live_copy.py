@@ -20,6 +20,8 @@ PROFILE_SCOPE = "FULL_WALLET"
 USER_AUTHORIZED_ALLOCATION_USD = Decimal("0")
 FIXED_SHARE_SCALE = Decimal("0.5")
 SCALE_BASIS = "USER_AUTHORIZED_HALF_OF_SOURCE_SHARES_NO_SLEEVE_BUDGET"
+# Non-tennis BUY notional is clipped in cd90_live_copy via zockdo_nontennis_cap.
+# Tennis event_slug prefixes atp-/wta-/itf- stay at this scale with no extra cap.
 DEFAULT_RUNTIME_DIR = Path(__file__).resolve().parent / "zockdo_live_runtime"
 
 
