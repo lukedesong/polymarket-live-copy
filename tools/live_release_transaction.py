@@ -139,6 +139,8 @@ REQUIRED_ASSETS = frozenset(
         "ops/polymarket-deadman-alerter.py",
         "app/live_chain_client.py",
         "app/zockdo_live_copy.py",
+        "app/zockdo_nontennis_cap.py",
+        "app/zockdo_soccer_sleeve.py",
         "app/wallet9506_live_copy.py",
         *(f"systemd/{unit}" for unit in (*EXECUTOR_UNITS, HEALTH_UNIT, HEALTH_TIMER)),
         "systemd/com.luke.polymarket.deadman-alerter.service",

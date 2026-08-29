@@ -75,6 +75,17 @@ def test_release_always_contains_canonical_version_authority_verifier():
     ).is_file()
 
 
+def test_release_includes_zockdo_soccer_stop_modules():
+    for relative in (
+        "app/zockdo_nontennis_cap.py",
+        "app/zockdo_soccer_sleeve.py",
+    ):
+        assert relative in release.REQUIRED_ASSETS
+        assert (
+            release.Path(release.__file__).resolve().parent.parent / relative
+        ).is_file()
+
+
 def test_version_verifier_uses_noninteractive_sudo_only_after_permission_denied(
     monkeypatch,
 ):
