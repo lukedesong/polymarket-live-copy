@@ -41,6 +41,7 @@ from cd90_live_sizing import (
     maximum_buy_fee_usd,
     plan_action,
 )
+from zockdo_nontennis_cap import max_buy_notional_usd_for_profile
 from live_action_fidelity import canonical_hash
 from live_wallet_coordinator import (
     AuthenticatedAccountCashSnapshot,
@@ -13138,6 +13139,24 @@ def _execute_source_action_locked(
         planning_source_quantity = remaining
         planning_scale = Decimal("1")
         allow_minimum_upscale = False
+    max_buy_notional_usd = None
+    if source.side == "BUY":
+        event_slug = ""
+        frozen_meta = store.frozen_action_metadata(source.action_id)
+        if frozen_meta is not None:
+            event_slug = str(
+                (frozen_meta.get("metadata") or {}).get("event_slug") or ""
+            )
+        max_buy_notional_usd = max_buy_notional_usd_for_profile(
+            profile_key=profile_key,
+            event_slug=event_slug,
+            scale=execution_scale,
+        )
+        if max_buy_notional_usd is not None:
+            cumulative_sizing["non_tennis_max_copy_notional_usd"] = str(
+                max_buy_notional_usd
+            )
+            cumulative_sizing["non_tennis_event_slug"] = event_slug
     plan = plan_action(
         side=source.side,
         source_quantity=planning_source_quantity,
@@ -13154,6 +13173,7 @@ def _execute_source_action_locked(
         available_cash=effective_cash,
         fee_exponent=Decimal(str(snapshot.get("fee_exponent", "1"))),
         allow_minimum_upscale=allow_minimum_upscale,
+        max_buy_notional_usd=max_buy_notional_usd,
     )
 
     if (

@@ -12,6 +12,7 @@ from typing import Any, Mapping
 import cd90_live_copy as core
 from cd90_live_copy import LiveStore
 from live_copy_profiles import FullWalletEventScope
+from zockdo_soccer_sleeve import ZockdoEventScope
 
 
 SOURCE_WALLET = "0xcd741947f7430f96bf1820a0b30d8a0fad3100a1"
@@ -20,6 +21,9 @@ PROFILE_SCOPE = "FULL_WALLET"
 USER_AUTHORIZED_ALLOCATION_USD = Decimal("0")
 FIXED_SHARE_SCALE = Decimal("0.5")
 SCALE_BASIS = "USER_AUTHORIZED_HALF_OF_SOURCE_SHARES_NO_SLEEVE_BUDGET"
+# Non-tennis BUY notional is clipped in cd90_live_copy via zockdo_nontennis_cap.
+# Tennis event_slug prefixes atp-/wta-/itf- stay at this scale with no extra cap.
+# Soccer BUY is skipped in ZockdoEventScope. Soccer SELL still unwinds inventory.
 DEFAULT_RUNTIME_DIR = Path(__file__).resolve().parent / "zockdo_live_runtime"
 
 
@@ -136,7 +140,9 @@ def run_service(
         runtime_dir=runtime_dir,
         env=values,
         profile_key=PROFILE_KEY,
-        action_scope=FullWalletEventScope(core._bounded_public_json),
+        action_scope=ZockdoEventScope(
+            FullWalletEventScope(core._bounded_public_json)
+        ),
         hot_standby=hot_standby,
     )
 

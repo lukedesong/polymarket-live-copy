@@ -180,6 +180,7 @@ def plan_action(
     available_cash: Decimal,
     fee_exponent: int | Decimal = Decimal("1"),
     allow_minimum_upscale: bool = False,
+    max_buy_notional_usd: Decimal | None = None,
 ) -> ActionPlan:
     """Plan a FAK action under an explicit market-minimum policy.
 
@@ -225,40 +226,66 @@ def plan_action(
         raise ScaleInputError("unsupported nonintegral fee exponent")
 
     proportional = quantity * share_scale
+    requested_basis = proportional
+    notional_capped = False
+    buy_notional_cap = (
+        None if max_buy_notional_usd is None else _decimal(max_buy_notional_usd)
+    )
+    if buy_notional_cap is not None:
+        if buy_notional_cap <= ZERO:
+            raise ScaleInputError("max_buy_notional_usd must be positive")
+        if normalized_side == "BUY":
+            cap_quantity = buy_notional_cap / price
+            if requested_basis > cap_quantity:
+                requested_basis = cap_quantity
+                notional_capped = True
     buy_notional_minimum_quantity = (
         minimum_buy_notional / price if normalized_side == "BUY" else ZERO
     )
     if not allow_minimum_upscale:
-        if proportional < minimum:
+        if requested_basis < minimum:
             return _skipped(
-                reason="PROPORTIONAL_QUANTITY_BELOW_MARKET_MINIMUM",
+                reason=(
+                    "NON_TENNIS_COPY_NOTIONAL_CAP_BELOW_MARKET_MINIMUM"
+                    if notional_capped
+                    else "PROPORTIONAL_QUANTITY_BELOW_MARKET_MINIMUM"
+                ),
                 side=normalized_side,
                 proportional_quantity=proportional,
-                requested_quantity=proportional,
+                requested_quantity=requested_basis,
                 best_price=price,
             )
         if (
             normalized_side == "BUY"
-            and proportional < buy_notional_minimum_quantity
+            and requested_basis < buy_notional_minimum_quantity
         ):
             return _skipped(
-                reason="PROPORTIONAL_BUY_NOTIONAL_BELOW_MARKETABLE_MINIMUM",
+                reason=(
+                    "NON_TENNIS_COPY_NOTIONAL_CAP_BELOW_MARKETABLE_MINIMUM"
+                    if notional_capped
+                    else "PROPORTIONAL_BUY_NOTIONAL_BELOW_MARKETABLE_MINIMUM"
+                ),
                 side=normalized_side,
                 proportional_quantity=proportional,
-                requested_quantity=proportional,
+                requested_quantity=requested_basis,
                 best_price=price,
             )
-        requested = proportional
+        requested = requested_basis
         share_minimum_override = False
         buy_notional_override = False
     elif normalized_side == "BUY":
-        requested = max(proportional, minimum, buy_notional_minimum_quantity)
+        requested = max(requested_basis, minimum, buy_notional_minimum_quantity)
+        if notional_capped:
+            requested = requested_basis
         share_minimum_override = (
-            proportional < minimum and minimum >= buy_notional_minimum_quantity
+            (not notional_capped)
+            and requested_basis < minimum
+            and minimum >= buy_notional_minimum_quantity
         )
         buy_notional_override = (
-            normalized_side == "BUY"
-            and proportional < buy_notional_minimum_quantity
+            (not notional_capped)
+            and normalized_side == "BUY"
+            and requested_basis < buy_notional_minimum_quantity
             and buy_notional_minimum_quantity > minimum
         )
     else:
@@ -344,6 +371,8 @@ def plan_action(
             if buy_notional_override
             else "MINIMUM_ORDER_SIZE_UPSCALE"
             if share_minimum_override
+            else "NON_TENNIS_COPY_NOTIONAL_CAP"
+            if notional_capped
             else ""
         ),
         side=normalized_side,
