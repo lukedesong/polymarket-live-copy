@@ -3,6 +3,11 @@
 Tennis keeps the frozen 0.5 share scale. Other sports still follow, but our
 BUY notional is clipped to tennis's own event-size p90 times that scale.
 The p90 is from official Data API trades, not a round number.
+
+This cap is a size clip, not a frequency filter. Raw Zockdo event counts
+cannot be read as intensity: Polymarket lists far more tennis matches than
+soccer or basketball in the same window. Compare coverage (his events /
+listed match events) before calling a sleeve hobby.
 """
 
 from __future__ import annotations
