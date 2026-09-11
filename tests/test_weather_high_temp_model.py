@@ -3,8 +3,8 @@ from decimal import Decimal
 import pytest
 
 from weather_high_temp_model import (
+    DEAD_NO_ASK_GONE,
     FORECAST_EXCLUDE_NEGATIVE,
-    HTT_SKIP_REASON,
     HTT_WALLET,
     YES_OPTIONAL_REASON,
     WeatherModelError,
@@ -113,8 +113,8 @@ def test_parse_bucket_titles_and_klga_station():
     assert whole_degree(D("80.9")) == D("80")
 
 
-def test_dead_buckets_are_htt_race_skips_when_observed_max_is_80():
-    yes, no = nyc_market_prices(overpriced_tail=True)
+def test_dead_buckets_are_still_raced_when_no_ask_remains():
+    yes, no = nyc_market_prices()
     buckets = priced_nyc(yes_asks=yes, no_asks=no)
     members = [D("81")] * 10 + [D("82")] * 8 + [D("83")] * 2
     receipt = qualify_no_books(
@@ -123,13 +123,33 @@ def test_dead_buckets_are_htt_race_skips_when_observed_max_is_80():
         members=members,
     )
     by_title = {row["title"]: row for row in receipt["buckets"]}
-    for title in NYC_TITLES[:6]:
-        assert by_title[title]["status"] == "dead"
-        assert by_title[title]["qualify"] is False
-        assert by_title[title]["skip_reason"] == HTT_SKIP_REASON
+    cold = by_title["69°F or below"]
+    neighbor_dead = by_title["78-79°F"]
+    assert cold["status"] == "dead"
+    assert cold["race_vs_htt"] is True
+    assert cold["qualify"] is True
+    assert Decimal(cold["ev"]) > D("0")
+    assert neighbor_dead["status"] == "dead"
+    assert neighbor_dead["qualify"] is True
     assert by_title["80-81°F"]["status"] == "possible"
     assert receipt["htt_wallet"] == HTT_WALLET
     assert receipt["poly_live_trading_armed"] is False
+
+
+def test_dead_bucket_empty_book_is_lost_print_not_a_refusal():
+    yes, no = nyc_market_prices()
+    no["69°F or below"] = None
+    buckets = priced_nyc(yes_asks=yes, no_asks=no)
+    receipt = qualify_no_books(
+        buckets,
+        observed_max=D("80"),
+        members=[D("81")] * 10,
+    )
+    cold = next(row for row in receipt["buckets"] if row["title"] == "69°F or below")
+    assert cold["status"] == "dead"
+    assert cold["race_vs_htt"] is True
+    assert cold["qualify"] is False
+    assert cold["skip_reason"] == DEAD_NO_ASK_GONE
 
 
 def test_truncated_ensemble_cannot_fall_below_observed_max():
@@ -175,7 +195,11 @@ def test_matching_model_and_market_does_not_qualify():
         spread_inflation=D("0"),
         model_weight=D("0.5"),
     )
-    assert all(row["qualify"] is False for row in receipt["buckets"])
+    assert all(
+        row["qualify"] is False
+        for row in receipt["buckets"]
+        if row["status"] == "possible"
+    )
 
 
 def test_forecast_exclude_basket_is_negative_after_weather_fees():

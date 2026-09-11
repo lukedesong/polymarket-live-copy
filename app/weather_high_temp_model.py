@@ -2,6 +2,10 @@
 
 YES is an extra diagnostic only. This module never claims a YES edge and never
 treats a YES cluster as a hedge of a NO book.
+
+Dead buckets are still raced: htt is faster on average, but leftover NO asks
+are qualified when fee-after EV is positive. Empty books are a lost print,
+not a refusal to race.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ DEFAULT_MODEL_WEIGHT = Decimal("0.5")
 DEFAULT_SPREAD_INFLATION = Decimal("0.15")
 HTT_WALLET = "0x6011655c4afb76f36dd1b08a137a1ba73466b31e"
 YES_OPTIONAL_REASON = "YES_OPTIONAL_NO_CLAIMED_EDGE"
-HTT_SKIP_REASON = "HTT_RACE_SKIP"
+DEAD_NO_ASK_GONE = "DEAD_NO_ASK_GONE"
 FORECAST_EXCLUDE_NEGATIVE = "FORECAST_EXCLUDE_NEGATIVE_EV"
 
 _TITLE_BELOW = re.compile(
@@ -495,22 +499,24 @@ def qualify_no_books(
             "qualify": False,
             "skip_reason": None,
         }
-        if dead:
-            row["skip_reason"] = HTT_SKIP_REASON
-            rows.append(row)
-            continue
+        row["race_vs_htt"] = dead
         if bucket.no_ask is None:
-            row["skip_reason"] = "MISSING_NO_ASK"
+            row["skip_reason"] = DEAD_NO_ASK_GONE if dead else "MISSING_NO_ASK"
             rows.append(row)
             continue
         if bucket.fee_rate is None:
             row["skip_reason"] = "MISSING_FEE_RATE"
             rows.append(row)
             continue
-        ev = no_ev(p_yes=p_blend, no_ask=bucket.no_ask, fee_rate=bucket.fee_rate)
+        p_yes = ZERO if dead else p_blend
+        ev = no_ev(p_yes=p_yes, no_ask=bucket.no_ask, fee_rate=bucket.fee_rate)
         row["ev"] = str(ev)
         row["fee"] = str(taker_fee(rate=bucket.fee_rate, price=bucket.no_ask))
-        if ev >= min_edge:
+        if dead:
+            qualifies = ev > ZERO
+        else:
+            qualifies = ev >= min_edge
+        if qualifies:
             row["qualify"] = True
         else:
             row["skip_reason"] = "NO_EDGE_BELOW_MIN"
