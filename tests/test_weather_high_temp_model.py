@@ -4,6 +4,7 @@ import pytest
 
 from weather_high_temp_model import (
     DEAD_NO_ASK_GONE,
+    FORECAST_COVERAGE_BAND,
     FORECAST_EXCLUDE_NEGATIVE,
     HTT_WALLET,
     YES_OPTIONAL_REASON,
@@ -178,7 +179,37 @@ def test_overpriced_live_tail_no_qualifies_after_fees():
     assert tail["qualify"] is True
     assert Decimal(tail["ev"]) >= D("0.04")
     center = by_title["80-81°F"]
+    neighbor = by_title["82-83°F"]
     assert center["qualify"] is False
+    assert center["skip_reason"] == FORECAST_COVERAGE_BAND
+    assert neighbor["in_coverage_band"] is True
+    assert neighbor["qualify"] is False
+    assert neighbor["skip_reason"] == FORECAST_COVERAGE_BAND
+    assert "80-81°F" in receipt["coverage_band"]
+    assert receipt["coverage_alpha"] == "0.85"
+    assert receipt["selected_no_basket"]["size"] >= 1
+
+
+def test_coverage_band_blocks_cheap_neighbor_no():
+    yes, no = nyc_market_prices(overpriced_tail=True)
+    no["82-83°F"] = D("0.50")
+    buckets = priced_nyc(yes_asks=yes, no_asks=no)
+    members = [D("81")] * 20 + [D("82")] * 10
+    receipt = qualify_no_books(
+        buckets,
+        observed_max=D("80"),
+        members=members,
+        min_edge=D("0.04"),
+        model_weight=D("0.8"),
+        spread_inflation=D("0"),
+    )
+    neighbor = next(row for row in receipt["buckets"] if row["title"] == "82-83°F")
+    tail = next(row for row in receipt["buckets"] if row["title"] == "84-85°F")
+    assert Decimal(neighbor["ev"]) >= D("0.04")
+    assert neighbor["skip_reason"] == FORECAST_COVERAGE_BAND
+    assert neighbor["qualify"] is False
+    assert tail["qualify"] is True
+    assert tail["in_coverage_band"] is False
 
 
 def test_matching_model_and_market_does_not_qualify():

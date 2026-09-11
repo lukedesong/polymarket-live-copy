@@ -1,7 +1,8 @@
 """Read-only weather highest-temp NO qualification receipts.
 
 This module never submits orders and never reads POLYMARKET_LIVE_TRADING as an
-arming switch. YES remains an extra diagnostic with no claimed edge.
+arming switch. Still-possible NO is blocked inside the 85% forecast coverage
+band. YES remains an extra diagnostic with no claimed edge.
 """
 
 from __future__ import annotations

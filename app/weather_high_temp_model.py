@@ -3,9 +3,10 @@
 YES is an extra diagnostic only. This module never claims a YES edge and never
 treats a YES cluster as a hedge of a NO book.
 
-Dead buckets are still raced: htt is faster on average, but leftover NO asks
-are qualified when fee-after EV is positive. Empty books are a lost print,
-not a refusal to race.
+Dead leftover asks are still raced. Still-possible NO is blocked inside the
+central 85% coverage band so a point-forecast gap does not buy the neighbor.
+Outside the band, each leftover NO must clear a fee-after EV gate; the rest of
+the ladder is not bought just because it sits outside the band.
 """
 
 from __future__ import annotations
@@ -22,9 +23,11 @@ ONE = Decimal("1")
 DEFAULT_MIN_EDGE = Decimal("0.04")
 DEFAULT_MODEL_WEIGHT = Decimal("0.5")
 DEFAULT_SPREAD_INFLATION = Decimal("0.15")
+DEFAULT_COVERAGE_ALPHA = Decimal("0.85")
 HTT_WALLET = "0x6011655c4afb76f36dd1b08a137a1ba73466b31e"
 YES_OPTIONAL_REASON = "YES_OPTIONAL_NO_CLAIMED_EDGE"
 DEAD_NO_ASK_GONE = "DEAD_NO_ASK_GONE"
+FORECAST_COVERAGE_BAND = "FORECAST_COVERAGE_BAND"
 FORECAST_EXCLUDE_NEGATIVE = "FORECAST_EXCLUDE_NEGATIVE_EV"
 
 _TITLE_BELOW = re.compile(
@@ -425,6 +428,64 @@ def dutch_book_no(
     }
 
 
+def coverage_band(
+    probs: Sequence[Decimal],
+    *,
+    alpha: Decimal = DEFAULT_COVERAGE_ALPHA,
+) -> tuple[int, ...]:
+    """Smallest high-probability set covering at least alpha of the posterior."""
+
+    if alpha <= ZERO or alpha > ONE:
+        raise WeatherModelError("INVALID_COVERAGE_ALPHA")
+    if not probs:
+        raise WeatherModelError("EMPTY_POSTERIOR")
+    ordered = sorted(range(len(probs)), key=lambda index: (-probs[index], index))
+    chosen: list[int] = []
+    mass = ZERO
+    for index in ordered:
+        if mass >= alpha:
+            break
+        chosen.append(index)
+        mass += probs[index]
+    return tuple(sorted(chosen))
+
+
+def selected_no_basket(
+    buckets: Sequence[TempBucket],
+    probs: Sequence[Decimal],
+    *,
+    qualified_indexes: Sequence[int],
+    observed_whole: Decimal,
+) -> dict[str, Any]:
+    if not qualified_indexes:
+        return {
+            "size": 0,
+            "titles": [],
+            "p_hit": "0",
+            "cost": "0",
+            "ev": "0",
+        }
+    cost = ZERO
+    p_hit = ZERO
+    titles: list[str] = []
+    for index in qualified_indexes:
+        bucket = buckets[index]
+        titles.append(bucket.title)
+        if bucket.no_ask is None or bucket.fee_rate is None:
+            raise WeatherModelError("QUALIFIED_NO_MISSING_BOOK")
+        cost += bucket.no_ask + taker_fee(rate=bucket.fee_rate, price=bucket.no_ask)
+        if not bucket.is_dead(observed_whole):
+            p_hit += probs[index]
+    size = Decimal(len(qualified_indexes))
+    return {
+        "size": int(size),
+        "titles": titles,
+        "p_hit": str(p_hit),
+        "cost": str(cost),
+        "ev": str(size - p_hit - cost),
+    }
+
+
 def yes_cluster_diagnosis(
     buckets: Sequence[TempBucket],
     probs: Sequence[Decimal],
@@ -470,6 +531,7 @@ def qualify_no_books(
     min_edge: Decimal = DEFAULT_MIN_EDGE,
     model_weight: Decimal = DEFAULT_MODEL_WEIGHT,
     spread_inflation: Decimal = DEFAULT_SPREAD_INFLATION,
+    coverage_alpha: Decimal = DEFAULT_COVERAGE_ALPHA,
 ) -> dict[str, Any]:
     observed_whole = whole_degree(observed_max)
     model = model_posterior(
@@ -480,9 +542,12 @@ def qualify_no_books(
     )
     market = devig_yes_prices(buckets, observed_whole=observed_whole)
     blended = blend_posteriors(model, market, model_weight=model_weight)
+    band = set(coverage_band(blended, alpha=coverage_alpha))
     rows: list[dict[str, Any]] = []
+    qualified_indexes: list[int] = []
     for index, bucket in enumerate(buckets):
         dead = bucket.is_dead(observed_whole)
+        in_band = (not dead) and index in band
         p_model = model[index]
         p_market = market[index]
         p_blend = blended[index]
@@ -493,6 +558,7 @@ def qualify_no_books(
             "p_market_devig": str(p_market),
             "p_blend": str(p_blend),
             "side": "NO",
+            "in_coverage_band": in_band,
             "no_ask": None if bucket.no_ask is None else str(bucket.no_ask),
             "fee_rate": None if bucket.fee_rate is None else str(bucket.fee_rate),
             "ev": None,
@@ -512,21 +578,35 @@ def qualify_no_books(
         ev = no_ev(p_yes=p_yes, no_ask=bucket.no_ask, fee_rate=bucket.fee_rate)
         row["ev"] = str(ev)
         row["fee"] = str(taker_fee(rate=bucket.fee_rate, price=bucket.no_ask))
+        if in_band:
+            row["skip_reason"] = FORECAST_COVERAGE_BAND
+            rows.append(row)
+            continue
         if dead:
             qualifies = ev > ZERO
         else:
             qualifies = ev >= min_edge
         if qualifies:
             row["qualify"] = True
+            qualified_indexes.append(index)
         else:
             row["skip_reason"] = "NO_EDGE_BELOW_MIN"
         rows.append(row)
     exclude_ev, exclude_label = forecast_exclude_no_ev(buckets, blended)
+    band_titles = [buckets[index].title for index in sorted(band)]
     return {
         "observed_whole": str(observed_whole),
         "min_edge": str(min_edge),
         "model_weight": str(model_weight),
         "spread_inflation": str(spread_inflation),
+        "coverage_alpha": str(coverage_alpha),
+        "coverage_band": band_titles,
+        "selected_no_basket": selected_no_basket(
+            buckets,
+            blended,
+            qualified_indexes=qualified_indexes,
+            observed_whole=observed_whole,
+        ),
         "htt_wallet": HTT_WALLET,
         "poly_live_trading_armed": False,
         "buckets": rows,
