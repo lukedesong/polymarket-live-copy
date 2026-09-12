@@ -1,0 +1,20 @@
+{
+  "shadow_name": "wx-s3-shadow",
+  "aum_usd": "5000",
+  "size_per_bin_usd": "100",
+  "leftover_cap_usd": "100",
+  "leftover_ask_max": "0.99",
+  "min_shares": "5",
+  "shares_decimals": 2,
+  "min_edge": "0.04",
+  "coverage_alpha": "0.85",
+  "model_weight": "0.5",
+  "spread_inflation": "0.15",
+  "tick_s": 20,
+  "ensemble_data_root": "/opt/ensemble-collect/data/ensemble_daily",
+  "ensemble_city_config": "/opt/ensemble-collect/config/ensemble_cities.json",
+  "clock_watch_path": "/opt/noaa-max-clock/data/city_watch.json",
+  "real_order_submitted": false,
+  "record_only": true,
+  "note": "Record only. $100/bin walks the ask book (not 卖一 only) while EV/dead gates hold; px>=0.99 skipped. Rest-sell 0.99. WRH Synoptic only for dead."
+}
