@@ -29,6 +29,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 5
 REQUEST_TIMEOUT_SEC = 120
 CITY_CHUNK = 12
+CHUNK_PAUSE_SEC = 1.5
 
 
 def _layout():
@@ -167,6 +168,7 @@ def main():
                 for city in chunk:
                     missing.append((city["slug"], model, "request_failed"))
                     summary["cities_missing"] += 1
+                time.sleep(CHUNK_PAUSE_SEC)
                 continue
             for city, loc in zip(chunk, raw):
                 try:
@@ -178,6 +180,7 @@ def main():
                     print(f"[warn] city={city['slug']} model={model}: {exc}", file=sys.stderr)
                     missing.append((city["slug"], model, str(exc)))
                     summary["cities_missing"] += 1
+            time.sleep(CHUNK_PAUSE_SEC)
         model_summary[model] = summary
     output_root.mkdir(parents=True, exist_ok=True)
     out_dir = output_root / fetched_at.strftime("%Y-%m-%d")
