@@ -1,0 +1,16 @@
+[Unit]
+Description=Ensemble hourly temperature collector for shadow 4 nowcast (RECORD ONLY, no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=lukeadmin
+Group=lukeadmin
+WorkingDirectory=/opt/ensemble-collect
+ExecStart=/usr/bin/python3 /opt/ensemble-collect/ensemble_hourly_collect.py
+Nice=10
+TimeoutStartSec=180
+UnsetEnvironment=POLYMARKET_LIVE_TRADING TEMPX_LIVE_TRADING POLYMARKET_PRIVATE_KEY POLYMARKET_API_KEY POLYMARKET_API_SECRET POLYMARKET_PASSPHRASE LIVETENNIS_API_KEY HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy POLYMARKET_PROXY_URL
+NoNewPrivileges=yes
+PrivateTmp=true

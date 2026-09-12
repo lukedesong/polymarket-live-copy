@@ -1,0 +1,21 @@
+[Unit]
+Description=Weather nowcast-reprice record ledger (RECORD ONLY, shadow 4, does not modify wx-s3-shadow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lukeadmin
+Group=lukeadmin
+WorkingDirectory=/opt/wx-s4-shadow
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/wx-s4-shadow/wx_s4_shadow.py --runtime-dir /opt/wx-s4-shadow/data
+Restart=always
+RestartSec=8
+Nice=10
+UnsetEnvironment=POLYMARKET_LIVE_TRADING TEMPX_LIVE_TRADING POLYMARKET_PRIVATE_KEY POLYMARKET_API_KEY POLYMARKET_API_SECRET POLYMARKET_PASSPHRASE LIVETENNIS_API_KEY HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy POLYMARKET_PROXY_URL
+NoNewPrivileges=yes
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

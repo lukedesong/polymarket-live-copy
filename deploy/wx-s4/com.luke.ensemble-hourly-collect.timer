@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ensemble hourly collector every hour (shadow 4 nowcast input, RECORD ONLY)
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+Unit=com.luke.ensemble-hourly-collect.service
+
+[Install]
+WantedBy=timers.target

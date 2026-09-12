@@ -273,7 +273,7 @@ def _zero_dead_and_renormalize(
 ) -> tuple[Decimal, ...]:
     adjusted: list[Decimal] = []
     live_mass = ZERO
-    for bucket, prob in zip(buckets, probs, strict=True):
+    for bucket, prob in zip(buckets, probs):
         if bucket.is_dead(observed_whole):
             adjusted.append(ZERO)
         else:
@@ -343,7 +343,7 @@ def blend_posteriors(
         raise WeatherModelError("POSTERIOR_LENGTH_MISMATCH")
     blended = [
         model_weight * left + (ONE - model_weight) * right
-        for left, right in zip(model, market, strict=True)
+        for left, right in zip(model, market)
     ]
     total = sum(blended, ZERO)
     if total <= ZERO:
