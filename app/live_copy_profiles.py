@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
@@ -84,6 +85,45 @@ def _canonical_hash(payload: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+TENNIS_EXACT_TAG_SLUGS = frozenset({"atp", "wta", "itf", "uts", "challenger"})
+TENNIS_EVENT_SLUG_PREFIXES = ("atp-", "wta-", "itf-", "uts-", "challenger-")
+_TENNIS_WORD_RE = re.compile(r"\btennis\b", re.IGNORECASE)
+
+
+def _extract_tag_slugs(*tag_sources: Any) -> tuple[str, ...]:
+    slugs: list[str] = []
+    for tags in tag_sources:
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if isinstance(tag, dict):
+                slug = _text(tag.get("slug")).lower()
+                if slug:
+                    slugs.append(slug)
+    return tuple(sorted(set(slugs)))
+
+
+def _classify_sport(
+    *,
+    tag_slugs: tuple[str, ...],
+    event_slug: str,
+    market_slug: str,
+    topic_text: str,
+) -> str:
+    for slug in tag_slugs:
+        if slug == "tennis" or "tennis" in slug:
+            return "TENNIS_SLEEVE"
+        if slug in TENNIS_EXACT_TAG_SLUGS:
+            return "TENNIS_SLEEVE"
+    for slug in (event_slug, market_slug):
+        for prefix in TENNIS_EVENT_SLUG_PREFIXES:
+            if slug.startswith(prefix):
+                return "TENNIS_SLEEVE"
+    if _TENNIS_WORD_RE.search(topic_text):
+        return "TENNIS_SLEEVE"
+    return "NON_TENNIS_SLEEVE"
 
 
 def _token_ids(value: Any) -> tuple[str, ...]:
@@ -246,6 +286,13 @@ class OfficialEventMetadataResolver:
         topic_text = " ".join(
             (question, event_title, market_slug, event_slug)
         ).casefold()
+        tag_slugs = _extract_tag_slugs(events[0].get("tags"), market.get("tags"))
+        sport_classification = _classify_sport(
+            tag_slugs=tag_slugs,
+            event_slug=event_slug,
+            market_slug=market_slug,
+            topic_text=topic_text,
+        )
         return {
             "condition_id": condition,
             "primary_token_id": primary_token_id,
@@ -255,9 +302,11 @@ class OfficialEventMetadataResolver:
             "event_slug": event_slug,
             "question": question,
             "event_title": event_title,
+            "tag_slugs": tag_slugs,
             "topic_classification": (
                 "NETFLIX" if "netflix" in topic_text else "NON_NETFLIX"
             ),
+            "sport_classification": sport_classification,
             "active": market.get("active"),
             "closed": market.get("closed"),
             "accepting_orders": market.get("acceptingOrders"),
@@ -373,6 +422,43 @@ class FullWalletEventScope:
 
     def resolve_action(self, action: Any) -> ScopeDecision:
         return self.resolve(getattr(action, "token_id", ""))
+
+    def resolve_retry_lifecycle(
+        self,
+        action: Any,
+        frozen_metadata: Mapping[str, Any],
+    ) -> ScopeDecision:
+        evidence = self.resolver.resolve_frozen_market_lifecycle(
+            token_id=getattr(action, "token_id", ""),
+            frozen_metadata=frozen_metadata,
+        )
+        return ScopeDecision(True, "OFFICIAL_RETRY_MARKET_LIFECYCLE", evidence)
+
+
+class TennisSleeveEventScope:
+    """Follow tennis sleeves; non-tennis BUY skips, non-tennis SELL maps inventory."""
+
+    def __init__(self, public_get_json: PublicJSONReader):
+        self.resolver = OfficialEventMetadataResolver(public_get_json)
+
+    def resolve(self, token_id: str) -> ScopeDecision:
+        evidence = self.resolver.resolve(token_id)
+        if evidence.get("sport_classification") == "TENNIS_SLEEVE":
+            return ScopeDecision(True, "TENNIS_SLEEVE_ACTION_ELIGIBLE", evidence)
+        return ScopeDecision(False, "SCOPE_EXCLUDED_NON_TENNIS_SLEEVE", evidence)
+
+    def resolve_action(self, action: Any) -> ScopeDecision:
+        evidence = self.resolver.resolve(getattr(action, "token_id", ""))
+        if evidence.get("sport_classification") == "TENNIS_SLEEVE":
+            return ScopeDecision(True, "TENNIS_SLEEVE_ACTION_ELIGIBLE", evidence)
+        side = _text(getattr(action, "side", "")).upper()
+        if side == "SELL":
+            return ScopeDecision(
+                True,
+                "NON_TENNIS_SLEEVE_SELL_MAPS_EXISTING_INVENTORY_ONLY",
+                evidence,
+            )
+        return ScopeDecision(False, "SCOPE_EXCLUDED_NON_TENNIS_SLEEVE", evidence)
 
     def resolve_retry_lifecycle(
         self,

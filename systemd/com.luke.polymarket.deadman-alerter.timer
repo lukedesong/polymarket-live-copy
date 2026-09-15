@@ -3,7 +3,7 @@ Description=Run dead-man liveness alerter every 2 minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=2min
+OnCalendar=*:0/2
 AccuracySec=15s
 Persistent=true
 

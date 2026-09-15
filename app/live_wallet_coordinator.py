@@ -854,7 +854,34 @@ class SharedWalletCoordinator:
                 raw_cash[sleeve.profile_key] = _ledger_cash(ledger)
                 ownership[sleeve.profile_key] = _ledger_ownership(ledger)
             hashes[sleeve.profile_key] = _sha256(sleeve.ledger_path)
-        _assert_disjoint_sleeve_ownership(ownership)
+        new_keys = set(requested) - set(existing)
+        if new_keys:
+            # Legacy registered sleeves may have grown overlapping inventory
+            # after their original migration.  Re-asserting that historical
+            # overlap would block adding an empty new sleeve.  Only the new
+            # sleeve must not collide with anyone.
+            for new_key in sorted(new_keys):
+                new_tokens, new_conditions = ownership[new_key]
+                for other_key in sorted(ownership):
+                    if other_key == new_key:
+                        continue
+                    other_tokens, other_conditions = ownership[other_key]
+                    shared_tokens = new_tokens & other_tokens
+                    if shared_tokens:
+                        token = next(iter(sorted(shared_tokens)))
+                        raise SharedWalletCoordinatorError(
+                            "CROSS_SLEEVE_TOKEN_OWNERSHIP:"
+                            f"{token}:{other_key}:{new_key}"
+                        )
+                    shared_conditions = new_conditions & other_conditions
+                    if shared_conditions:
+                        condition = next(iter(sorted(shared_conditions)))
+                        raise SharedWalletCoordinatorError(
+                            "CROSS_SLEEVE_CONDITION_OWNERSHIP:"
+                            f"{condition}:{other_key}:{new_key}"
+                        )
+        else:
+            _assert_disjoint_sleeve_ownership(ownership)
 
         raw_total = sum(raw_cash.values(), ZERO)
         overlap = max(raw_total - physical, ZERO)

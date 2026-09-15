@@ -1020,6 +1020,22 @@ class FakeExecution:
         return self.associated_trades[order_id]
 
 
+class SourceTokenSizeSnapshotExecution(FakeExecution):
+    def __init__(self, *, source_token_size: str, **kwargs):
+        super().__init__(**kwargs)
+        self._source_token_size = source_token_size
+
+    def snapshot(self, *, token_id: str, side: str):
+        snap = super().snapshot(token_id=token_id, side=side)
+        snap["source_token_size"] = self._source_token_size
+        return snap
+
+
+class FailingSourceTokenSizeExecution(FakeExecution):
+    def source_token_size(self, *, token_id: str, source_wallet: str | None):
+        raise RuntimeError("SOURCE_TOKEN_SIZE_FETCH_FAILED")
+
+
 class FakePreparedExecution(FakeExecution):
     def __init__(self, *, response=None, error=None):
         super().__init__(response=response, error=error)
@@ -1198,7 +1214,8 @@ class FakeCLOBClient:
 
     def cancel_order(self, payload):
         self.cancellations.append(payload.orderID)
-        self.open_order_ids.discard(payload.orderID)
+        if not getattr(self, "keep_open_after_cancel", False):
+            self.open_order_ids.discard(payload.orderID)
         return {"canceled": [payload.orderID], "not_canceled": {}}
 
     def get_open_orders(self):
@@ -2236,6 +2253,60 @@ def test_scale_rebase_refuses_an_active_order_reservation(tmp_path: Path):
     assert store.fixed_share_scale() == D("0.25")
 
 
+def test_scale_rebase_allows_pending_confirmed_zero_fill_without_submission(
+    tmp_path: Path,
+):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    source = action()
+    assert store.record_action_receipt(source) is True
+    store.append_transition(
+        source=source,
+        status="PENDING_CONFIRMED_ZERO_FILL",
+        reason="CURRENT_BOOK_UNAVAILABLE_FOR_LIQUIDITY_RETRY",
+    )
+
+    result = store.rebase_fixed_share_scale(
+        multiplier=D("2"),
+        change_id="cd90-20260826-user-authorized-200pct",
+        effective_after_block=100,
+        resume_from_block=90,
+        requested_at_ms=3,
+    )
+
+    assert result["new_scale"] == D("0.50")
+    assert store.fixed_share_scale() == D("0.50")
+
+
+def test_operator_planned_resume_allows_pending_confirmed_zero_fill(tmp_path: Path):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    store.set_runtime("last_processed_block", "100")
+    source = action()
+    assert store.record_action_receipt(source) is True
+    store.append_transition(
+        source=source,
+        status="PENDING_CONFIRMED_ZERO_FILL",
+        reason="FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE",
+    )
+
+    result = store.arm_planned_operator_resume(
+        resume_from_block=100,
+        change_id="cd90-20260826-pending-zero-fill-resume",
+        reason="PENDING_ZERO_FILL_SURVIVES_CUTOVER",
+        armed_at_ms=1,
+    )
+
+    assert result["resume_from_block"] == 100
+    assert result["idempotent"] is False
+    assert store.runtime_value("operator_planned_resume_state") == "PENDING"
+    assert store.runtime_value("operator_planned_resume_from_block") == "100"
+
+
 def test_operator_planned_resume_is_idempotent_and_requires_the_persisted_cursor(
     tmp_path: Path,
 ):
@@ -3017,7 +3088,7 @@ def test_cd90_skip_policy_never_submits_a_below_minimum_scaled_action(tmp_path: 
     assert latest["reason"] == "PROPORTIONAL_QUANTITY_BELOW_MARKET_MINIMUM"
 
 
-def test_cd90_skip_policy_never_upsizes_a_sell_even_with_available_inventory(
+def test_cd90_skip_policy_upsizes_a_sell_to_market_minimum_when_copy_inventory_covers_it(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -3047,11 +3118,223 @@ def test_cd90_skip_policy_never_upsizes_a_sell_even_with_available_inventory(
     )
 
     assert result == {
+        "terminal_status": "SUBMITTED_UNRECONCILED",
+        "reason": "MINIMUM_ORDER_SIZE_UPSCALE",
+    }
+    assert execution.calls[-1]["size"] == D("5")
+    assert store.position_quantity("123") == D("100")
+
+
+def _ratio_sell_setup(
+    tmp_path: Path,
+    *,
+    held: str,
+    source_token_size: str,
+    sell_quantity: str = "40",
+) -> tuple[LiveStore, SourceAction, SourceTokenSizeSnapshotExecution]:
+    store = LiveStore(tmp_path / "ratio.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("1000"),
+        observed_at_ms=1,
+    )
+    with store.connect() as connection:
+        connection.execute(
+            "INSERT INTO positions(token_id, quantity, cost_basis_usd) "
+            f"VALUES('123', '{held}', '40')"
+        )
+    source = action(side="SELL", quantity=sell_quantity)
+    execution = SourceTokenSizeSnapshotExecution(source_token_size=source_token_size)
+    return store, source, execution
+
+
+def test_cd90_sell_ratio_unwind_submits_target_reduction(tmp_path: Path):
+    store, source, execution = _ratio_sell_setup(
+        tmp_path, held="12", source_token_size="60"
+    )
+    held_before = store.position_quantity("123")
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "SUBMITTED_UNRECONCILED",
+        "reason": "SOURCE_RATIO_UNWIND",
+    }
+    assert execution.calls[-1]["size"] == D("6")
+    assert store.position_quantity("123") == held_before
+
+
+def test_cd90_sell_ratio_flatten_when_source_token_is_gone(tmp_path: Path):
+    store, source, execution = _ratio_sell_setup(
+        tmp_path, held="12", source_token_size="0"
+    )
+    held_before = store.position_quantity("123")
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "SUBMITTED_UNRECONCILED",
+        "reason": "SOURCE_RATIO_FLATTEN",
+    }
+    assert execution.calls[-1]["size"] == D("12")
+    assert store.position_quantity("123") == held_before
+
+
+def test_cd90_sell_ratio_skips_when_copy_already_under_target(tmp_path: Path):
+    store, source, execution = _ratio_sell_setup(
+        tmp_path, held="4", source_token_size="60"
+    )
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
         "terminal_status": "SKIPPED",
-        "reason": "PROPORTIONAL_QUANTITY_BELOW_MARKET_MINIMUM",
+        "reason": "SOURCE_RATIO_ALREADY_AT_OR_BELOW_TARGET",
     }
     assert execution.calls == []
-    assert store.position_quantity("123") == D("100")
+    assert store.position_quantity("123") == D("4")
+
+
+def test_cd90_sell_ratio_caps_at_copy_inventory(tmp_path: Path):
+    store, source, execution = _ratio_sell_setup(
+        tmp_path,
+        held="6",
+        source_token_size="0",
+        sell_quantity="100",
+    )
+    held_before = store.position_quantity("123")
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "SUBMITTED_UNRECONCILED",
+        "reason": "SOURCE_RATIO_FLATTEN",
+    }
+    assert execution.calls[-1]["size"] == D("6")
+    assert store.position_quantity("123") == held_before
+
+
+def test_cd90_sell_ratio_upsizes_below_minimum_unwind(tmp_path: Path):
+    store, source, execution = _ratio_sell_setup(
+        tmp_path, held="12", source_token_size="80"
+    )
+    held_before = store.position_quantity("123")
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "SUBMITTED_UNRECONCILED",
+        "reason": "MINIMUM_ORDER_SIZE_UPSCALE",
+    }
+    assert execution.calls[-1]["size"] == D("5")
+    assert store.position_quantity("123") == held_before
+
+
+def test_cd90_sell_ratio_fetch_failure_falls_back_to_fill_times_scale(
+    tmp_path: Path,
+):
+    store = LiveStore(tmp_path / "fetch-fail.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("1000"),
+        observed_at_ms=1,
+    )
+    store.lock_config_once(
+        "source_wallet", "0x" + "a" * 40
+    )
+    with store.connect() as connection:
+        connection.execute(
+            "INSERT INTO positions(token_id, quantity, cost_basis_usd) "
+            "VALUES('123', '12', '40')"
+        )
+    source = action(side="SELL", quantity="40")
+    execution = FailingSourceTokenSizeExecution()
+    held_before = store.position_quantity("123")
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "SUBMITTED_UNRECONCILED",
+        "reason": "MINIMUM_ORDER_SIZE_UPSCALE",
+    }
+    assert execution.calls[-1]["size"] == D("5")
+    assert store.position_quantity("123") == held_before
+    with store.connect() as connection:
+        errors = connection.execute(
+            "SELECT category FROM runtime_errors"
+        ).fetchall()
+    assert [row["category"] for row in errors] == ["EXTERNAL_SOURCE_POSITION"]
+
+
+def test_fetch_source_token_size_reads_matching_position_page(monkeypatch):
+    def fake_json(url: str):
+        assert "positions?" in url
+        return [{"asset": "123", "size": "60"}]
+
+    monkeypatch.setattr(live, "_bounded_public_json", fake_json)
+    assert live.fetch_source_token_size("0x" + "b" * 40, "123") == D("60")
+
+
+def test_fetch_source_token_size_raises_when_token_missing(monkeypatch):
+    def fake_json(url: str):
+        return [{"asset": "999", "size": "60"}]
+
+    monkeypatch.setattr(live, "_bounded_public_json", fake_json)
+    with pytest.raises(LiveConfigurationError, match="SOURCE_TOKEN_SIZE_UNAVAILABLE"):
+        live.fetch_source_token_size("0x" + "c" * 40, "123")
+
+
+def test_fetch_source_token_size_returns_explicit_zero_when_row_size_is_zero(
+    monkeypatch,
+):
+    def fake_json(url: str):
+        return [{"asset": "123", "size": "0"}]
+
+    monkeypatch.setattr(live, "_bounded_public_json", fake_json)
+    assert live.fetch_source_token_size("0x" + "d" * 40, "123") == D("0")
+
+
+def test_fetch_source_token_size_raises_when_matched_row_has_empty_size(
+    monkeypatch,
+):
+    def fake_json(url: str):
+        return [{"asset": "123"}]
+
+    monkeypatch.setattr(live, "_bounded_public_json", fake_json)
+    with pytest.raises(LiveConfigurationError, match="SOURCE_TOKEN_SIZE_UNAVAILABLE"):
+        live.fetch_source_token_size("0x" + "e" * 40, "123")
 
 
 def test_shallow_buy_book_still_submits_a_minimum_fak_attempt(tmp_path: Path):
@@ -5872,6 +6155,241 @@ def test_buy_above_user_price_ceiling_allows_fees_when_execution_price_has_no_lo
     assert len(execution.calls) == 1
 
 
+def test_buy_above_user_price_ceiling_tolerates_raw_unit_vwap_truncation(
+    tmp_path: Path,
+):
+    """A same-tick BUY must not be blocked by integer raw-amount truncation.
+
+    Live counterexample (wallet 9506, Shanghai 29C 2026-08-16): the source
+    order price was 0.93, but on-chain maker/taker raw amounts are floored to
+    1e-6, so notional/quantity reconstructs 0.9299999931... and a 0.93 Ask was
+    misjudged as an execution loss.  The reconstructed VWAP can understate the
+    true order price by at most one raw unit spread across the quantity.
+    """
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+
+    class HighPriceExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            snapshot = super().snapshot(token_id=token_id, side=side)
+            snapshot["best_price"] = "0.93"
+            return snapshot
+
+    execution = HighPriceExecution()
+    # 92.729998 / 99.709676 = 0.92999999318... (true source order price 0.93)
+    source = replace(
+        action(quantity="99.709676"),
+        source_notional=D("92.729998"),
+    )
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result["terminal_status"] == "SUBMITTED_UNRECONCILED"
+    assert len(execution.calls) == 1
+
+
+def test_buy_above_user_price_ceiling_still_blocks_a_real_price_loss(
+    tmp_path: Path,
+):
+    """The raw-unit tolerance must not admit a genuinely higher Ask."""
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+
+    class HighPriceExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            snapshot = super().snapshot(token_id=token_id, side=side)
+            snapshot["best_price"] = "0.95"
+            return snapshot
+
+    execution = HighPriceExecution()
+    # 181.949988 / 193.18104 = 0.9418625... (real gap to 0.95, not noise)
+    source = replace(
+        action(quantity="193.18104"),
+        source_notional=D("181.949988"),
+    )
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert result == {
+        "terminal_status": "EXTERNAL_UNFILLABLE",
+        "reason": "BUY_PRICE_ABOVE_0_90_WITH_EXECUTION_LOSS",
+    }
+    assert execution.calls == []
+
+
+def test_zockdo_skips_source_buy_at_or_above_0_80_including_exactly_0_80():
+    assert (
+        live.buy_price_gate_reason(
+            side="BUY",
+            source_vwap=D("0.80"),
+            source_quantity=D("40"),
+            our_worst_price=D("0.40"),
+            profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+        )
+        == "SOURCE_BUY_PRICE_AT_OR_ABOVE_0_80"
+    )
+    assert (
+        live.buy_price_gate_reason(
+            side="BUY",
+            source_vwap=D("0.79"),
+            source_quantity=D("40"),
+            our_worst_price=D("0.40"),
+            profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+        )
+        is None
+    )
+
+
+def test_zockdo_skips_our_buy_above_0_90_even_when_matching_source():
+    assert (
+        live.buy_price_gate_reason(
+            side="BUY",
+            source_vwap=D("0.93"),
+            source_quantity=D("40"),
+            our_worst_price=D("0.93"),
+            profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+        )
+        == "SOURCE_BUY_PRICE_AT_OR_ABOVE_0_80"
+    )
+    assert (
+        live.buy_price_gate_reason(
+            side="BUY",
+            source_vwap=D("0.79"),
+            source_quantity=D("40"),
+            our_worst_price=D("0.91"),
+            profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+        )
+        == "BUY_PRICE_ABOVE_0_90"
+    )
+    assert (
+        live.buy_price_gate_reason(
+            side="BUY",
+            source_vwap=D("0.93"),
+            source_quantity=D("40"),
+            our_worst_price=D("0.93"),
+            profile_key=None,
+        )
+        is None
+    )
+    assert (
+        live.buy_price_gate_reason(
+            side="SELL",
+            source_vwap=D("0.85"),
+            source_quantity=D("40"),
+            our_worst_price=D("0.85"),
+            profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+        )
+        is None
+    )
+
+
+def test_zockdo_live_buy_does_not_submit_source_price_at_0_80(tmp_path: Path):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    source = replace(action(quantity="40"), source_notional=D("32"))
+    execution = FakeExecution()
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+        profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+    )
+
+    assert result == {
+        "terminal_status": "EXTERNAL_UNFILLABLE",
+        "reason": "SOURCE_BUY_PRICE_AT_OR_ABOVE_0_80",
+    }
+    assert execution.calls == []
+
+
+def test_zockdo_live_buy_still_submits_source_price_below_0_80(tmp_path: Path):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    source = replace(action(quantity="40"), source_notional=D("31.6"))
+    execution = FakeExecution()
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+        profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+    )
+
+    assert result["terminal_status"] == "SUBMITTED_UNRECONCILED"
+    assert len(execution.calls) == 1
+
+
+def test_zockdo_live_buy_cancels_same_price_follow_above_0_90(tmp_path: Path):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+
+    class HighPriceExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            snapshot = super().snapshot(token_id=token_id, side=side)
+            snapshot["best_price"] = "0.93"
+            return snapshot
+
+    source = replace(
+        action(quantity="99.709676"),
+        source_notional=D("92.729998"),
+    )
+    execution = HighPriceExecution()
+
+    result = execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+        profile_key=live.LIVE_PROFILE_ZOCKDO_FULL_WALLET,
+    )
+
+    assert result == {
+        "terminal_status": "EXTERNAL_UNFILLABLE",
+        "reason": "SOURCE_BUY_PRICE_AT_OR_ABOVE_0_80",
+    }
+    assert execution.calls == []
+
+
 def test_retry_closure_does_not_submit_non_liquidity_pending_actions(
     tmp_path: Path,
 ):
@@ -7799,8 +8317,18 @@ def test_clob_adapter_submits_a_fak_market_order_with_buy_amount_derived_from_ex
 
 def test_clob_adapter_posts_multiple_active_cancel_orders_without_waiting(monkeypatch):
     client = FakeCLOBClient()
+
+    class ReceiptReader:
+        @staticmethod
+        def latest_block_number():
+            assert client.cancellations
+            assert client.get_open_orders() == []
+            return 101
+
     adapter = CLOBExecutionAdapter(
-        client, minimum_marketable_buy_notional_usd=D("1")
+        client,
+        minimum_marketable_buy_notional_usd=D("1"),
+        receipt_reader=ReceiptReader(),
     )
     adapter.snapshot(token_id="123", side="BUY")
 
@@ -7837,13 +8365,45 @@ def test_clob_adapter_posts_multiple_active_cancel_orders_without_waiting(monkey
     assert len(client.created_orders) == 2
     assert len(client.submissions) == 2
 
-    adapter.cancel_active_gtd_order(first_response["orderID"])
-    adapter.cancel_active_gtd_order(second_response["orderID"])
+    first_cancel = adapter.cancel_active_gtd_order(first_response["orderID"])
+    second_cancel = adapter.cancel_active_gtd_order(second_response["orderID"])
+    assert first_cancel["active_cancel_observed_head_block"] == 101
+    assert second_cancel["active_cancel_observed_head_block"] == 101
     assert client.cancellations == [
         first_response["orderID"],
         second_response["orderID"],
     ]
     assert client.get_open_orders() == []
+
+
+def test_clob_adapter_cancel_still_open_is_unverified_not_fatal():
+    client = FakeCLOBClient()
+    client.keep_open_after_cancel = True
+
+    class ReceiptReader:
+        @staticmethod
+        def latest_block_number():
+            raise AssertionError("still-open cancel must not claim a finalized head")
+
+    adapter = CLOBExecutionAdapter(
+        client,
+        minimum_marketable_buy_notional_usd=D("1"),
+        receipt_reader=ReceiptReader(),
+    )
+    adapter.snapshot(token_id="123", side="BUY")
+    prepared = adapter.prepare_gtd_limit(
+        token_id="123",
+        side="BUY",
+        price=D("0.40"),
+        size=D("10"),
+    )
+    response = adapter.submit_prepared_gtd_limit(prepared)
+    result = adapter.cancel_active_gtd_order(response["orderID"])
+
+    assert result["active_cancel_verified"] is False
+    assert result["active_cancel_still_open"] is True
+    assert client.cancellations == [response["orderID"]]
+    assert client.get_open_orders() == [{"id": response["orderID"]}]
 
 
 def test_due_active_cancel_is_run_after_nonblocking_submission():
@@ -7908,6 +8468,209 @@ def test_due_active_cancel_is_run_after_nonblocking_submission():
     assert store.transitions[0]["status"] == "ACTIVE_CANCEL_COMPLETED"
 
 
+def test_partial_gtc_is_canceled_before_the_active_cancel_deadline():
+    source = action(marker="partial")
+
+    class PartialStore:
+        def __init__(self):
+            self.updated = []
+            self.transitions = []
+
+        def unreconciled_submissions(self):
+            return [
+                (
+                    source,
+                    {
+                        "attempt_id": "attempt-partial",
+                        "order_id": "order-partial",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "plan": {"requested_quantity": "10"},
+                        "response": {"active_cancel_due_at_ms": 1_000},
+                    },
+                )
+            ]
+
+        def update_attempt_state(self, **kwargs):
+            self.updated.append(kwargs)
+
+        def append_transition(self, **kwargs):
+            self.transitions.append(kwargs)
+
+    class Execution:
+        def __init__(self):
+            self.cancelled = []
+
+        @staticmethod
+        def get_order(order_id):
+            assert order_id == "order-partial"
+            return {
+                "status": "MATCHED",
+                "size_matched": "2",
+                "original_size": "10",
+            }
+
+        def cancel_active_gtd_order(self, order_id):
+            self.cancelled.append(order_id)
+            return {
+                "active_cancel_verified": True,
+                "active_cancel_observed_head_block": 101,
+            }
+
+    store = PartialStore()
+    execution = Execution()
+
+    result = live.cancel_due_active_gtd_orders(
+        store=store, execution=execution, due_at_ms=100
+    )
+
+    assert result == [{"order_id": "order-partial", "terminal_status": "CANCELED"}]
+    assert execution.cancelled == ["order-partial"]
+    assert store.updated[0]["response"]["active_cancel_trigger"] == (
+        "PARTIAL_FILL_DETECTED"
+    )
+    assert store.updated[0]["response"][
+        "active_cancel_trigger_matched_quantity"
+    ] == "2"
+    assert store.transitions[0]["reason"] == (
+        "GTC_ACTIVE_CANCEL_PARTIAL_FILL_DETECTED"
+    )
+
+
+def test_zero_or_full_gtc_is_not_canceled_before_the_active_cancel_deadline():
+    source = action(marker="not-partial")
+
+    class Store:
+        def unreconciled_submissions(self):
+            return [
+                (
+                    source,
+                    {
+                        "attempt_id": "attempt-not-partial",
+                        "order_id": "order-not-partial",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "plan": {"requested_quantity": "10"},
+                        "response": {"active_cancel_due_at_ms": 1_000},
+                    },
+                )
+            ]
+
+    for matched_quantity in ("0", "10"):
+        class Execution:
+            @staticmethod
+            def get_order(_order_id):
+                return {
+                    "status": "MATCHED",
+                    "size_matched": matched_quantity,
+                    "original_size": "10",
+                }
+
+            @staticmethod
+            def cancel_active_gtd_order(_order_id):
+                raise AssertionError("zero/full fill must not cancel early")
+
+        assert live.cancel_due_active_gtd_orders(
+            store=Store(), execution=Execution(), due_at_ms=100
+        ) == []
+
+
+def test_sell_gtc_is_not_canceled_before_the_active_cancel_deadline():
+    source = action(side="SELL", marker="sell-not-partial")
+
+    class Store:
+        @staticmethod
+        def unreconciled_submissions():
+            return [
+                (
+                    source,
+                    {
+                        "attempt_id": "attempt-sell",
+                        "order_id": "order-sell",
+                        "execution_order_type": "GTC_ACTIVE_CANCEL",
+                        "plan": {"requested_quantity": "10"},
+                        "response": {"active_cancel_due_at_ms": 1_000},
+                    },
+                )
+            ]
+
+    class Execution:
+        @staticmethod
+        def get_order(_order_id):
+            return {
+                "status": "MATCHED",
+                "size_matched": "2",
+                "original_size": "10",
+            }
+
+        @staticmethod
+        def cancel_active_gtd_order(_order_id):
+            raise AssertionError("SELL must not use the BUY early-cancel trigger")
+
+    assert live.cancel_due_active_gtd_orders(
+        store=Store(), execution=Execution(), due_at_ms=100
+    ) == []
+
+
+def test_partial_gtc_cancel_still_open_does_not_crash_release_or_repost(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    order_id = execution.prepared["order_id"]
+    execution.orders[order_id] = {
+        "status": "MATCHED",
+        "size_matched": "2",
+        "original_size": "10",
+    }
+
+    def cancel_active_gtd_order(observed_order_id):
+        assert observed_order_id == order_id
+        raise RuntimeError("ACTIVE_CANCEL_ORDER_STILL_OPEN")
+
+    execution.cancel_active_gtd_order = cancel_active_gtd_order
+    result = live.cancel_due_active_gtd_orders(
+        store=store,
+        execution=execution,
+        due_at_ms=0,
+    )
+
+    assert result == [
+        {
+            "order_id": order_id,
+            "terminal_status": "ACTIVE_CANCEL_ORDER_STILL_OPEN",
+        }
+    ]
+    with store.connect() as connection:
+        attempt = connection.execute(
+            "SELECT state, response_json FROM submission_attempts WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    response = json.loads(attempt["response_json"])
+    assert attempt["state"] == "SUBMITTED_UNRECONCILED"
+    assert response.get("active_cancel_verified") is not True
+    assert response.get("active_cancel_still_open") is True
+    assert int(reservation["active"]) == 1
+    assert store.latest_transition(source)["terminal_status"] == (
+        "ACTIVE_CANCEL_ORDER_STILL_OPEN"
+    )
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+    assert live.cancel_due_active_gtd_orders(
+        store=store,
+        execution=execution,
+        due_at_ms=0,
+    ) == [
+        {
+            "order_id": order_id,
+            "terminal_status": "ACTIVE_CANCEL_ORDER_STILL_OPEN",
+        }
+    ]
+    assert store.submission_attempt_count(source.action_id) == 1
+
+
 def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
     from eth_abi import encode
 
@@ -7967,6 +8730,9 @@ def test_order_hash_reconciliation_uses_the_canonical_order_filled_topic():
     assert result["quantity"] == D("10")
     assert result["notional_usd"] == D("4")
     assert result["vwap_price"] == D("0.4")
+    assert result["scan_from_block"] == 100
+    assert result["scan_to_block"] == 101
+    assert result["finality"] == "polygon_finalized_block"
 
 
 def test_websocket_liveness_timeout_is_independent_from_order_retry_policy():
@@ -8263,6 +9029,7 @@ def test_source_follower_accepts_a_websocket_announced_head_without_polling_late
         "source_action_ids": [],
         "last_processed_block": 100,
         "current_head": 100,
+        "drained_empty_book_pendings": [],
     }
 
 
@@ -8646,6 +9413,187 @@ def test_no_ask_book_failure_is_durable_before_cursor_advance(
     assert store.submission_attempt_count(source.action_id) == 0
     assert execution.calls == []
 
+
+def test_no_ask_on_closed_market_terminalizes_before_retry(tmp_path: Path):
+    class ClosedMarketScope:
+        def resolve(self, _token_id):
+            return ScopeDecision(
+                follow=True,
+                reason="FULL_WALLET_ACTION_ELIGIBLE",
+                metadata={
+                    "condition_id": "condition-closed",
+                    "market_slug": "closed-market",
+                    "event_slug": "closed-event",
+                    "closed": True,
+                    "accepting_orders": False,
+                },
+            )
+
+    class NoAskExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            raise RuntimeError("NO_ASK_BOOK_LEVEL")
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    store.set_runtime("last_processed_block", "99")
+    follower = LiveSourceFollower(
+        store=store,
+        rpc=FakeRpc(head=100),
+        source_wallet="0x" + "a" * 40,
+        clock_ms=lambda: 1_700_000_000_000,
+        action_scope=ClosedMarketScope(),
+    )
+    source = action()
+    follower._new_source_actions = lambda **_kwargs: [source]
+    execution = NoAskExecution()
+
+    follower.run_cycle_to_head(
+        head=100,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    latest = store.latest_transition(source)
+    assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
+    assert latest["reason"] == "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY"
+    assert store.runtime_value("last_processed_block") == "100"
+    assert store.submission_attempt_count(source.action_id) == 0
+    assert execution.calls == []
+
+
+def test_no_ask_on_open_market_stays_pending_external_retry(tmp_path: Path):
+    class OpenMarketScope:
+        def resolve(self, _token_id):
+            return ScopeDecision(
+                follow=True,
+                reason="FULL_WALLET_ACTION_ELIGIBLE",
+                metadata={
+                    "condition_id": "condition-open",
+                    "market_slug": "open-market",
+                    "event_slug": "open-event",
+                    "closed": False,
+                    "accepting_orders": True,
+                },
+            )
+
+    class NoAskExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            raise RuntimeError("NO_ASK_BOOK_LEVEL")
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    store.set_runtime("last_processed_block", "99")
+    follower = LiveSourceFollower(
+        store=store,
+        rpc=FakeRpc(head=100),
+        source_wallet="0x" + "a" * 40,
+        clock_ms=lambda: 1_700_000_000_000,
+        action_scope=OpenMarketScope(),
+    )
+    source = action()
+    follower._new_source_actions = lambda **_kwargs: [source]
+    execution = NoAskExecution()
+
+    follower.run_cycle_to_head(
+        head=100,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    assert store.latest_transition(source)["terminal_status"] == (
+        "PENDING_EXTERNAL_RETRY"
+    )
+    assert store.runtime_value("last_processed_block") == "100"
+    assert store.submission_attempt_count(source.action_id) == 0
+    assert execution.calls == []
+
+
+def test_drain_pending_external_empty_book_on_closed_market(tmp_path: Path):
+    class ChangingMarketScope:
+        def __init__(self):
+            self.calls = 0
+
+        def resolve(self, _token_id):
+            self.calls += 1
+            if self.calls == 1:
+                return ScopeDecision(
+                    follow=True,
+                    reason="FULL_WALLET_ACTION_ELIGIBLE",
+                    metadata={
+                        "condition_id": "condition-changing",
+                        "market_slug": "changing-market",
+                        "event_slug": "changing-event",
+                        "closed": False,
+                        "accepting_orders": True,
+                    },
+                )
+            return ScopeDecision(
+                follow=True,
+                reason="OFFICIAL_RETRY_MARKET_LIFECYCLE",
+                metadata={
+                    "condition_id": "condition-changing",
+                    "market_slug": "changing-market",
+                    "event_slug": "changing-event",
+                    "closed": True,
+                    "accepting_orders": False,
+                },
+            )
+
+    class NoAskExecution(FakeExecution):
+        def snapshot(self, *, token_id: str, side: str):
+            raise RuntimeError("NO_ASK_BOOK_LEVEL")
+
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    store.set_runtime("last_processed_block", "99")
+    scope = ChangingMarketScope()
+    follower = LiveSourceFollower(
+        store=store,
+        rpc=FakeRpc(head=100),
+        source_wallet="0x" + "a" * 40,
+        clock_ms=lambda: 1_700_000_000_000,
+        action_scope=scope,
+    )
+    source = action()
+    follower._new_source_actions = lambda **_kwargs: [source]
+    execution = NoAskExecution()
+
+    follower.run_cycle_to_head(
+        head=100,
+        execution=execution,
+        live_enabled=True,
+    )
+    assert store.latest_transition(source)["terminal_status"] == (
+        "PENDING_EXTERNAL_RETRY"
+    )
+    assert store.action_target(source.action_id) is None
+
+    follower.run_cycle_to_head(
+        head=100,
+        execution=execution,
+        live_enabled=True,
+    )
+
+    latest = store.latest_transition(source)
+    assert latest["terminal_status"] == "EXTERNAL_UNFILLABLE"
+    assert latest["reason"] == "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY"
+    assert store.submission_attempt_count(source.action_id) == 0
+    assert execution.calls == []
 
 
 def test_reopen_no_book_error_preserves_history_and_restores_retryable_state(
@@ -11440,6 +12388,363 @@ def _v2_zero_fill_store(tmp_path: Path):
     return store, source, execution
 
 
+class DelayedActiveCancelExecution(FakePreparedExecution):
+    def __init__(self):
+        super().__init__()
+        self.prepared["order_type"] = "GTC"
+        self.response = {
+            "success": True,
+            "status": "delayed",
+            "orderID": self.prepared["order_id"],
+        }
+        self.orders[self.prepared["order_id"]] = {
+            "status": "MATCHED",
+            "size_matched": "0",
+            "original_size": "10",
+        }
+
+    prepare_gtd_limit = FakePreparedExecution.prepare_fak_market
+    submit_prepared_gtd_limit = FakePreparedExecution.submit_prepared_fak_market
+
+
+def _delayed_active_cancel_store(tmp_path: Path):
+    store = LiveStore(tmp_path / "live.sqlite3")
+    initialize_scale_once(
+        store=store,
+        allocation_usd=D("100"),
+        source_open_position_value_usd=D("400"),
+        observed_at_ms=1,
+    )
+    _activate_liquidity_retry_v2(store)
+    source = action(quantity="40")
+    execution = DelayedActiveCancelExecution()
+    assert execute_source_action(
+        store=store,
+        source=source,
+        execution=execution,
+        live_enabled=True,
+    )["terminal_status"] == "SUBMITTED_UNRECONCILED"
+    execution.authoritative_submission_execution = lambda **_kwargs: None
+    return store, source, execution
+
+
+def test_delayed_gtc_without_completed_cancel_never_becomes_retryable_zero_fill(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "authoritative_no_fill": True,
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_CANCEL_OR_FILL",
+        }
+    ]
+    with store.connect() as connection:
+        attempt = connection.execute(
+            "SELECT state FROM submission_attempts WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    assert attempt["state"] == "SUBMITTED_UNRECONCILED"
+    assert int(reservation["active"]) == 1
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+
+
+def test_canceled_gtc_waits_until_finalized_scan_covers_cancel_head(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "0",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "authoritative_no_fill": True,
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 9,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALITY",
+        }
+    ]
+    assert store.submission_attempt_count(source.action_id) == 1
+
+
+def test_canceled_gtc_zero_fill_retries_only_after_finalized_cancel_boundary(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "0",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "authoritative_no_fill": True,
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 10,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING_CONFIRMED_ZERO_FILL",
+            "reason": "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE",
+        }
+    ]
+    assert store.liquidity_retry_evidence(source) is not None
+
+
+def test_partial_gtc_stays_reserved_and_cannot_retry_before_active_cancel(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "quantity": D("5"),
+        "notional_usd": D("2"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "4" * 64}],
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 1,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_CANCEL_OR_FILL",
+        }
+    ]
+    with store.connect() as connection:
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    assert int(reservation["active"]) == 1
+    assert store.liquidity_retry_evidence(source) is None
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+
+
+def test_partial_gtc_retries_exact_remainder_only_after_post_cancel_finality(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "5",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "quantity": D("5"),
+        "notional_usd": D("2"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "5" * 64}],
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 10,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PARTIAL_PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_PARTIAL_FILL",
+        }
+    ]
+    evidence = store.liquidity_retry_evidence(source)
+    assert evidence is not None
+    assert evidence["cumulative_official_filled_quantity"] == "5"
+    execution.prepared["order_id"] = "0x" + "8" * 64
+    execution.prepared["order_type"] = "FAK"
+    execution.response = {
+        "success": True,
+        "orderID": execution.prepared["order_id"],
+    }
+
+    assert _retry_through_execution(store=store, execution=execution) == [
+        {"terminal_status": "SUBMITTED_UNRECONCILED", "reason": ""}
+    ]
+    assert execution.prepare_calls[-1]["size"] == D("5")
+
+
+def test_partial_gtc_that_fills_during_cancel_finalizes_without_retry(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    order_id = execution.prepared["order_id"]
+    execution.orders[order_id] = {
+        "status": "MATCHED",
+        "size_matched": "2",
+        "original_size": "10",
+    }
+
+    def cancel_active_gtd_order(observed_order_id):
+        assert observed_order_id == order_id
+        return {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+
+    execution.cancel_active_gtd_order = cancel_active_gtd_order
+    assert live.cancel_due_active_gtd_orders(
+        store=store,
+        execution=execution,
+        due_at_ms=0,
+    ) == [{"order_id": order_id, "terminal_status": "CANCELED"}]
+
+    execution.orders[order_id] = {
+        "status": "CANCELED",
+        "size_matched": "10",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: {
+        "quantity": D("10"),
+        "notional_usd": D("4"),
+        "fee_usd": D("0"),
+        "vwap_price": D("0.40"),
+        "receipt_evidence": [{"transaction_hash": "0x" + "6" * 64}],
+        "scan_from_block": source.block_number,
+        "scan_to_block": source.block_number + 10,
+        "finality": "polygon_finalized_block",
+    }
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "FILLED",
+            "reason": "OFFICIAL_ONCHAIN_FILL_RECEIPT",
+        }
+    ]
+    assert store.submission_attempt_count(source.action_id) == 1
+    assert _retry_through_execution(store=store, execution=execution) == []
+    assert len(execution.prepared_submit_calls) == 1
+
+
+def test_legacy_gtc_zero_fill_without_post_cancel_proof_is_not_retryable(
+    tmp_path: Path,
+):
+    store, source, _execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    store.release_reservation_and_finalize(
+        source=source,
+        terminal_status="PENDING_CONFIRMED_ZERO_FILL",
+        reason="GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE",
+        created_at_ms=2,
+        details={
+            "order_id": attempt["order_id"],
+            "attempt_id": attempt["attempt_id"],
+            "chain_scan": {
+                "from_block": source.block_number,
+                "to_block": source.block_number + 10,
+                "order_filled_log_count": 0,
+                "finality": "polygon_finalized_block",
+            },
+        },
+        attempt_id=attempt["attempt_id"],
+        attempt_state="NO_FILL",
+        attempt_response={"result": "legacy_zero_fill"},
+    )
+
+    assert store.liquidity_retry_evidence(source) is None
+
+
+def test_canceled_gtc_without_finalized_order_hash_proof_keeps_reservation(
+    tmp_path: Path,
+):
+    store, source, execution = _delayed_active_cancel_store(tmp_path)
+    attempt = store.unreconciled_submissions()[0][1]
+    response = dict(attempt["response"])
+    response.update(
+        {
+            "active_cancel_verified": True,
+            "active_cancel_observed_head_block": source.block_number + 10,
+        }
+    )
+    store.update_attempt_state(
+        attempt_id=attempt["attempt_id"],
+        state="SUBMITTED_UNRECONCILED",
+        response=response,
+        updated_at_ms=2,
+    )
+    execution.orders[execution.prepared["order_id"]] = {
+        "status": "CANCELED",
+        "size_matched": "0",
+        "original_size": "10",
+    }
+    execution.authoritative_order_hash_execution = lambda **_kwargs: None
+
+    assert reconcile_submitted_actions(store=store, execution=execution) == [
+        {
+            "terminal_status": "PENDING",
+            "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF",
+        }
+    ]
+    with store.connect() as connection:
+        reservation = connection.execute(
+            "SELECT active FROM order_reservations WHERE action_id=?",
+            (source.action_id,),
+        ).fetchone()
+    assert int(reservation["active"]) == 1
+
+
 def test_liquidity_retry_v2_is_prospective_has_no_deadline_and_preserves_v1(
     tmp_path: Path,
 ):
@@ -11463,7 +12768,9 @@ def test_liquidity_retry_v2_is_prospective_has_no_deadline_and_preserves_v1(
     ) is None
 
 
-def test_finalized_zero_fill_is_closed_without_resubmit(tmp_path: Path):
+def test_finalized_zero_fill_retries_exact_remaining_quantity_without_deadline(
+    tmp_path: Path,
+):
     store, source, execution = _v2_zero_fill_store(tmp_path)
     execution.response = {"success": True, "orderID": "order-2"}
 
@@ -11471,15 +12778,59 @@ def test_finalized_zero_fill_is_closed_without_resubmit(tmp_path: Path):
 
     assert result == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert len(execution.calls) == 1
-    assert store.submission_attempt_count(source.action_id) == 1
+    assert len(execution.calls) == 2
+    assert execution.calls[-1]["size"] == D("10")
+    assert store.submission_attempt_count(source.action_id) == 2
 
 
-def test_gtd_closes_legacy_partial_remainder_without_resubmitting(
+def test_dynamic_buy_limit_uses_depth_and_retains_sixty_percent_of_source_upside():
+    result = live.dynamic_buy_limit_price(
+        source_average_price=D("0.7095365837"),
+        target_quantity=D("21.5788731"),
+        cumulative_filled_quantity=D("0"),
+        cumulative_filled_notional_usd=D("0"),
+        current_best_ask=D("0.74"),
+        tick_size=D("0.01"),
+        raw_asks=[
+            {"price": "0.74", "size": "7.69"},
+            {"price": "0.75", "size": "35"},
+            {"price": "0.90", "size": "20"},
+        ],
+        preserve_first_attempt_price=True,
+    )
+
+    assert result["retained_upside_ratio"] == D("0.60")
+    assert result["average_price_cap"] == D("0.82572195022")
+    assert result["safe_worst_price"] == D("0.82")
+    assert result["order_limit_price"] == D("0.75")
+    assert result["snapshot_projected_vwap"] == D(
+        "0.7464363291983027603049391861"
+    )
+
+
+def test_dynamic_buy_limit_spends_only_proven_price_surplus_on_a_later_retry():
+    result = live.dynamic_buy_limit_price(
+        source_average_price=D("0.70"),
+        target_quantity=D("10"),
+        cumulative_filled_quantity=D("5"),
+        cumulative_filled_notional_usd=D("3.70"),
+        current_best_ask=D("0.90"),
+        tick_size=D("0.01"),
+        raw_asks=[{"price": "0.90", "size": "5"}],
+        preserve_first_attempt_price=False,
+    )
+
+    assert result["average_price_cap"] == D("0.82")
+    assert result["safe_worst_price"] == D("0.90")
+    assert result["order_limit_price"] == D("0.90")
+    assert result["snapshot_projected_total_vwap"] == D("0.82")
+
+
+def test_active_cancel_retries_the_exact_partial_remainder(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -11512,15 +12863,15 @@ def test_gtd_closes_legacy_partial_remainder_without_resubmitting(
     target = store.action_target(source.action_id)
     assert result == [
         {
-            "terminal_status": "PARTIAL",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert [call["size"] for call in execution.calls] == [D("10")]
+    assert [call["size"] for call in execution.calls] == [D("10"), D("5")]
     assert target["target_quantity"] == D("10")
     assert target["cumulative_filled_quantity"] == D("5")
     assert target["remaining_quantity"] == D("5")
-    assert target["state"] == "PARTIAL"
+    assert target["state"] == "SUBMITTED_UNRECONCILED"
 
 
 def test_partial_without_persisted_chain_receipt_never_enters_retry(
@@ -11558,18 +12909,20 @@ def test_partial_without_persisted_chain_receipt_never_enters_retry(
     assert len(execution.calls) == 1
 
 
-def test_finalized_zero_fill_is_closed_once_without_overfill(
+def test_finalized_zero_fill_retries_once_without_overfill(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
+    execution.response = {"success": True, "orderID": "order-2"}
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert store.submission_attempt_count(source.action_id) == 1
-    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 2
+    assert len(execution.calls) == 2
+    assert _retry_through_execution(store=store, execution=execution) == []
 
 
 def test_finalized_zero_fill_restart_does_not_submit_an_unknown_replacement(
@@ -11592,13 +12945,13 @@ def test_finalized_zero_fill_restart_does_not_submit_an_unknown_replacement(
 
     assert first == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "UNKNOWN_SUBMISSION",
+            "reason": "SUBMISSION_TRANSPORT_UNKNOWN:TimeoutError",
         }
     ]
     assert second == []
-    assert retry_execution.calls == []
-    assert restarted.submission_attempt_count(source.action_id) == 1
+    assert len(retry_execution.calls) == 1
+    assert restarted.submission_attempt_count(source.action_id) == 2
 
 
 def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
@@ -11651,8 +13004,8 @@ def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
             start_redemption_cycle=lambda: None,
         ) is True
 
-    assert store.submission_attempt_count(source.action_id) == 1
-    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 2
+    assert len(execution.calls) == 2
 
     execution.response = {"success": True, "orderID": "order-3"}
     assert live._process_live_ws_head(
@@ -11663,11 +13016,11 @@ def test_duplicate_websocket_head_does_not_replace_a_finalized_zero_fill(
         head=103,
         start_redemption_cycle=lambda: None,
     ) is True
-    assert store.submission_attempt_count(source.action_id) == 1
-    assert len(execution.calls) == 1
+    assert store.submission_attempt_count(source.action_id) == 3
+    assert len(execution.calls) == 3
 
 
-def test_finalized_zero_fill_does_not_wait_for_a_better_book(
+def test_finalized_zero_fill_retries_at_the_current_safe_book(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11680,14 +13033,16 @@ def test_finalized_zero_fill_does_not_wait_for_a_better_book(
         return value
 
     execution.snapshot = snapshot
+    execution.response = {"success": True, "orderID": "order-2"}
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert len(execution.calls) == 1
-    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
+    assert len(execution.calls) == 2
+    assert execution.calls[-1]["price"] == D("0.64")
+    assert store.action_target(source.action_id)["state"] == "SUBMITTED_UNRECONCILED"
 
 
 def test_liquidity_retry_ignores_unknown_and_pre_boundary_actions(tmp_path: Path):
@@ -11735,7 +13090,7 @@ def test_finalized_zero_fill_closes_without_reading_a_closed_market(
     assert result == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "reason": "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY",
         }
     ]
     assert len(execution.calls) == before_calls
@@ -11757,12 +13112,12 @@ def test_finalized_zero_fill_closes_without_a_lifecycle_refetch(
 
     assert result == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "PENDING_CONFIRMED_ZERO_FILL",
+            "reason": "OFFICIAL_MARKET_STATE_RESOLVER_UNAVAILABLE_FOR_LIQUIDITY_RETRY",
         }
     ]
     assert len(execution.calls) == before_calls
-    assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
+    assert store.action_target(source.action_id)["state"] == "PENDING_CONFIRMED_ZERO_FILL"
 
 
 def test_later_opposite_terminates_v2_partial_remainder_but_preserves_fill(
@@ -11941,7 +13296,7 @@ def test_v2_retry_uses_an_exact_share_fak_limit_order(tmp_path: Path):
     assert created.price == 0.4
 
 
-def test_finalized_zero_fill_closes_without_a_new_cash_check(
+def test_finalized_zero_fill_rechecks_cash_before_retry(
     tmp_path: Path,
 ):
     store, source, execution = _v2_zero_fill_store(tmp_path)
@@ -11952,14 +13307,14 @@ def test_finalized_zero_fill_closes_without_a_new_cash_check(
     assert result == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "reason": "INSUFFICIENT_AUTHENTICATED_ACCOUNT_CASH_AT_RETRY",
         }
     ]
     assert len(execution.calls) == 1
     assert store.action_target(source.action_id)["state"] == "EXTERNAL_UNFILLABLE"
 
 
-def test_gtd_closes_a_legacy_sell_retry_without_reposting(
+def test_sell_retry_without_inventory_remains_unfillable_without_reposting(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -11997,7 +13352,7 @@ def test_gtd_closes_a_legacy_sell_retry_without_reposting(
     assert _retry_through_execution(store=store, execution=execution) == [
         {
             "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "reason": "NO_LOCAL_INVENTORY_PRE_WATERMARK_OR_PRIOR_MISS",
         }
     ]
     assert len(execution.calls) == 1
@@ -12038,7 +13393,7 @@ def test_v2_retry_remainder_below_current_minimum_is_terminal_without_upscale(
     assert len(execution.calls) == 1
 
 
-def test_finalized_zero_fill_closes_before_new_price_or_fee_checks(
+def test_finalized_zero_fill_above_ninety_retries_only_at_source_price(
     tmp_path: Path,
 ):
     store = LiveStore(tmp_path / "live.sqlite3")
@@ -12079,16 +13434,18 @@ def test_finalized_zero_fill_closes_before_new_price_or_fee_checks(
         "finality": "polygon_finalized_block",
     }
     reconcile_submitted_actions(store=store, execution=execution)
+    execution.response = {"success": True, "orderID": "order-2"}
     assert _retry_through_execution(store=store, execution=execution) == [
         {
-            "terminal_status": "EXTERNAL_UNFILLABLE",
-            "reason": "GTD_POLICY_REPLACED_LIQUIDITY_RETRY",
+            "terminal_status": "SUBMITTED_UNRECONCILED",
+            "reason": "",
         }
     ]
-    assert len(execution.calls) == 1
+    assert len(execution.calls) == 2
+    assert execution.calls[-1]["price"] == D("0.91")
 
 
-def test_liquidity_retry_status_counts_gtd_replacement_termination(
+def test_liquidity_retry_status_counts_official_market_close_termination(
     tmp_path: Path,
 ):
     store, _source, execution = _v2_zero_fill_store(tmp_path)
@@ -12105,7 +13462,7 @@ def test_liquidity_retry_status_counts_gtd_replacement_termination(
     summary = store.liquidity_retry_summary()
 
     assert summary["termination_counts"] == {
-        "GTD_POLICY_REPLACED_LIQUIDITY_RETRY": 1
+        "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY": 1
     }
 
 

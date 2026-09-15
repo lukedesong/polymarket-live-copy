@@ -165,6 +165,28 @@ def _pending(
     )
 
 
+def infer_source_held_after(
+    *,
+    observed_size: Decimal,
+    source_sell_quantity: Decimal,
+) -> Decimal:
+    """Treat official Data API size as remaining-after, not remaining-before.
+
+    Subtracting this fill whenever ``observed_size >= source_sell_quantity``
+    mis-sizes a partial exit: source 100→60 on a sell of 40 would become 20.
+    A lagged pre-fill snapshot undersells once; a later source SELL realigns.
+    ``source_sell_quantity`` is retained as a validated input for callers.
+    """
+
+    observed = _decimal(observed_size)
+    sold = _decimal(source_sell_quantity)
+    if observed < ZERO:
+        raise ScaleInputError("source token size cannot be negative")
+    if sold <= ZERO:
+        raise ScaleInputError("source_sell_quantity must be positive")
+    return observed
+
+
 def plan_action(
     *,
     side: str,
@@ -180,6 +202,8 @@ def plan_action(
     available_cash: Decimal,
     fee_exponent: int | Decimal = Decimal("1"),
     allow_minimum_upscale: bool = False,
+    source_held_after: Decimal | None = None,
+    max_buy_notional_usd: Decimal | None = None,
 ) -> ActionPlan:
     """Plan a FAK action under an explicit market-minimum policy.
 
@@ -187,8 +211,11 @@ def plan_action(
     BUY and best Bid for a SELL.  For a BUY, cash reserves the notional plus a
     conservative protocol-fee bound.  The fixed share-scale is preserved whenever
     it is tradable.  Per the user's execution instruction, a smaller scaled
-    amount can either be raised once to the largest current executable
+    BUY can either be raised once to the largest current executable
     minimum, or be skipped without changing the fixed proportional quantity.
+    A SELL first aligns copy inventory to ``source_held_after * scale`` when
+    that remaining is known, and raises a below-minimum unwind to the market
+    minimum when copy inventory can cover it rather than leaving unsold dust.
     It is never deferred to a newer price; cash, depth, and sell-inventory
     still apply to a tradable target.
     """
@@ -228,51 +255,41 @@ def plan_action(
     buy_notional_minimum_quantity = (
         minimum_buy_notional / price if normalized_side == "BUY" else ZERO
     )
-    if not allow_minimum_upscale:
-        if proportional < minimum:
-            return _skipped(
-                reason="PROPORTIONAL_QUANTITY_BELOW_MARKET_MINIMUM",
-                side=normalized_side,
-                proportional_quantity=proportional,
-                requested_quantity=proportional,
-                best_price=price,
-            )
-        if (
-            normalized_side == "BUY"
-            and proportional < buy_notional_minimum_quantity
-        ):
-            return _skipped(
-                reason="PROPORTIONAL_BUY_NOTIONAL_BELOW_MARKETABLE_MINIMUM",
-                side=normalized_side,
-                proportional_quantity=proportional,
-                requested_quantity=proportional,
-                best_price=price,
-            )
-        requested = proportional
-        share_minimum_override = False
-        buy_notional_override = False
-    elif normalized_side == "BUY":
-        requested = max(proportional, minimum, buy_notional_minimum_quantity)
-        share_minimum_override = (
-            proportional < minimum and minimum >= buy_notional_minimum_quantity
-        )
-        buy_notional_override = (
-            normalized_side == "BUY"
-            and proportional < buy_notional_minimum_quantity
-            and buy_notional_minimum_quantity > minimum
-        )
-    else:
-        # The user authorized minimum-size upscaling only for BUY.  Raising a
-        # SELL would dispose of more inventory than the scaled source action,
-        # even when this sleeve happens to hold enough shares.
-        requested = proportional
-        share_minimum_override = False
-        buy_notional_override = False
+    source_after: Decimal | None = None
+    if source_held_after is not None:
+        source_after = _decimal(source_held_after)
+        if source_after < ZERO:
+            raise ScaleInputError("source_held_after cannot be negative")
+    share_minimum_override = False
+    buy_notional_override = False
+    ratio_unwind = False
+    flatten_copy = False
     inventory_capped = False
+    buy_notional_capped = False
+    max_buy = (
+        None if max_buy_notional_usd is None else _decimal(max_buy_notional_usd)
+    )
+    if max_buy is not None and max_buy <= ZERO:
+        raise ScaleInputError("max_buy_notional_usd must be positive")
     if normalized_side == "SELL":
-        # A prior FOK can reconcile as a partial fill.  A later source SELL
-        # must unwind what this sleeve actually owns, not skip it forever or
-        # round it up into an unauthorised short position.
+        if source_after is not None:
+            target_held = source_after * share_scale
+            requested = held - target_held
+            ratio_unwind = True
+            flatten_copy = source_after == ZERO and requested > ZERO
+            if requested <= ZERO:
+                return _skipped(
+                    reason="SOURCE_RATIO_ALREADY_AT_OR_BELOW_TARGET",
+                    side=normalized_side,
+                    proportional_quantity=proportional,
+                    requested_quantity=ZERO,
+                    best_price=price,
+                )
+        else:
+            requested = proportional
+        if requested < minimum and held >= minimum:
+            requested = minimum
+            share_minimum_override = True
         target_before_inventory_cap = requested
         requested = min(requested, held)
         inventory_capped = requested < target_before_inventory_cap
@@ -289,6 +306,51 @@ def plan_action(
                 requested_quantity=requested,
                 best_price=price,
             )
+    elif not allow_minimum_upscale:
+        if proportional < minimum:
+            return _skipped(
+                reason="PROPORTIONAL_QUANTITY_BELOW_MARKET_MINIMUM",
+                side=normalized_side,
+                proportional_quantity=proportional,
+                requested_quantity=proportional,
+                best_price=price,
+            )
+        if proportional < buy_notional_minimum_quantity:
+            return _skipped(
+                reason="PROPORTIONAL_BUY_NOTIONAL_BELOW_MARKETABLE_MINIMUM",
+                side=normalized_side,
+                proportional_quantity=proportional,
+                requested_quantity=proportional,
+                best_price=price,
+            )
+        requested = proportional
+        if max_buy is not None:
+            cap_quantity = max_buy / price
+            if requested > cap_quantity:
+                requested = cap_quantity
+                buy_notional_capped = True
+            if requested < minimum or requested < buy_notional_minimum_quantity:
+                return _skipped(
+                    reason="CAPPED_BUY_QUANTITY_BELOW_MARKET_MINIMUM",
+                    side=normalized_side,
+                    proportional_quantity=proportional,
+                    requested_quantity=requested,
+                    best_price=price,
+                )
+    else:
+        requested = max(proportional, minimum, buy_notional_minimum_quantity)
+        share_minimum_override = (
+            proportional < minimum and minimum >= buy_notional_minimum_quantity
+        )
+        buy_notional_override = (
+            proportional < buy_notional_minimum_quantity
+            and buy_notional_minimum_quantity > minimum
+        )
+        if max_buy is not None:
+            cap_quantity = max_buy / price
+            if requested > cap_quantity:
+                requested = cap_quantity
+                buy_notional_capped = True
     # A valid minimum-size FAK may legitimately receive a partial fill.
     # Displayed depth below the target says only that a full immediate fill is
     # unavailable; it is not a reason to turn a FAK into a local pre-submit
@@ -338,12 +400,18 @@ def plan_action(
         reason=(
             "FAK_PARTIAL_ATTEMPT"
             if shallow_fak_attempt
-            else "SELL_AVAILABLE_INVENTORY_CAP"
-            if inventory_capped
-            else "MINIMUM_MARKETABLE_BUY_NOTIONAL_UPSCALE"
-            if buy_notional_override
             else "MINIMUM_ORDER_SIZE_UPSCALE"
             if share_minimum_override
+            else "SOURCE_RATIO_FLATTEN"
+            if flatten_copy
+            else "SELL_AVAILABLE_INVENTORY_CAP"
+            if inventory_capped
+            else "SOURCE_RATIO_UNWIND"
+            if ratio_unwind and requested != proportional
+            else "MINIMUM_MARKETABLE_BUY_NOTIONAL_UPSCALE"
+            if buy_notional_override
+            else "BUY_NOTIONAL_CAPPED"
+            if buy_notional_capped
             else ""
         ),
         side=normalized_side,

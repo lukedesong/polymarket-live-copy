@@ -1,5 +1,5 @@
 #!/opt/polymarket-live/venv/bin/python
-"""Fail-closed single-transaction release for the three live-copy profiles.
+"""Fail-closed single-transaction release for the live-copy profiles.
 
 This controller intentionally uses only the Python standard library.  The
 candidate application is never imported into this process before the durable
@@ -64,16 +64,21 @@ PROFILE_KEYS = (
     "cd90",
     "zockdo_full_wallet",
     "wallet_9506_full_wallet",
+    "wallet_42b79c_full_wallet",
+    "albumista_full_wallet",
+    "mauricebishop_full_wallet",
 )
+RETIRED_CD90_PRIMARY_UNIT = "com.luke.polymarket.cd90-live.service"
+RETIRED_CD90_STANDBY_UNIT = "com.luke.polymarket.cd90-live-hot-standby.service"
+RETIRED_9506_PRIMARY_UNIT = "com.luke.polymarket.wallet-9506-live.service"
+RETIRED_9506_STANDBY_UNIT = "com.luke.polymarket.wallet-9506-live-hot-standby.service"
 PRIMARY_UNITS = (
-    "com.luke.polymarket.cd90-live.service",
     "com.luke.polymarket.zockdo-live.service",
-    "com.luke.polymarket.wallet-9506-live.service",
+    "com.luke.polymarket.wallet-42b79c-live.service",
 )
 STANDBY_UNITS = (
-    "com.luke.polymarket.cd90-live-hot-standby.service",
     "com.luke.polymarket.zockdo-live-hot-standby.service",
-    "com.luke.polymarket.wallet-9506-live-hot-standby.service",
+    "com.luke.polymarket.wallet-42b79c-live-hot-standby.service",
 )
 EXECUTOR_UNITS = tuple(
     unit for pair in zip(PRIMARY_UNITS, STANDBY_UNITS, strict=True) for unit in pair
@@ -81,6 +86,45 @@ EXECUTOR_UNITS = tuple(
 HEALTH_UNIT = "com.luke.polymarket.live-health.service"
 HEALTH_TIMER = "com.luke.polymarket.live-health.timer"
 ALL_STOP_UNITS = (*EXECUTOR_UNITS, HEALTH_TIMER, HEALTH_UNIT)
+TEMPX_SERVICE_SCRIPTS = {
+    "com.luke.polymarket.tempx-signal.service": (
+        "/opt/polymarket-tempx/temperature_signal_engine.py"
+    ),
+    "com.luke.polymarket.tempx-executor.service": (
+        "/opt/polymarket-tempx/temperature_executor.py"
+    ),
+    "com.luke.polymarket.tempx-universe.service": (
+        "/opt/polymarket-tempx/temperature_book_capture.py"
+    ),
+    "com.luke.polymarket.tempx-status.service": (
+        "/opt/polymarket-tempx/tempx_write_status.py"
+    ),
+}
+TEMPX_WORKING_DIRECTORY = Path("/opt/polymarket-tempx")
+
+
+def is_allowlisted_tempx_process(
+    *,
+    cgroup_text: str,
+    cwd: Path,
+    executable: Path,
+    argv: Sequence[str],
+    expected_python: Path,
+) -> bool:
+    """Allow only exact tempx unit processes during live-copy quiescence."""
+    if cwd != TEMPX_WORKING_DIRECTORY or executable != expected_python:
+        return False
+    units = {
+        PurePosixPath(fields[2]).name
+        for line in cgroup_text.splitlines()
+        if len(fields := line.split(":", 2)) == 3
+        and PurePosixPath(fields[2]).name in TEMPX_SERVICE_SCRIPTS
+    }
+    if len(units) != 1:
+        return False
+    expected_script = TEMPX_SERVICE_SCRIPTS[next(iter(units))]
+    python_scripts = [value for value in argv[1:] if value.endswith(".py")]
+    return python_scripts == [expected_script]
 
 
 @dataclass(frozen=True)
@@ -92,6 +136,7 @@ class ProfileSpec:
     standby_unit: str
     app_script: str
     change_suffix: str
+    has_executor: bool = True
 
 
 PROFILE_SPECS = (
@@ -99,17 +144,18 @@ PROFILE_SPECS = (
         "cd90",
         "cd90_live",
         "cd90-live.env",
-        PRIMARY_UNITS[0],
-        STANDBY_UNITS[0],
+        RETIRED_CD90_PRIMARY_UNIT,
+        RETIRED_CD90_STANDBY_UNIT,
         "cd90_live_copy.py",
         "cd90",
+        False,
     ),
     ProfileSpec(
         "zockdo_full_wallet",
         "zockdo_live",
         "zockdo-live.env",
-        PRIMARY_UNITS[1],
-        STANDBY_UNITS[1],
+        PRIMARY_UNITS[0],
+        STANDBY_UNITS[0],
         "zockdo_live_copy.py",
         "zockdo",
     ),
@@ -117,12 +163,122 @@ PROFILE_SPECS = (
         "wallet_9506_full_wallet",
         "wallet_9506_live",
         "wallet-9506-live.env",
-        PRIMARY_UNITS[2],
-        STANDBY_UNITS[2],
+        RETIRED_9506_PRIMARY_UNIT,
+        RETIRED_9506_STANDBY_UNIT,
         "wallet9506_live_copy.py",
         "wallet9506",
+        False,
+    ),
+    ProfileSpec(
+        "wallet_42b79c_full_wallet",
+        "wallet_42b79c_live",
+        "wallet-42b79c-live.env",
+        PRIMARY_UNITS[1],
+        STANDBY_UNITS[1],
+        "wallet42b79c_live_copy.py",
+        "wallet42b79c",
+    ),
+    ProfileSpec(
+        "albumista_full_wallet",
+        "albumista_live",
+        "albumista-live.env",
+        "com.luke.polymarket.albumista-live.service",
+        "com.luke.polymarket.albumista-live-hot-standby.service",
+        "albumista_live_copy.py",
+        "albumista",
+        False,
+    ),
+    ProfileSpec(
+        "mauricebishop_full_wallet",
+        "mauricebishop_live",
+        "mauricebishop-live.env",
+        "com.luke.polymarket.mauricebishop-live.service",
+        "com.luke.polymarket.mauricebishop-live-hot-standby.service",
+        "mauricebishop_live_copy.py",
+        "mauricebishop",
+        False,
     ),
 )
+
+
+def executor_specs() -> tuple[ProfileSpec, ...]:
+    return tuple(spec for spec in PROFILE_SPECS if spec.has_executor)
+
+
+MASK_ON_CUTOVER_KEYS = frozenset({"cd90", "wallet_9506_full_wallet"})
+
+
+def cutover_requires_observed_drain(spec: ProfileSpec, *, cutover: bool) -> bool:
+    """OBSERVED must be drained only on executor ledgers.
+
+    Residual coordinator sleeves (paused albumista/mauricebishop) keep frozen
+    OBSERVED rows. Starting those executors to drain them is out of scope, and
+    leftover OBSERVED is not a live submission risk.
+    """
+
+    return bool(cutover) and spec.has_executor
+
+
+def retired_follower_units() -> tuple[str, ...]:
+    units: list[str] = []
+    for spec in PROFILE_SPECS:
+        if spec.key not in MASK_ON_CUTOVER_KEYS:
+            continue
+        units.extend((spec.primary_unit, spec.standby_unit))
+    return tuple(units)
+
+
+def retired_follower_env_names() -> tuple[str, ...]:
+    return tuple(
+        spec.env_name
+        for spec in PROFILE_SPECS
+        if spec.key in MASK_ON_CUTOVER_KEYS
+    )
+
+
+def new_executor_planned_resume_violation(runtime: Mapping[str, str]) -> str:
+    """Return the resume key that a first-start profile must not still carry."""
+
+    if str(runtime.get("operator_planned_resume_from_block") or "").strip():
+        return "operator_planned_resume_from_block"
+    if (
+        str(runtime.get("operator_pre_repair_forward_recovery_armed") or "").lower()
+        == "true"
+    ):
+        return "operator_pre_repair_forward_recovery_armed"
+    if str(runtime.get("operator_planned_resume_state") or "") == "PENDING":
+        return "operator_planned_resume_state"
+    return ""
+
+
+VOLATILE_CODE_REPAIR_RUNTIME_KEYS = frozenset({"auto_redemption_worker_state"})
+
+
+def blocking_code_repair_runtime_keys(
+    rows: Sequence[tuple[Any, ...]],
+) -> tuple[str, ...]:
+    """Durable code-repair flags, excluding the redemption worker crash latch."""
+
+    blocking: list[str] = []
+    for row in rows:
+        key = str(row[0] if row else "")
+        value = str(row[1] if len(row) > 1 else "")
+        if "CODE_REPAIR_REQUIRED" not in value.upper():
+            continue
+        if key in VOLATILE_CODE_REPAIR_RUNTIME_KEYS:
+            continue
+        blocking.append(key)
+    return tuple(sorted(set(blocking)))
+
+
+def new_sleeve_ledger_open_blocked(category: str, message: str) -> bool:
+    """Old executor cannot write-open a coordinator sleeve added this release."""
+
+    return str(category) == "INTERNAL_REDEMPTION_CYCLE" and (
+        "unable to open database file" in str(message).lower()
+    )
+
+
 COORDINATOR_RELATIVE = Path("shared_wallet/coordinator.sqlite3")
 WALLET_LOCK_RELATIVE = Path("authenticated-wallet.lock")
 HEALTH_BRIDGE = "polymarket-server-health"
@@ -139,7 +295,10 @@ REQUIRED_ASSETS = frozenset(
         "ops/polymarket-deadman-alerter.py",
         "app/live_chain_client.py",
         "app/zockdo_live_copy.py",
+        "app/zockdo_nontennis_cap.py",
+        "app/zockdo_soccer_sleeve.py",
         "app/wallet9506_live_copy.py",
+        "app/wallet42b79c_live_copy.py",
         *(f"systemd/{unit}" for unit in (*EXECUTOR_UNITS, HEALTH_UNIT, HEALTH_TIMER)),
         "systemd/com.luke.polymarket.deadman-alerter.service",
         "systemd/com.luke.polymarket.deadman-alerter.timer",
@@ -151,10 +310,26 @@ REQUIRED_ASSETS = frozenset(
         "tests/test_cd90_live_copy.py",
         "tests/test_zockdo_live_copy.py",
         "tests/test_wallet9506_live_copy.py",
+        "tests/test_wallet42b79c_live_copy.py",
         "tests/test_execution_latency.py",
         "tests/test_bounded_retry_health.py",
         "tests/test_bounded_retry_release.py",
         "tests/test_deadman_alerter.py",
+        "tempx/temperature_executor.py",
+        "tempx/temperature_signal_engine.py",
+        "tempx/temperature_book_capture.py",
+        "tempx/bin_decision_engine.py",
+        "tempx/hightemptation_ladder_econ.py",
+        "tempx/hightemptation_obs_alignment.py",
+        "tempx/tempx_write_status.py",
+        "systemd/com.luke.polymarket.tempx-executor.service",
+        "systemd/com.luke.polymarket.tempx-signal.service",
+        "systemd/com.luke.polymarket.tempx-universe.service",
+        "systemd/com.luke.polymarket.tempx-universe.timer",
+        "systemd/com.luke.polymarket.tempx-status.service",
+        "systemd/com.luke.polymarket.tempx-status.timer",
+        "tests/test_tempx_architecture.py",
+        "tests/test_bin_decision_engine.py",
     }
 )
 
@@ -246,6 +421,7 @@ EXTERNAL_RUNTIME_CATEGORIES = frozenset(
         "EXTERNAL_REDEMPTION_PAYOUT_PROOF",
         "EXTERNAL_REDEMPTION_RESOLUTION",
         "EXTERNAL_REDEMPTION_STATUS",
+        "EXTERNAL_SOURCE_POSITION",
         "EXTERNAL_WS_STREAM",
     }
 )
@@ -307,6 +483,8 @@ MIGRATION_CONFIG_KEYS = frozenset(
         "liquidity_retry_effective_after_block",
         "liquidity_retry_activation_receipt_hash",
         "liquidity_retry_activation_receipt_json",
+        "fixed_share_scale",
+        "scale_basis",
     }
 )
 MIGRATION_CONFIG_RECEIPT_KEYS = frozenset(
@@ -1383,10 +1561,16 @@ def verify_local_storage(
                 continue
             raise ContractViolation(f"unknown local redemption state:{state}")
         _verify_repair_storage(connection)
-        if connection.execute(
-            "SELECT COUNT(*) FROM runtime_state WHERE value LIKE '%CODE_REPAIR_REQUIRED%'"
-        ).fetchone()[0]:
-            raise ContractViolation("runtime code repair state is present")
+        repair_keys = blocking_code_repair_runtime_keys(
+            connection.execute(
+                "SELECT key,value FROM runtime_state "
+                "WHERE value LIKE '%CODE_REPAIR_REQUIRED%'"
+            ).fetchall()
+        )
+        if repair_keys:
+            raise ContractViolation(
+                f"runtime code repair state is present:{list(repair_keys)}"
+            )
         if cutover:
             observed = connection.execute(
                 """
@@ -2029,6 +2213,9 @@ EXPECTED_SLEEVE_ROLES = {
     "cd90": "RESIDUAL",
     "zockdo_full_wallet": "RESERVED",
     "wallet_9506_full_wallet": "RESERVED",
+    "wallet_42b79c_full_wallet": "RESERVED",
+    "albumista_full_wallet": "RESERVED",
+    "mauricebishop_full_wallet": "RESERVED",
 }
 
 
@@ -2137,6 +2324,9 @@ def verify_shared_wallet_topology(
         raise ContractViolation("coordinator topology query failed") from exc
     finally:
         connection.close()
+    known_migration_tips = {
+        str(item["migration_receipt_hash"]) for item in history
+    }
     for profile, ledger in ledgers.items():
         connection = _ro_connection(ledger)
         try:
@@ -2153,7 +2343,8 @@ def verify_shared_wallet_topology(
             connection.close()
         if config.get("profile_key") != profile:
             raise ContractViolation(f"local profile identity mismatch:{profile}")
-        if config.get("shared_wallet_migration_receipt_hash") != tip:
+        local_tip = str(config.get("shared_wallet_migration_receipt_hash") or "")
+        if local_tip not in known_migration_tips:
             raise ContractViolation(f"local migration tip mismatch:{profile}")
     return tip
 
@@ -2294,6 +2485,19 @@ def _validate_health_external_limitations(
                     f"{limitation}"
                 )
             continue
+        liquidity_retry_prefix = f"{prefix}_LIQUIDITY_RETRY_PENDING:"
+        if limitation.startswith(liquidity_retry_prefix):
+            try:
+                payload = json.loads(limitation[len(liquidity_retry_prefix) :])
+            except json.JSONDecodeError as exc:
+                raise ContractViolation(
+                    f"health external limitation invalid:{profile_key}:{limitation}"
+                ) from exc
+            if not isinstance(payload, dict) or not payload:
+                raise ContractViolation(
+                    f"health external limitation invalid:{profile_key}:{limitation}"
+                )
+            continue
         raise ContractViolation(f"health external limitation unknown:{profile_key}:{limitation}")
     audit_external = int(audit["external_count"])
     if (post_release_count or 0) != audit_external:
@@ -2316,6 +2520,103 @@ def _validate_health_external_limitations(
     return external_count
 
 
+def strip_retired_profiles_from_health_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Drop N-1 health rows for sleeves that this release no longer executes.
+
+    The previous release still monitored CD90. After the follower is deleted,
+    pre-stop health is generated by that old bridge and would otherwise fail
+    the candidate's 2-profile / 4-executor contract.
+    """
+
+    normalized = json.loads(json.dumps(payload))
+    retired_keys = {spec.key for spec in PROFILE_SPECS if not spec.has_executor}
+    retired_units = {
+        spec.primary_unit
+        for spec in PROFILE_SPECS
+        if not spec.has_executor
+    } | {
+        spec.standby_unit
+        for spec in PROFILE_SPECS
+        if not spec.has_executor
+    }
+    profiles = normalized.get("profiles")
+    if isinstance(profiles, dict):
+        for key in retired_keys:
+            profiles.pop(key, None)
+    services = normalized.get("services")
+    if isinstance(services, list):
+        normalized["services"] = [
+            item
+            for item in services
+            if not (
+                isinstance(item, Mapping)
+                and str(item.get("unit") or "") in retired_units
+            )
+        ]
+        normalized["service_expected_count"] = len(normalized["services"])
+        normalized["service_active_count"] = sum(
+            1
+            for item in normalized["services"]
+            if isinstance(item, Mapping)
+            and str(item.get("ActiveState") or "") == "active"
+        )
+    if isinstance(normalized.get("paused_profiles"), list):
+        normalized["paused_profiles"] = [
+            key for key in normalized["paused_profiles"] if key not in retired_keys
+        ]
+    if isinstance(normalized.get("service_paused_units"), list):
+        normalized["service_paused_units"] = [
+            unit
+            for unit in normalized["service_paused_units"]
+            if unit not in retired_units
+        ]
+        normalized["service_paused_count"] = len(normalized["service_paused_units"])
+    if isinstance(normalized.get("service_inactive_units"), list):
+        normalized["service_inactive_units"] = [
+            unit
+            for unit in normalized["service_inactive_units"]
+            if unit not in retired_units
+        ]
+    if isinstance(normalized.get("failed_polymarket_units"), list):
+        normalized["failed_polymarket_units"] = [
+            unit
+            for unit in normalized["failed_polymarket_units"]
+            if unit not in retired_units
+        ]
+        normalized["failed_polymarket_unit_count"] = len(
+            normalized["failed_polymarket_units"]
+        )
+    if isinstance(normalized.get("profiles"), dict):
+        normalized["monitored_profile_count"] = len(normalized["profiles"])
+    return normalized
+
+
+def _health_executor_scope(
+    payload: Mapping[str, Any], *, pre_stop: bool
+) -> tuple[tuple[ProfileSpec, ...], tuple[str, ...]]:
+    specs = executor_specs()
+    units = EXECUTOR_UNITS
+    if not pre_stop:
+        return specs, units
+    profiles = payload.get("profiles")
+    present_keys = (
+        set(profiles) & {spec.key for spec in specs}
+        if isinstance(profiles, Mapping)
+        else set()
+    )
+    scoped = tuple(spec for spec in specs if spec.key in present_keys)
+    scoped_units = tuple(
+        unit
+        for spec in scoped
+        for unit in (spec.primary_unit, spec.standby_unit)
+    )
+    if "zockdo_full_wallet" not in present_keys:
+        raise ContractViolation("health profile set mismatch")
+    return scoped, scoped_units
+
+
 def validate_health_payload(
     payload: Mapping[str, Any], *, pre_stop: bool = False
 ) -> str:
@@ -2323,10 +2624,12 @@ def validate_health_payload(
     if state not in {"OK", "EXTERNAL_DEGRADED"}:
         raise ContractViolation(f"invalid health classification:{state}")
     profiles = payload.get("profiles")
-    if not isinstance(profiles, Mapping) or set(profiles) != set(PROFILE_KEYS):
+    scoped_specs, scoped_units = _health_executor_scope(payload, pre_stop=pre_stop)
+    executor_keys = {spec.key for spec in scoped_specs}
+    if not isinstance(profiles, Mapping) or set(profiles) != executor_keys:
         raise ContractViolation("health profile set mismatch")
     services = payload.get("services")
-    if not isinstance(services, list) or len(services) != len(EXECUTOR_UNITS):
+    if not isinstance(services, list) or len(services) != len(scoped_units):
         raise ContractViolation("health executor service set mismatch")
     if any(not isinstance(item, Mapping) for item in services):
         raise ContractViolation("health executor service set mismatch")
@@ -2335,11 +2638,11 @@ def validate_health_payload(
         for item in services
         if isinstance(item, Mapping)
     }
-    if set(service_by_name) != set(EXECUTOR_UNITS):
+    if set(service_by_name) != set(scoped_units):
         raise ContractViolation("health executor service set mismatch")
     paused_profiles: list[str] = []
     paused_units: list[str] = []
-    for spec in PROFILE_SPECS:
+    for spec in scoped_specs:
         row = profiles[spec.key]
         if not isinstance(row, Mapping) or not isinstance(row.get("paused"), bool):
             raise ContractViolation(f"health profile malformed:{spec.key}")
@@ -2389,9 +2692,9 @@ def validate_health_payload(
         raise ContractViolation("health paused unit set mismatch")
     if int(payload.get("service_paused_count") or 0) != len(paused_units):
         raise ContractViolation("health paused unit count mismatch")
-    if int(payload.get("monitored_profile_count") or -1) != len(PROFILE_KEYS):
+    if int(payload.get("monitored_profile_count") or -1) != len(scoped_specs):
         raise ContractViolation("health monitored profile count mismatch")
-    if int(payload.get("service_expected_count") or -1) != len(EXECUTOR_UNITS):
+    if int(payload.get("service_expected_count") or -1) != len(scoped_units):
         raise ContractViolation("health executor expected count mismatch")
     observed_active_count = sum(
         1
@@ -2400,7 +2703,7 @@ def validate_health_payload(
     )
     if int(payload.get("service_active_count") or -1) != observed_active_count:
         raise ContractViolation("health executor active count mismatch")
-    if observed_active_count + len(paused_units) != len(EXECUTOR_UNITS):
+    if observed_active_count + len(paused_units) != len(scoped_units):
         raise ContractViolation("health executor coverage mismatch")
     timer = payload.get("health_timer")
     if (
@@ -2431,7 +2734,8 @@ def validate_health_payload(
         raise ContractViolation("health runtime lock contract is not OK")
 
     external_evidence = 0
-    for key in PROFILE_KEYS:
+    for spec in scoped_specs:
+        key = spec.key
         row = profiles[key]
         if not isinstance(row, Mapping):
             raise ContractViolation(f"health profile malformed:{key}")
@@ -3594,6 +3898,11 @@ def _canonical_database_payload(path: Path, *, ignore_migration_fields: bool) ->
             )
         ]
         for table in tables:
+            if (
+                ignore_migration_fields
+                and table == "fixed_share_scale_rebase_receipts"
+            ):
+                continue
             columns = [
                 str(row[1])
                 for row in connection.execute(f'PRAGMA table_info("{table}")')
@@ -4200,6 +4509,8 @@ for raw in sys.argv[2:]:
     def _verify_env_files(self, *, capture: bool) -> None:
         current: dict[str, str] = {}
         for spec in PROFILE_SPECS:
+            if not spec.has_executor:
+                continue
             path = self._env_path(spec)
             try:
                 status = path.lstat()
@@ -4268,7 +4579,7 @@ for raw in sys.argv[2:]:
         for spec in PROFILE_SPECS:
             verify_local_storage(
                 ledgers[spec.key],
-                cutover=cutover,
+                cutover=cutover_requires_observed_drain(spec, cutover=cutover),
                 full_integrity=full_integrity,
             )
         verify_coordinator_storage(
@@ -4582,6 +4893,21 @@ for raw in sys.argv[2:]:
         if not set(expected_shared_conditions).issubset(current_shared_conditions):
             raise ContractViolation("shared redemption receipt condition regressed")
 
+    def _original_unit_states(self, unit: str) -> tuple[str, str]:
+        load = self._property(unit, "LoadState")
+        if load in {"not-found", "masked", ""}:
+            return "inactive", "disabled"
+        activity = self._property(unit, "ActiveState")
+        enablement = self._property(unit, "UnitFileState")
+        if enablement in {"not-found", "invalid", ""} or activity not in {
+            "active",
+            "inactive",
+        }:
+            return "inactive", "disabled"
+        if enablement not in {"enabled", "disabled"}:
+            return activity, "disabled"
+        return activity, enablement
+
     def _capture_original_service_state(self) -> None:
         if not self.config.production:
             self.original_activity = {unit: "active" for unit in EXECUTOR_UNITS}
@@ -4593,13 +4919,15 @@ for raw in sys.argv[2:]:
                 "timer_enabled": "disabled",
             }
             return
-        self.original_activity = {
-            unit: self._property(unit, "ActiveState") for unit in EXECUTOR_UNITS
-        }
-        self.original_enablement = {
-            unit: self._property(unit, "UnitFileState")
-            for unit in (*EXECUTOR_UNITS, HEALTH_TIMER)
-        }
+        self.original_activity = {}
+        self.original_enablement = {}
+        for unit in EXECUTOR_UNITS:
+            activity, enablement = self._original_unit_states(unit)
+            self.original_activity[unit] = activity
+            self.original_enablement[unit] = enablement
+        self.original_enablement[HEALTH_TIMER] = self._property(
+            HEALTH_TIMER, "UnitFileState"
+        )
         self._validate_original_executor_policy()
         self.old_health_state = {
             "timer_active": self._property(HEALTH_TIMER, "ActiveState"),
@@ -4634,7 +4962,9 @@ for raw in sys.argv[2:]:
             for unit in (*EXECUTOR_UNITS, HEALTH_TIMER)
         ):
             raise ContractViolation("original executor enablement state invalid")
-        for spec in PROFILE_SPECS:
+        for spec in executor_specs():
+            if self._executor_introduced_this_release(spec):
+                continue
             activities = tuple(
                 self.original_activity[unit]
                 for unit in (spec.primary_unit, spec.standby_unit)
@@ -4654,19 +4984,41 @@ for raw in sys.argv[2:]:
                     f"{activities}:{enablement}"
                 )
 
+    def _executor_introduced_this_release(self, spec: ProfileSpec) -> bool:
+        if not spec.has_executor:
+            return False
+        old_unit = Path(self.old_release) / "systemd" / spec.primary_unit
+        return not old_unit.is_file()
+
     def _profile_original_mode(self, spec: ProfileSpec) -> str:
+        if not spec.has_executor:
+            return "RETIRED"
         self._validate_original_executor_policy()
+        if self._executor_introduced_this_release(spec):
+            return "NEW"
         if self.original_activity[spec.primary_unit] == "active":
             return "ACTIVE"
         return "PAUSED"
 
+    def _live_after_cutover(self, spec: ProfileSpec) -> bool:
+        return self._profile_original_mode(spec) in {"ACTIVE", "NEW"}
+
     def _original_active_executor_units(self) -> tuple[str, ...]:
         self._validate_original_executor_policy()
-        return tuple(
-            unit
-            for unit in EXECUTOR_UNITS
-            if self.original_activity[unit] == "active"
-        )
+        units: list[str] = []
+        for spec in executor_specs():
+            mode = self._profile_original_mode(spec)
+            if mode == "NEW":
+                # Start only the primary first.  Dual-start on an empty ledger
+                # races config inserts and restarts the standby.
+                units.append(spec.primary_unit)
+                continue
+            if mode != "ACTIVE":
+                continue
+            for unit in (spec.primary_unit, spec.standby_unit):
+                if self.original_activity[unit] == "active":
+                    units.append(unit)
+        return tuple(units)
 
     def _change_ids_unused(self) -> None:
         for spec in PROFILE_SPECS:
@@ -4694,7 +5046,7 @@ for raw in sys.argv[2:]:
                 raise ContractViolation("official side-effect gate timed out")
             return remaining
 
-        env_path = self._env_path(PROFILE_SPECS[0])
+        env_path = self._env_path(executor_specs()[0])
         audit_tool = self.old_release / "tools/assert_no_authenticated_open_orders.py"
         self.runner.run(
             (
@@ -4821,7 +5173,7 @@ print(json.dumps({'wallet': wallet, 'rows': rows}, sort_keys=True, separators=('
         program = """
 import _socket
 from pathlib import Path
-for path, write in ((Path('/etc/polymarket-live/cd90-live.env'), False), (Path('/srv/polymarket-live/runtime/probe'), True)):
+for path, write in ((Path('/etc/polymarket-live/zockdo-live.env'), False), (Path('/srv/polymarket-live/runtime/probe'), True)):
     try:
         path.write_text('x') if write else path.read_bytes()
     except OSError:
@@ -4873,13 +5225,19 @@ exec /usr/bin/setpriv --reuid=polymarket-live --regid=polymarket-live --clear-gr
             return
         self._validate_original_executor_policy()
         expected_python = Path("/opt/polymarket-live/venv/bin/python").resolve()
-        for spec in PROFILE_SPECS:
+        for spec in executor_specs():
             for unit, mode in (
                 (spec.primary_unit, "--run"),
                 (spec.standby_unit, "--run-hot-standby"),
             ):
                 installed = self.config.systemd_root / unit
                 expected = self.old_release / "systemd" / unit
+                if not expected.is_file():
+                    if self._profile_original_mode(spec) != "NEW":
+                        raise ContractViolation(
+                            f"executor unit missing from old release:{unit}"
+                        )
+                    continue
                 if (
                     not installed.is_file()
                     or installed.is_symlink()
@@ -5220,6 +5578,32 @@ exec /usr/bin/setpriv --reuid=polymarket-live --regid=polymarket-live --clear-gr
         if errors:
             raise ContractViolation("profile runtime lock release failed") from errors[0]
 
+    def _service_account_process_is_allowlisted(self, pid: int) -> bool:
+        proc = Path("/proc") / str(pid)
+        try:
+            cgroup_text = (proc / "cgroup").read_text(encoding="utf-8")
+            cwd = (proc / "cwd").resolve(strict=True)
+            executable = (proc / "exe").resolve(strict=True)
+            argv = tuple(
+                value.decode("utf-8", "strict")
+                for value in (proc / "cmdline").read_bytes().split(b"\0")
+                if value
+            )
+            expected_python = self.config.venv_python.resolve(strict=True)
+        except FileNotFoundError:
+            # The process exited after ps observed it, so it no longer keeps
+            # the live-copy fleet from being quiescent.
+            return True
+        except (OSError, UnicodeDecodeError):
+            return False
+        return is_allowlisted_tempx_process(
+            cgroup_text=cgroup_text,
+            cwd=cwd,
+            executable=executable,
+            argv=argv,
+            expected_python=expected_python,
+        )
+
     def _verify_quiescent(self) -> None:
         if self.config.production:
             self._verify_service_lock_files()
@@ -5247,7 +5631,13 @@ exec /usr/bin/setpriv --reuid=polymarket-live --regid=polymarket-live --clear-gr
             ).stdout
             for line in process_list.splitlines():
                 fields = line.split(maxsplit=2)
-                if len(fields) >= 2 and fields[0] == service_uid:
+                if (
+                    len(fields) >= 2
+                    and fields[0] == service_uid
+                    and not self._service_account_process_is_allowlisted(
+                        int(fields[1])
+                    )
+                ):
                     raise ContractViolation(
                         "service-account orphan process remains"
                     )
@@ -5944,8 +6334,14 @@ exec /usr/bin/setpriv --reuid=polymarket-live --regid=polymarket-live --clear-gr
     def _disable_autostart(self) -> None:
         if not self.config.production:
             return
-        self._systemctl("disable", *EXECUTOR_UNITS, HEALTH_TIMER)
-        for unit in (*EXECUTOR_UNITS, HEALTH_TIMER):
+        present = [
+            unit
+            for unit in (*EXECUTOR_UNITS, HEALTH_TIMER)
+            if (self.config.systemd_root / unit).is_file()
+        ]
+        if present:
+            self._systemctl("disable", *present)
+        for unit in present:
             if self._enabled(unit) != "disabled":
                 raise ContractViolation(f"unit autostart disable failed:{unit}")
 
@@ -6067,7 +6463,13 @@ app = Path(os.environ['CANDIDATE_APP']).resolve()
 sys.path.insert(0, str(app))
 from cd90_live_copy import LiveStore, arm_pre_repair_forward_recovery
 from live_wallet_coordinator import SharedWalletCoordinator
-for module_name in ('cd90_live_copy', 'live_wallet_coordinator'):
+from decimal import Decimal
+from wallet42b79c_live_copy import apply_twenty_percent_scale_rebase
+for module_name in (
+    'cd90_live_copy',
+    'live_wallet_coordinator',
+    'wallet42b79c_live_copy',
+):
     module = sys.modules[module_name]
     if Path(module.__file__).resolve().parent != app:
         raise SystemExit('offline migration import escaped candidate')
@@ -6085,14 +6487,39 @@ for item in {profiles!r}:
         receipt_history=history,
         changed_at_ms=changed_at_ms,
     )
-    store.ensure_bounded_retry_policy_at_current_cursor(
-        activated_at_ms=changed_at_ms,
-        change_id=os.environ[item['change_env']],
-    )
-    store.ensure_liquidity_retry_policy_at_current_cursor(
-        activated_at_ms=changed_at_ms,
-        change_id=os.environ[item['change_env']],
-    )
+    if store.runtime_value("last_processed_block") is not None:
+        store.ensure_bounded_retry_policy_at_current_cursor(
+            activated_at_ms=changed_at_ms,
+            change_id=os.environ[item['change_env']],
+        )
+        store.ensure_liquidity_retry_policy_at_current_cursor(
+            activated_at_ms=changed_at_ms,
+            change_id=os.environ[item['change_env']],
+        )
+    if item['key'] == 'wallet_42b79c_full_wallet':
+        last_raw = store.runtime_value('last_processed_block')
+        head_raw = store.runtime_value('current_head')
+        if last_raw is None or head_raw is None:
+            raise SystemExit('grand scale rebase requires cursor')
+        last_processed_block = int(last_raw)
+        current_head = int(head_raw)
+        if current_head < last_processed_block:
+            raise SystemExit('grand scale rebase cursor inverted')
+        scale = store.fixed_share_scale()
+        if scale == Decimal('0.1'):
+            apply_twenty_percent_scale_rebase(
+                store=store,
+                change_id=os.environ[item['change_env']],
+                effective_after_block=current_head,
+                resume_from_block=last_processed_block,
+                requested_at_ms=changed_at_ms,
+            )
+        elif scale == Decimal('0.2'):
+            pass
+        else:
+            raise SystemExit(
+                'grand twenty-percent rebase unsupported scale:' + str(scale)
+            )
     if item['resume']:
         arm_pre_repair_forward_recovery(
             store=store,
@@ -6125,8 +6552,8 @@ print('CANDIDATE_IMPORT_COMPLETE')
         for spec in PROFILE_SPECS:
             database = self.migration_stage / f"{spec.key}.sqlite3"
             if self._profile_original_mode(spec) != "ACTIVE":
-                # The profile was explicitly paused before this transaction;
-                # it is not a recovery candidate and must not be armed.
+                # New or paused profiles are not recovery candidates and must
+                # not receive a forward-resume marker in offline staging.
                 continue
             expected_change = f"{self.config.change_id}-{spec.change_suffix}"
             expected = {
@@ -6258,6 +6685,7 @@ print('CANDIDATE_IMPORT_COMPLETE')
             )
         )
         fsync_regular_file_and_parent(heartbeat)
+        self._retire_deleted_followers()
         temporary = self.config.current_link.with_name(
             f".{self.config.current_link.name}.{self.config.change_id}.tmp"
         )
@@ -6268,6 +6696,38 @@ print('CANDIDATE_IMPORT_COMPLETE')
         fsync_directory(self.config.current_link.parent)
         self._systemctl("daemon-reload")
         self._verify_installed_candidate()
+
+    def _retire_deleted_followers(self) -> None:
+        """Mask retired copy executors and delete their env; keep ledgers."""
+
+        if not self.config.production:
+            return
+        env_root = Path("/etc/polymarket-live")
+        for spec in PROFILE_SPECS:
+            if spec.key not in MASK_ON_CUTOVER_KEYS:
+                continue
+            for unit in (spec.primary_unit, spec.standby_unit):
+                self._systemctl("disable", "--now", unit, check=False)
+                # systemctl mask cannot replace a regular unit file in
+                # /etc/systemd/system/; 9506 3.29 cutover left those files
+                # startable until they were moved aside. Remove first.
+                installed = self.config.systemd_root / unit
+                if installed.is_file() and not installed.is_symlink():
+                    self.runner.run(
+                        (
+                            "/usr/bin/sudo",
+                            "-n",
+                            "/usr/bin/rm",
+                            "-f",
+                            str(installed),
+                        )
+                    )
+                self._systemctl("mask", "--now", unit, check=False)
+            env_path = env_root / spec.env_name
+            if env_path.is_file() and not env_path.is_symlink():
+                self.runner.run(
+                    ("/usr/bin/sudo", "-n", "/usr/bin/rm", "-f", str(env_path))
+                )
 
     def _verify_installed_candidate(self) -> None:
         if self.config.current_link.resolve() != self.config.new_release.resolve():
@@ -6320,7 +6780,7 @@ print('CANDIDATE_IMPORT_COMPLETE')
                 raise ContractViolation(
                     f"installed candidate asset metadata mismatch:{installed}"
                 )
-        for spec in PROFILE_SPECS:
+        for spec in executor_specs():
             for unit in (spec.primary_unit, spec.standby_unit):
                 if self._property(unit, "WorkingDirectory") != "/opt/polymarket-live/current/app":
                     raise ContractViolation(f"candidate unit working directory mismatch:{unit}")
@@ -6549,22 +7009,38 @@ print('CANDIDATE_IMPORT_COMPLETE')
         ):
             if runtime_int(key) <= int(baseline[key]):
                 raise ContractViolation(f"candidate standby evidence did not advance:{spec.key}:{key}")
-        expected_change = f"{self.config.change_id}-{spec.change_suffix}"
-        expected_runtime = {
-            "operator_planned_resume_change_id": expected_change,
-            "operator_planned_resume_state": "COMPLETED",
-            "operator_planned_resume_from_block": "",
-            "operator_pre_repair_forward_recovery_armed": "false",
-        }
-        for key, expected in expected_runtime.items():
-            if runtime_text(key) != expected:
-                raise ContractViolation(f"candidate resume receipt mismatch:{spec.key}:{key}")
         completed_at = runtime_int("operator_planned_resume_completed_at_ms")
-        if completed_at < self.candidate_start_boundary_ns // 1_000_000:
-            raise ContractViolation(f"candidate resume completion is stale:{spec.key}")
         processed_to = runtime_int("operator_planned_resume_processed_to_block")
-        if processed_to < int(baseline["last_processed_block"]) or cursor < processed_to:
-            raise ContractViolation(f"candidate resume cursor proof failed:{spec.key}")
+        if self._profile_original_mode(spec) == "NEW":
+            violating = new_executor_planned_resume_violation(runtime)
+            if violating:
+                raise ContractViolation(
+                    f"new executor planned resume must be idle:{spec.key}:{violating}"
+                )
+        else:
+            expected_change = f"{self.config.change_id}-{spec.change_suffix}"
+            expected_runtime = {
+                "operator_planned_resume_change_id": expected_change,
+                "operator_planned_resume_state": "COMPLETED",
+                "operator_planned_resume_from_block": "",
+                "operator_pre_repair_forward_recovery_armed": "false",
+            }
+            for key, expected in expected_runtime.items():
+                if runtime_text(key) != expected:
+                    raise ContractViolation(
+                        f"candidate resume receipt mismatch:{spec.key}:{key}"
+                    )
+            if completed_at < self.candidate_start_boundary_ns // 1_000_000:
+                raise ContractViolation(
+                    f"candidate resume completion is stale:{spec.key}"
+                )
+            if (
+                processed_to < int(baseline["last_processed_block"])
+                or cursor < processed_to
+            ):
+                raise ContractViolation(
+                    f"candidate resume cursor proof failed:{spec.key}"
+                )
         connection = _ro_connection(database)
         try:
             runtime_error_max = verify_append_only_watermark(
@@ -6643,6 +7119,8 @@ print('CANDIDATE_IMPORT_COMPLETE')
     def _verify_paused_profile_unit_policy(
         self, spec: ProfileSpec, *, label: str
     ) -> dict[str, str]:
+        if not spec.has_executor:
+            return {"mode": "RETIRED"}
         if self._profile_original_mode(spec) != "PAUSED":
             raise ContractViolation(f"{label} profile was not originally paused:{spec.key}")
         evidence: dict[str, str] = {}
@@ -6725,7 +7203,7 @@ print('CANDIDATE_IMPORT_COMPLETE')
         evidence = {
             spec.key: (
                 self._verify_profile_acceptance(spec)
-                if self._profile_original_mode(spec) == "ACTIVE"
+                if self._live_after_cutover(spec)
                 else self._verify_paused_profile_acceptance(spec)
             )
             for spec in PROFILE_SPECS
@@ -6770,7 +7248,7 @@ print('CANDIDATE_IMPORT_COMPLETE')
     def _capture_candidate_status_mtime_baselines(self) -> None:
         baselines: dict[str, int] = {}
         for spec in PROFILE_SPECS:
-            if self._profile_original_mode(spec) != "ACTIVE":
+            if not self._live_after_cutover(spec):
                 continue
             path = self.runtimes[spec.key] / "status.json"
             try:
@@ -6791,7 +7269,7 @@ print('CANDIDATE_IMPORT_COMPLETE')
         evidence: dict[str, Any] = {}
         boundary_ms = self.candidate_start_boundary_ns // 1_000_000
         for spec in PROFILE_SPECS:
-            if self._profile_original_mode(spec) != "ACTIVE":
+            if not self._live_after_cutover(spec):
                 continue
             if spec.key not in self.candidate_status_mtime_baselines:
                 raise ContractViolation(
@@ -6851,6 +7329,13 @@ print('CANDIDATE_IMPORT_COMPLETE')
         # filesystem-only proof that every active profile has initialized its
         # own database before any root SQLite acceptance read begins.
         self._wait_for_candidate_startup_readiness(deadline)
+        if self.config.production:
+            for spec in executor_specs():
+                if self._profile_original_mode(spec) != "NEW":
+                    continue
+                if not self._active(spec.standby_unit):
+                    self._systemctl("start", spec.standby_unit)
+            self._wait_for_candidate_startup_readiness(deadline)
         last_error: ContractViolation | None = None
         while time.monotonic() < deadline:
             try:
@@ -6870,7 +7355,42 @@ print('CANDIDATE_IMPORT_COMPLETE')
     def _normalized_pre_stop_health_payload(
         self, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
-        normalized = json.loads(json.dumps(payload))
+        normalized = strip_retired_profiles_from_health_payload(payload)
+        new_profile_keys = {
+            spec.key
+            for spec in executor_specs()
+            if self._executor_introduced_this_release(spec)
+        }
+        coordinator = normalized.get("coordinator")
+        if isinstance(coordinator, dict) and new_profile_keys:
+            leftover: list[str] = []
+            for issue in list(coordinator.get("issues") or []):
+                text = str(issue)
+                if text.startswith("UNMONITORED_COORDINATOR_PROFILES:"):
+                    names = {
+                        part
+                        for part in text.split(":", 1)[1].split(",")
+                        if part
+                    } - new_profile_keys
+                    if names:
+                        leftover.append(
+                            "UNMONITORED_COORDINATOR_PROFILES:"
+                            + ",".join(sorted(names))
+                        )
+                else:
+                    leftover.append(text)
+            coordinator = dict(coordinator)
+            coordinator["issues"] = leftover
+            if not leftover:
+                coordinator["state"] = "OK"
+            normalized["coordinator"] = coordinator
+            zock = dict(normalized.get("profiles") or {}).get("zockdo_full_wallet") or {}
+            if normalized.get("overall_state") == "INTERNAL_DEGRADED" and not leftover:
+                normalized["overall_state"] = (
+                    "EXTERNAL_DEGRADED"
+                    if int(dict(zock).get("external_limitation_count") or 0) > 0
+                    else "OK"
+                )
         if "runtime_lock_contract" not in normalized:
             # The installed N-1 heartbeat predates this payload field.  The
             # release preflight has already verified the runtime root and all
@@ -6900,11 +7420,14 @@ print('CANDIDATE_IMPORT_COMPLETE')
                 for item in services
                 if isinstance(item, dict)
             }
-            if set(service_by_name) != set(EXECUTOR_UNITS):
-                return normalized
+            scoped_specs, scoped_units = _health_executor_scope(
+                normalized, pre_stop=True
+            )
+            if set(service_by_name) != set(scoped_units):
+                scoped_specs = ()
             paused_profile_keys: list[str] = []
             paused_unit_names: list[str] = []
-            for spec in PROFILE_SPECS:
+            for spec in scoped_specs:
                 row = profiles.get(spec.key)
                 if not isinstance(row, dict):
                     continue
@@ -7003,6 +7526,14 @@ print('CANDIDATE_IMPORT_COMPLETE')
                         ) from exc
                     finally:
                         connection.close()
+                    if new_profile_keys:
+                        error_rows = [
+                            item
+                            for item in error_rows
+                            if not new_sleeve_ledger_open_blocked(
+                                str(item[1]), str(item[2] or "")
+                            )
+                        ]
                     category_counts: dict[str, int] = {}
                     code_repair = 0
                     for _occurred_at_ms, category, message, details_json in error_rows:
@@ -7267,6 +7798,14 @@ print('CANDIDATE_IMPORT_COMPLETE')
                     ) from exc
                 finally:
                     connection.close()
+                if new_profile_keys:
+                    recovered_rows = [
+                        item
+                        for item in recovered_rows
+                        if not new_sleeve_ledger_open_blocked(
+                            str(item[1]), str(item[2] or "")
+                        )
+                    ]
                 internal_rows = [
                     item
                     for item in recovered_rows
@@ -7392,12 +7931,16 @@ print('CANDIDATE_IMPORT_COMPLETE')
                 latest_category == "EXTERNAL_REDEMPTION_CYCLE"
                 and internal_count == 0
                 and code_repair_count == 0
-            ):
+            ) or bool(new_profile_keys):
                 issues = [
                     issue
                     for issue in issues
                     if issue != f"{prefix}_AUTOMATIC_REDEMPTION_WORKER_INVALID"
                 ]
+            if new_profile_keys:
+                row["runtime_internal_error_count"] = internal_count
+                row["runtime_code_repair_count"] = code_repair_count
+                row["release_runtime_error_audit"] = audit
             row["status_issues"] = issues
             row["status_issue_count"] = len(issues)
             row["external_limitations"] = external
@@ -7429,7 +7972,35 @@ print('CANDIDATE_IMPORT_COMPLETE')
             for row in profiles.values()
             if isinstance(row, Mapping)
         )
+        new_profile_keys = {
+            spec.key
+            for spec in executor_specs()
+            if self._executor_introduced_this_release(spec)
+        }
         coordinator = normalized.get("coordinator")
+        if isinstance(coordinator, Mapping) and new_profile_keys:
+            leftover = []
+            for issue in list(coordinator.get("issues") or []):
+                text = str(issue)
+                if text.startswith("UNMONITORED_COORDINATOR_PROFILES:"):
+                    names = {
+                        part
+                        for part in text.split(":", 1)[1].split(",")
+                        if part
+                    } - new_profile_keys
+                    if names:
+                        leftover.append(
+                            "UNMONITORED_COORDINATOR_PROFILES:"
+                            + ",".join(sorted(names))
+                        )
+                else:
+                    leftover.append(text)
+            coordinator = dict(coordinator)
+            coordinator["issues"] = leftover
+            if not leftover:
+                coordinator["state"] = "OK"
+            normalized["coordinator"] = coordinator
+            policy_rewritten = True
         internal_degraded = internal_degraded or not isinstance(
             coordinator, Mapping
         ) or coordinator.get("state") != "OK"
@@ -7521,7 +8092,12 @@ print('CANDIDATE_IMPORT_COMPLETE')
                 )
                 for row in dict(normalized.get("profiles") or {}).values()
             )
-            if not intentional_legacy_degradation:
+            rewritten_new_executor_unmonitored = (
+                normalized.get("overall_state") in {"OK", "EXTERNAL_DEGRADED"}
+                and isinstance(normalized.get("coordinator"), dict)
+                and normalized["coordinator"].get("state") == "OK"
+            )
+            if not intentional_legacy_degradation and not rewritten_new_executor_unmonitored:
                 raise ContractViolation("pre-stop health unit failed")
         self.health_baseline_mtime_ns = path.stat(
             follow_symlinks=False
@@ -7536,7 +8112,9 @@ print('CANDIDATE_IMPORT_COMPLETE')
             if mtime <= baseline_mtime_ns:
                 raise ContractViolation("health status is not fresh")
             payload = json.loads(self.config.health_status_path.read_text(encoding="utf-8"))
-            classification = validate_health_payload(payload)
+            classification = validate_health_payload(
+                strip_retired_profiles_from_health_payload(payload)
+            )
             return classification, sha256_file(self.config.health_status_path), mtime
         # reset-failed is advisory: a freshly installed timer may not be
         # loaded yet, while the following start is the authoritative gate.
@@ -7553,7 +8131,9 @@ print('CANDIDATE_IMPORT_COMPLETE')
                         payload = json.loads(
                             self.config.health_status_path.read_text(encoding="utf-8")
                         )
-                        classification = validate_health_payload(payload)
+                        classification = validate_health_payload(
+                            strip_retired_profiles_from_health_payload(payload)
+                        )
                         return classification, sha256_file(self.config.health_status_path), mtime
                     except (json.JSONDecodeError, ContractViolation) as exc:
                         last_error = (
@@ -7568,9 +8148,10 @@ print('CANDIDATE_IMPORT_COMPLETE')
         if not self.config.production:
             return
         self._validate_original_executor_policy()
-        for unit in EXECUTOR_UNITS:
-            expected = self.original_enablement[unit]
-            self._systemctl("enable" if expected == "enabled" else "disable", unit)
+        for spec in executor_specs():
+            enable = self._live_after_cutover(spec)
+            for unit in (spec.primary_unit, spec.standby_unit):
+                self._systemctl("enable" if enable else "disable", unit)
         self._systemctl("enable", HEALTH_TIMER)
         self._verify_candidate_executor_policy_restored()
 
@@ -7578,13 +8159,16 @@ print('CANDIDATE_IMPORT_COMPLETE')
         if not self.config.production:
             return
         self._validate_original_executor_policy()
-        for unit in EXECUTOR_UNITS:
-            if self._enabled(unit) != self.original_enablement[unit]:
-                raise ContractViolation(f"candidate unit file policy drift:{unit}")
-            expected_activity = self.original_activity[unit]
-            actual_activity = self._property(unit, "ActiveState")
-            if actual_activity != expected_activity:
-                raise ContractViolation(f"candidate activity policy drift:{unit}")
+        for spec in executor_specs():
+            live = self._live_after_cutover(spec)
+            expected_enablement = "enabled" if live else "disabled"
+            expected_activity = "active" if live else "inactive"
+            for unit in (spec.primary_unit, spec.standby_unit):
+                if self._enabled(unit) != expected_enablement:
+                    raise ContractViolation(f"candidate unit file policy drift:{unit}")
+                actual_activity = self._property(unit, "ActiveState")
+                if actual_activity != expected_activity:
+                    raise ContractViolation(f"candidate activity policy drift:{unit}")
         if self._enabled(HEALTH_TIMER) != "enabled" or not self._active(HEALTH_TIMER):
             raise ContractViolation("candidate health timer policy drift")
 
@@ -8258,6 +8842,8 @@ print('CANDIDATE_IMPORT_COMPLETE')
         if self.config.production:
             for unit in (*EXECUTOR_UNITS, HEALTH_UNIT, HEALTH_TIMER):
                 source = self.config.systemd_root / unit
+                if not source.is_file():
+                    source = self.config.new_release / "systemd" / unit
                 destination = self.config.snapshot / unit
                 shutil.copy2(source, destination)
                 with destination.open("rb") as handle:
@@ -8363,7 +8949,10 @@ print('CANDIDATE_IMPORT_COMPLETE')
             before = self.config.snapshot / f"exact-{spec.key}.sqlite3"
             after = self.migration_stage / f"{spec.key}.sqlite3"
             verify_offline_migration_delta(before, after)
-            verify_local_storage(after, cutover=True)
+            verify_local_storage(
+                after,
+                cutover=cutover_requires_observed_drain(spec, cutover=True),
+            )
         coordinator_before = self.config.snapshot / "exact-coordinator.sqlite3"
         coordinator_after = self.migration_stage / "coordinator.sqlite3"
         if _canonical_database_payload(
@@ -8766,7 +9355,10 @@ print('CANDIDATE_IMPORT_COMPLETE')
         self._verify_env_files(capture=False)
         self._verify_old_fleet_identity_after_restore()
         for spec in PROFILE_SPECS:
-            if self._profile_original_mode(spec) == "PAUSED":
+            mode = self._profile_original_mode(spec)
+            if mode in {"RETIRED", "NEW"}:
+                continue
+            if mode == "PAUSED":
                 self._verify_paused_old_profile_acceptance(spec)
                 continue
             primary_pid = 0

@@ -38,9 +38,11 @@ from cd90_live_sizing import (
     ActionPlan,
     ScaleInputError,
     derive_fixed_share_scale,
+    infer_source_held_after,
     maximum_buy_fee_usd,
     plan_action,
 )
+from zockdo_nontennis_cap import max_buy_notional_usd_for_profile
 from live_action_fidelity import canonical_hash
 from live_wallet_coordinator import (
     AuthenticatedAccountCashSnapshot,
@@ -156,7 +158,11 @@ LIVE_PROFILE_TENNIS_MAINLINE = "tennis_atp_wta_mainline"
 LIVE_PROFILE_WALLET_44B0_NETFLIX = "wallet_44b0_netflix"
 LIVE_PROFILE_ZOCKDO_FULL_WALLET = "zockdo_full_wallet"
 LIVE_PROFILE_WALLET_9506_FULL_WALLET = "wallet_9506_full_wallet"
+LIVE_PROFILE_WALLET_42B79C_FULL_WALLET = "wallet_42b79c_full_wallet"
 LIVE_PROFILE_FUU_FULL_WALLET = "fuu_full_wallet"
+LIVE_PROFILE_MAURICEBISHOP_FULL_WALLET = "mauricebishop_full_wallet"
+LIVE_PROFILE_ALBUMISTA_FULL_WALLET = "albumista_full_wallet"
+LIVE_PROFILE_MEAN_IMPEDIMENT_BTC5M = "mean_impediment_btc5m"
 SIZING_MODE_FIXED_SHARES = "FIXED_SHARES"
 SIZING_MODE_SOURCE_NOTIONAL = "SOURCE_NOTIONAL"
 LIVE_PROFILE_MINIMUM_SIZE_POLICIES = {
@@ -166,11 +172,57 @@ LIVE_PROFILE_MINIMUM_SIZE_POLICIES = {
     LIVE_PROFILE_WALLET_44B0_NETFLIX: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
     LIVE_PROFILE_ZOCKDO_FULL_WALLET: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
     LIVE_PROFILE_WALLET_9506_FULL_WALLET: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
+    LIVE_PROFILE_WALLET_42B79C_FULL_WALLET: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
     LIVE_PROFILE_FUU_FULL_WALLET: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
+    LIVE_PROFILE_MAURICEBISHOP_FULL_WALLET: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
+    LIVE_PROFILE_ALBUMISTA_FULL_WALLET: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
+    LIVE_PROFILE_MEAN_IMPEDIMENT_BTC5M: MINIMUM_SIZE_POLICY_SKIP_BELOW_MINIMUM,
 }
+# The public trade endpoint can only enumerate PUBLIC_WALLET_TRADE_PAGE_SIZE *
+# PUBLIC_WALLET_TRADE_MAX_PAGES rows for one wallet, so a source that trades
+# faster than that window can never present a short final page and its forward
+# baseline can never be "complete".  For those profiles the newest bounded
+# window is still a sound no-replay baseline: the steady-state reader stops at
+# the first page containing an already-observed row, and the window is orders
+# of magnitude larger than the source's fill rate between cycles.  Every other
+# profile keeps the strict end-of-history requirement unchanged.
+PUBLIC_WALLET_BOUNDED_BASELINE_PROFILES = frozenset(
+    {LIVE_PROFILE_MEAN_IMPEDIMENT_BTC5M}
+)
 RETRYABLE_EMPTY_BOOK_LEVEL_ERRORS = frozenset(
     {"NO_ASK_BOOK_LEVEL", "NO_BID_BOOK_LEVEL"}
 )
+
+
+def _official_market_closed_from_lifecycle_details(
+    details: Mapping[str, Any],
+) -> bool:
+    return bool(details.get("closed")) or details.get("accepting_orders") is False
+
+
+def _official_market_lifecycle_details_from_resolver_result(
+    lifecycle: Any,
+) -> dict[str, Any]:
+    if isinstance(lifecycle, Mapping):
+        return dict(lifecycle)
+    raw_details = getattr(lifecycle, "metadata", None)
+    return dict(raw_details) if isinstance(raw_details, Mapping) else {}
+
+
+def _is_empty_book_snapshot_reason(reason: str) -> bool:
+    upper = str(reason or "").upper()
+    if not upper.startswith("BOOK_SNAPSHOT_ERROR:"):
+        return False
+    for book_error in RETRYABLE_EMPTY_BOOK_LEVEL_ERRORS:
+        if book_error in upper:
+            return True
+    return (
+        "POLYAPIEXCEPTION" in upper
+        and "STATUS_CODE=404" in upper
+        and "NO ORDERBOOK EXISTS" in upper
+    )
+
+
 REDEMPTION_REQUIRED_ENV = (
     "POLYMARKET_RELAYER_API_KEY",
     "POLYMARKET_RELAYER_API_KEY_ADDRESS",
@@ -205,6 +257,166 @@ LIQUIDITY_RETRY_POLICY_ID = "LIQUIDITY_ONLY_RETRY_V2"
 # source wallet's observed price per share.  The user explicitly excludes
 # protocol fees from this price-loss comparison.
 USER_SPECIFIED_HIGH_PRICE_BUY_CEILING = Decimal("0.90")
+# BUY skip (Luke 2026-08-28): only when our worst Ask is above 0.90 and
+# worse than the source VWAP.  Same-price follow above 0.90 is allowed.
+# The 2026-08-24 zockdo 0.80 source skip and absolute 0.90 skip are off.
+# SELL is unchanged.  0.90 is a user-specified value.
+# User-confirmed prospective BUY pricing rule (2026-08-16).  Preserve sixty
+# percent of the source wallet's remaining one-dollar payout upside.  Protocol
+# fees stay outside this price-loss comparison and remain reserved separately.
+DYNAMIC_BUY_RETAINED_UPSIDE_RATIO = Decimal("0.60")
+
+
+def buy_price_gate_reason(
+    *,
+    side: str,
+    source_vwap: Decimal,
+    source_quantity: Decimal,
+    our_worst_price: Decimal,
+    profile_key: str | None,
+) -> str | None:
+    """Return a BUY skip reason, or None if this price gate does not fire."""
+
+    if str(side).upper() != "BUY":
+        return None
+    if source_quantity <= ZERO:
+        raise LiveConfigurationError("INVALID_SOURCE_QUANTITY_FOR_PRICE_GATE")
+    truncation_bound = TOKEN_RAW_UNIT / Decimal(str(source_quantity))
+    source_price = Decimal(str(source_vwap))
+    our_price = Decimal(str(our_worst_price))
+    if (
+        our_price > USER_SPECIFIED_HIGH_PRICE_BUY_CEILING
+        and our_price > source_price + truncation_bound
+    ):
+        return "BUY_PRICE_ABOVE_0_90_WITH_EXECUTION_LOSS"
+    return None
+
+
+def dynamic_buy_limit_price(
+    *,
+    source_average_price: Decimal,
+    target_quantity: Decimal,
+    cumulative_filled_quantity: Decimal,
+    cumulative_filled_notional_usd: Decimal,
+    current_best_ask: Decimal,
+    tick_size: Decimal,
+    raw_asks: Any,
+    preserve_first_attempt_price: bool,
+) -> dict[str, Any]:
+    """Return a depth-aware exact-share BUY limit without overspending edge.
+
+    The total action budget is frozen from the source price.  A later retry may
+    spend only price surplus proved by earlier official fills.  The first
+    attempt retains the existing eligible best-Ask submission so this repair
+    cannot turn a previously submittable action into a local price skip.
+    """
+
+    source_price = Decimal(str(source_average_price))
+    target = Decimal(str(target_quantity))
+    filled = Decimal(str(cumulative_filled_quantity))
+    filled_notional = Decimal(str(cumulative_filled_notional_usd))
+    best = Decimal(str(current_best_ask))
+    tick = Decimal(str(tick_size))
+    values = (source_price, target, filled, filled_notional, best, tick)
+    if any(not value.is_finite() for value in values):
+        raise LiveConfigurationError("INVALID_DYNAMIC_BUY_PRICE_INPUT")
+    if (
+        source_price <= ZERO
+        or source_price > Decimal("1")
+        or target <= ZERO
+        or filled < ZERO
+        or filled >= target
+        or filled_notional < ZERO
+        or best <= ZERO
+        or best > Decimal("1")
+        or tick <= ZERO
+    ):
+        raise LiveConfigurationError("INVALID_DYNAMIC_BUY_PRICE_INPUT")
+
+    if source_price > USER_SPECIFIED_HIGH_PRICE_BUY_CEILING:
+        average_cap = source_price
+        absolute_ceiling = source_price
+    else:
+        average_cap = min(
+            USER_SPECIFIED_HIGH_PRICE_BUY_CEILING,
+            Decimal("1")
+            - DYNAMIC_BUY_RETAINED_UPSIDE_RATIO
+            * (Decimal("1") - source_price),
+        )
+        absolute_ceiling = USER_SPECIFIED_HIGH_PRICE_BUY_CEILING
+
+    remaining = target - filled
+    remaining_budget = target * average_cap - filled_notional
+    raw_safe_price = min(absolute_ceiling, remaining_budget / remaining)
+    baseline_override = bool(
+        preserve_first_attempt_price
+        and best <= absolute_ceiling
+        and best > raw_safe_price
+    )
+    if baseline_override:
+        raw_safe_price = best
+    safe_price = (
+        raw_safe_price / tick
+    ).to_integral_value(rounding=ROUND_FLOOR) * tick
+    if safe_price <= ZERO:
+        raise LiveConfigurationError("DYNAMIC_BUY_PRICE_BUDGET_EXHAUSTED")
+
+    parsed: list[tuple[Decimal, Decimal]] = []
+    if isinstance(raw_asks, list):
+        for level in raw_asks:
+            if not isinstance(level, Mapping):
+                continue
+            try:
+                price = Decimal(str(level["price"]))
+                quantity = Decimal(str(level["size"]))
+            except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
+                raise LiveConfigurationError(
+                    "INVALID_DYNAMIC_BUY_ASK_LEVEL"
+                ) from exc
+            if price > ZERO and quantity > ZERO and price <= safe_price:
+                parsed.append((price, quantity))
+    parsed.sort(key=lambda item: item[0])
+
+    visible_quantity = ZERO
+    visible_notional = ZERO
+    marginal_price: Decimal | None = None
+    for price, quantity in parsed:
+        take = min(quantity, remaining - visible_quantity)
+        if take <= ZERO:
+            break
+        visible_quantity += take
+        visible_notional += take * price
+        marginal_price = price
+        if visible_quantity == remaining:
+            break
+    order_limit = (
+        marginal_price
+        if visible_quantity == remaining and marginal_price is not None
+        else best
+        if not parsed and preserve_first_attempt_price
+        else safe_price
+    )
+    projected_vwap = (
+        visible_notional / visible_quantity if visible_quantity > ZERO else None
+    )
+    projected_total_vwap = (
+        (filled_notional + visible_notional) / (filled + visible_quantity)
+        if filled + visible_quantity > ZERO
+        else None
+    )
+    return {
+        "retained_upside_ratio": DYNAMIC_BUY_RETAINED_UPSIDE_RATIO,
+        "average_price_cap": average_cap,
+        "absolute_price_ceiling": absolute_ceiling,
+        "safe_worst_price": safe_price,
+        "order_limit_price": order_limit,
+        "remaining_quantity": remaining,
+        "remaining_price_budget_usd": remaining_budget,
+        "snapshot_visible_quantity": visible_quantity,
+        "snapshot_projected_vwap": projected_vwap,
+        "snapshot_projected_total_vwap": projected_total_vwap,
+        "first_attempt_no_regression_override": baseline_override,
+    }
 
 
 def now_ms() -> int:
@@ -401,7 +613,11 @@ def source_action_detection_contract_for_profile(profile_key: str) -> str:
         LIVE_PROFILE_WALLET_44B0_NETFLIX,
         LIVE_PROFILE_ZOCKDO_FULL_WALLET,
         LIVE_PROFILE_WALLET_9506_FULL_WALLET,
+        LIVE_PROFILE_WALLET_42B79C_FULL_WALLET,
         LIVE_PROFILE_FUU_FULL_WALLET,
+        LIVE_PROFILE_MAURICEBISHOP_FULL_WALLET,
+        LIVE_PROFILE_ALBUMISTA_FULL_WALLET,
+        LIVE_PROFILE_MEAN_IMPEDIMENT_BTC5M,
     }:
         return SOURCE_ACTION_DETECTION_CONTRACT_FULL_WALLET
     if normalized in {
@@ -2486,32 +2702,38 @@ class LiveStore:
     def latest_scale_rebase(self) -> dict[str, Any] | None:
         """Return the last immutable future-action scale-change receipt."""
 
+        receipts = self.scale_rebase_receipts()
+        return receipts[-1] if receipts else None
+
+    def scale_rebase_receipts(self) -> tuple[dict[str, Any], ...]:
+        """Return every future-action scale-change receipt in apply order."""
+
         self.initialize()
         with self.connect() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
                 SELECT change_id, previous_scale, new_scale, requested_multiplier,
                        effective_after_block, resume_from_block, requested_at_ms, prior_scale_basis,
                        resulting_scale_basis, details_json
                 FROM fixed_share_scale_rebase_receipts
-                ORDER BY requested_at_ms DESC, change_id DESC
-                LIMIT 1
+                ORDER BY requested_at_ms ASC, change_id ASC
                 """
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "change_id": str(row["change_id"]),
-            "previous_scale": str(row["previous_scale"]),
-            "new_scale": str(row["new_scale"]),
-            "requested_multiplier": str(row["requested_multiplier"]),
-            "effective_after_block": int(row["effective_after_block"]),
-            "resume_from_block": int(row["resume_from_block"]),
-            "requested_at_ms": int(row["requested_at_ms"]),
-            "prior_scale_basis": str(row["prior_scale_basis"]),
-            "resulting_scale_basis": str(row["resulting_scale_basis"]),
-            "details": json.loads(str(row["details_json"])),
-        }
+            ).fetchall()
+        return tuple(
+            {
+                "change_id": str(row["change_id"]),
+                "previous_scale": str(row["previous_scale"]),
+                "new_scale": str(row["new_scale"]),
+                "requested_multiplier": str(row["requested_multiplier"]),
+                "effective_after_block": int(row["effective_after_block"]),
+                "resume_from_block": int(row["resume_from_block"]),
+                "requested_at_ms": int(row["requested_at_ms"]),
+                "prior_scale_basis": str(row["prior_scale_basis"]),
+                "resulting_scale_basis": str(row["resulting_scale_basis"]),
+                "details": json.loads(str(row["details_json"])),
+            }
+            for row in rows
+        )
 
     def arm_planned_operator_resume(
         self,
@@ -2574,7 +2796,9 @@ class LiveStore:
                     'PENDING_LIQUIDITY', 'PARTIAL_PENDING', 'PENDING_CAPITAL',
                     'PENDING_MINIMUM_UNWIND', 'PENDING_MINIMUM_REMAINDER',
                     'PENDING_EXTERNAL_RETRY', 'PENDING_METADATA',
-                    'PENDING_CAUSAL_ORDER'
+                    'PENDING_CAUSAL_ORDER',
+                    'PENDING_CONFIRMED_ZERO_FILL',
+                    'PENDING_PRICE_PROTECTION'
                 )
                 -- OBSERVED is safe only before any submission attempt exists.
                 -- The candidate runtime has an explicit restart recovery path
@@ -2970,7 +3194,25 @@ class LiveStore:
                     ORDER BY latest.id DESC
                     LIMIT 1
                 )
-                AND t.status NOT IN ('FILLED', 'PARTIAL', 'SKIPPED')
+                AND t.status NOT IN (
+                    'FILLED', 'PARTIAL', 'SKIPPED',
+                    -- Terminal, no live order.  Same set operator planned
+                    -- resume already treats as safe to cut over.
+                    'ERROR', 'ERROR_INTERNAL', 'EXTERNAL_UNFILLABLE',
+                    'SUPERSEDED_UNFILLED', 'EXPIRED_RETRY_WINDOW',
+                    -- Reservation-free wait: no submission exists yet.
+                    -- Bounded-retry waits keep the source-block scale, so a
+                    -- future-only rebase must not chase or resize them.
+                    'PENDING_CAUSAL_ORDER',
+                    'PENDING_CONFIRMED_ZERO_FILL',
+                    'PENDING_LIQUIDITY',
+                    'PENDING_PRICE_PROTECTION',
+                    'PENDING_EXTERNAL_RETRY',
+                    'PENDING_CAPITAL',
+                    'PENDING_MINIMUM_UNWIND',
+                    'PENDING_MINIMUM_REMAINDER',
+                    'PENDING_METADATA'
+                )
                 ORDER BY t.id
                 LIMIT 1
                 """
@@ -7090,6 +7332,37 @@ class LiveStore:
             "updated_at_ms": int(row["updated_at_ms"]),
         }
 
+    def action_filled_notional_usd(self, action_id: str) -> Decimal:
+        """Sum only authoritative fill transitions for one source action."""
+
+        self.initialize()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT details_json FROM action_transitions
+                WHERE action_id = ?
+                  AND status IN ('FILLED', 'PARTIAL', 'PARTIAL_PENDING')
+                ORDER BY id
+                """,
+                (str(action_id),),
+            ).fetchall()
+        total = ZERO
+        for row in rows:
+            details = json.loads(str(row["details_json"] or "{}"))
+            raw_notional = details.get("matched_notional_usd")
+            if raw_notional in {None, ""}:
+                continue
+            try:
+                notional = Decimal(str(raw_notional))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise LiveConfigurationError(
+                    "INVALID_ACTION_FILL_NOTIONAL"
+                ) from exc
+            if not notional.is_finite() or notional <= ZERO:
+                raise LiveConfigurationError("INVALID_ACTION_FILL_NOTIONAL")
+            total += notional
+        return total
+
     def original_submission_minimum_order_size(
         self, *, action_id: str
     ) -> Decimal | None:
@@ -7508,6 +7781,105 @@ class LiveStore:
                 )
                 reopened.append(action_id)
         return reopened
+
+    def empty_book_pending_external_retry_actions(self) -> list[SourceAction]:
+        """Return durable empty-book pendings that may need closed-market drain."""
+
+        runtime_empty_book_reasons = tuple(
+            "BOOK_SNAPSHOT_ERROR: RuntimeError: " + reason
+            for reason in sorted(RETRYABLE_EMPTY_BOOK_LEVEL_ERRORS)
+        )
+        reason_placeholders = ",".join("?" for _ in runtime_empty_book_reasons)
+        self.initialize()
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT a.*
+                FROM action_receipts AS a
+                JOIN action_transitions AS latest
+                  ON latest.id = (
+                      SELECT id FROM action_transitions
+                      WHERE action_id = a.action_id
+                      ORDER BY id DESC LIMIT 1
+                  )
+                WHERE LOWER(a.source_role) IN ('maker', 'verified_public_wallet')
+                  AND latest.status = 'PENDING_EXTERNAL_RETRY'
+                  AND (
+                    latest.reason IN ({reason_placeholders})
+                    OR (
+                      latest.reason LIKE 'BOOK_SNAPSHOT_ERROR: PolyApiException:%'
+                      AND latest.reason LIKE '%status_code=404%'
+                      AND LOWER(latest.reason) LIKE '%no orderbook exists%'
+                    )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM order_reservations AS reservation
+                      WHERE reservation.action_id = a.action_id
+                        AND reservation.active = 1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM submission_attempts AS attempt
+                      WHERE attempt.action_id = a.action_id
+                        AND attempt.state IN (
+                            'SUBMIT_STARTED', 'SUBMITTED_UNRECONCILED',
+                            'UNKNOWN_SUBMISSION'
+                        )
+                  )
+                ORDER BY a.block_number, a.source_log_index,
+                         a.source_timestamp,
+                         a.transaction_hash, a.token_id, a.side, a.order_hash
+                """,
+                runtime_empty_book_reasons,
+            ).fetchall()
+        return [self._source_from_receipt(row) for row in rows]
+
+    def hung_eligible_no_submission_actions(self) -> list[SourceAction]:
+        """Return eligible actions stuck without a target or submit side effect.
+
+        A later same-token action must not wait on these.  They never reached
+        sizing, so closing them does not chase, repost, or invent a fill.
+        """
+
+        hung_states = (
+            "OBSERVED",
+            "SCOPE_ELIGIBLE",
+            "PENDING_CAUSAL_ORDER",
+        )
+        placeholders = ",".join("?" for _ in hung_states)
+        self.initialize()
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT a.*
+                FROM action_receipts AS a
+                JOIN action_transitions AS latest
+                  ON latest.id = (
+                      SELECT id FROM action_transitions
+                      WHERE action_id = a.action_id
+                      ORDER BY id DESC LIMIT 1
+                  )
+                WHERE LOWER(a.source_role) IN ('maker', 'verified_public_wallet')
+                  AND latest.status IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM action_targets AS target
+                      WHERE target.action_id = a.action_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM order_reservations AS reservation
+                      WHERE reservation.action_id = a.action_id
+                        AND reservation.active = 1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM submission_attempts AS attempt
+                      WHERE attempt.action_id = a.action_id
+                  )
+                ORDER BY a.block_number, a.source_log_index,
+                         a.source_timestamp,
+                         a.transaction_hash, a.token_id, a.side, a.order_hash
+                """,
+                hung_states,
+            ).fetchall()
+        return [self._source_from_receipt(row) for row in rows]
 
     def repair_retryable_targets_with_terminal_latest_transition(
         self, *, changed_at_ms: int
@@ -8368,6 +8740,7 @@ class LiveStore:
                 WHERE action_id=? AND (
                     reason IN (
                         'FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE',
+                        'GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE',
                         'OFFICIAL_CONFIRMED_ZERO_FILL_RETRYABLE',
                         'FAK_PARTIAL_FILL'
                     )
@@ -8382,13 +8755,64 @@ class LiveStore:
             for row in attempts
         ):
             return None
+
+        def has_gtc_active_cancel_finality_proof(
+            parsed: Mapping[str, Any],
+        ) -> bool:
+            proof = parsed.get("gtc_active_cancel_zero_fill_proof")
+            chain_scan = parsed.get("chain_scan", {})
+            try:
+                cancel_head_block = int(str(proof.get("cancel_head_block")))
+                scan_to_block = int(str(proof.get("scan_to_block")))
+                chain_scan_to_block = int(str(chain_scan.get("to_block")))
+                matched_quantity = Decimal(
+                    str(proof.get("official_matched_quantity"))
+                )
+            except (AttributeError, InvalidOperation, TypeError, ValueError):
+                return False
+            return bool(
+                isinstance(proof, Mapping)
+                and proof.get("schema") == "GTC_ACTIVE_CANCEL_FINALITY_V1"
+                and proof.get("active_cancel_verified") is True
+                and scan_to_block >= cancel_head_block
+                and str(proof.get("official_status", "")).upper()
+                in {
+                    "ORDER_STATUS_INVALID",
+                    "ORDER_STATUS_CANCELED",
+                    "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+                    "MATCHED",
+                    "INVALID",
+                    "CANCELED",
+                }
+                and matched_quantity >= ZERO
+                and isinstance(chain_scan, Mapping)
+                and chain_scan.get("finality") is not None
+                and chain_scan_to_block == scan_to_block
+            )
+
         has_zero_fill_proof = False
         for row in proof_rows:
             parsed = json.loads(str(row["details_json"]))
             reason = str(row["reason"])
+            chain_scan = parsed.get("chain_scan", {})
             if (
                 reason == "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE"
-                and parsed.get("chain_scan", {}).get("finality") is not None
+                and isinstance(chain_scan, Mapping)
+                and chain_scan.get("finality") is not None
+            ):
+                has_zero_fill_proof = True
+                break
+            if (
+                reason == "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE"
+                and has_gtc_active_cancel_finality_proof(parsed)
+                and Decimal(
+                    str(
+                        parsed["gtc_active_cancel_zero_fill_proof"][
+                            "official_matched_quantity"
+                        ]
+                    )
+                )
+                == ZERO
             ):
                 has_zero_fill_proof = True
                 break
@@ -8396,6 +8820,12 @@ class LiveStore:
             str(row["status"]) == "PARTIAL_PENDING"
             and _has_chain_receipt_evidence(
                 json.loads(str(row["details_json"])).get("receipt_evidence")
+            )
+            and (
+                str(row["reason"]) != "GTC_ACTIVE_CANCEL_PARTIAL_FILL"
+                or has_gtc_active_cancel_finality_proof(
+                    json.loads(str(row["details_json"]))
+                )
             )
             for row in proof_rows
         )
@@ -10402,6 +10832,11 @@ class CLOBExecutionAdapter:
             "raw_book": book,
         }
 
+    def source_token_size(self, *, token_id: str, source_wallet: str | None) -> Decimal:
+        if source_wallet is None:
+            raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+        return fetch_source_token_size(str(source_wallet), str(token_id))
+
     def submit_fak_market(
         self,
         *,
@@ -10685,10 +11120,21 @@ class CLOBExecutionAdapter:
             for order in self.client.get_open_orders()
         )
         if still_open:
-            raise RuntimeError("ACTIVE_CANCEL_ORDER_STILL_OPEN")
+            return {
+                "active_cancel_response": cancel_response,
+                "active_cancel_verified": False,
+                "active_cancel_still_open": True,
+            }
+        latest_block_number = getattr(self.receipt_reader, "latest_block_number", None)
+        if not callable(latest_block_number):
+            raise RuntimeError("ACTIVE_CANCEL_CHAIN_HEAD_READER_UNAVAILABLE")
+        observed_head_block = int(latest_block_number())
+        if observed_head_block < 0:
+            raise RuntimeError("ACTIVE_CANCEL_CHAIN_HEAD_INVALID")
         return {
             "active_cancel_response": cancel_response,
             "active_cancel_verified": True,
+            "active_cancel_observed_head_block": observed_head_block,
             "active_cancel_wait_seconds": BUY_ACTIVE_CANCEL_WAIT_SECONDS,
         }
 
@@ -10912,7 +11358,16 @@ class CLOBExecutionAdapter:
         quantity = Decimal(total_quantity_raw) / TOKEN_SCALE
         notional = Decimal(total_notional_raw) / TOKEN_SCALE
         fee = Decimal(total_fee_raw) / TOKEN_SCALE
-        return {"quantity": quantity, "notional_usd": notional, "fee_usd": fee, "vwap_price": notional / quantity, "receipt_evidence": evidence}
+        return {
+            "quantity": quantity,
+            "notional_usd": notional,
+            "fee_usd": fee,
+            "vwap_price": notional / quantity,
+            "receipt_evidence": evidence,
+            "scan_from_block": int(source.block_number),
+            "scan_to_block": scan_to_block,
+            "finality": "polygon_finalized_block",
+        }
 
     def get_associated_trades(
         self,
@@ -11280,14 +11735,16 @@ class LiveSourceFollower:
         # bounded cursor cannot find the first short page, a later restart
         # must not treat only the newest persisted page as the whole baseline.
         baseline_rows: list[dict[str, Any]] = []
+        reached_history_end = False
         for page_number in range(PUBLIC_WALLET_TRADE_MAX_PAGES):
             page = self._read_verified_public_wallet_trade_page(
                 offset=page_number * PUBLIC_WALLET_TRADE_PAGE_SIZE
             )
             baseline_rows.extend(page)
             if len(page) < PUBLIC_WALLET_TRADE_PAGE_SIZE:
+                reached_history_end = True
                 break
-        else:
+        if not reached_history_end and not self._bounded_public_baseline_allowed():
             raise ConnectionError("PUBLIC_WALLET_FORWARD_WATERMARK_CURSOR_GAP")
         observed_at_ms = int(self.clock_ms())
         inserted = self.store.record_public_source_observations(
@@ -11300,7 +11757,17 @@ class LiveSourceFollower:
             "public_wallet_forward_watermark_row_count", len(baseline_rows)
         )
         self.store.set_runtime("public_wallet_forward_watermark_new_row_count", inserted)
+        self.store.set_runtime(
+            "public_wallet_forward_watermark_reached_history_end",
+            "true" if reached_history_end else "false",
+        )
         return len(baseline_rows)
+
+    def _bounded_public_baseline_allowed(self) -> bool:
+        """Whether this profile may baseline on the newest bounded window."""
+
+        profile = str(self.store.config("profile_key") or "")
+        return profile in PUBLIC_WALLET_BOUNDED_BASELINE_PROFILES
 
     def _record_verified_public_source_action(self, action: SourceAction) -> None:
         """Durably observe an executable public-wallet action before its row.
@@ -11592,6 +12059,132 @@ class LiveSourceFollower:
             "reason": reason,
         }
 
+    def _resolve_official_market_lifecycle_details_for_source(
+        self,
+        source: SourceAction,
+    ) -> dict[str, Any] | None:
+        action_scope = self.action_scope
+        frozen = self.store.frozen_action_metadata(source.action_id)
+        frozen_lifecycle_resolver = getattr(
+            action_scope, "resolve_retry_lifecycle", None
+        )
+        if callable(frozen_lifecycle_resolver):
+            if frozen is None:
+                return None
+            lifecycle = frozen_lifecycle_resolver(
+                source,
+                dict(frozen["metadata"]),
+            )
+            return _official_market_lifecycle_details_from_resolver_result(
+                lifecycle
+            )
+        action_resolver = getattr(action_scope, "resolve_action", None)
+        if callable(action_resolver):
+            lifecycle = action_resolver(source)
+            return _official_market_lifecycle_details_from_resolver_result(
+                lifecycle
+            )
+        scope_resolver = getattr(action_scope, "resolve", None)
+        if callable(scope_resolver):
+            lifecycle = scope_resolver(source.token_id)
+            return _official_market_lifecycle_details_from_resolver_result(
+                lifecycle
+            )
+        if frozen is None:
+            return None
+        return dict(frozen["metadata"])
+
+    def _drain_closed_market_empty_book_pendings(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for source in self.store.empty_book_pending_external_retry_actions():
+            lifecycle_details = (
+                self._resolve_official_market_lifecycle_details_for_source(source)
+            )
+            if lifecycle_details is None:
+                continue
+            if not _official_market_closed_from_lifecycle_details(
+                lifecycle_details
+            ):
+                continue
+            results.append(
+                _terminalize_official_market_closed_before_retry(
+                    store=self.store,
+                    source=source,
+                    lifecycle_details=lifecycle_details,
+                )
+            )
+        return results
+
+    def _close_hung_eligible_no_submission(
+        self,
+        *,
+        action: SourceAction,
+        details: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close one hung eligible action without chasing or submitting."""
+
+        if self.store.action_has_unresolved_submission_side_effect(
+            action.action_id
+        ):
+            raise LiveConfigurationError(
+                "UNRESOLVED_SUBMISSION_BLOCKS_HUNG_ELIGIBLE_CLOSEOUT"
+            )
+        frozen = self.store.frozen_action_metadata(action.action_id)
+        metadata = (
+            dict(frozen["metadata"])
+            if frozen is not None
+            else {}
+        )
+        extra = dict(details or {})
+        extra.update(
+            {
+                "new_order_submitted": False,
+                "historical_action_replayed": False,
+                "closeout": "HUNG_ELIGIBLE_NO_SUBMISSION_NO_CHASE",
+            }
+        )
+        if metadata:
+            extra["scope"] = dict(metadata)
+        proportional_quantity = (
+            action.source_quantity
+            * self.store.fixed_share_scale_for_source_block(action.block_number)
+        )
+        self.store.ensure_action_target(
+            source=action,
+            proportional_quantity=proportional_quantity,
+            target_quantity=proportional_quantity,
+            state="EXTERNAL_UNFILLABLE",
+            reason="HUNG_ELIGIBLE_NO_SUBMISSION_NO_CHASE",
+            updated_at_ms=int(self.clock_ms()),
+        )
+        self.store.append_transition(
+            source=action,
+            status="EXTERNAL_UNFILLABLE",
+            reason="HUNG_ELIGIBLE_NO_SUBMISSION_NO_CHASE",
+            details=extra,
+        )
+        return {
+            "terminal_status": "EXTERNAL_UNFILLABLE",
+            "reason": "HUNG_ELIGIBLE_NO_SUBMISSION_NO_CHASE",
+        }
+
+    def _drain_hung_eligible_no_submission_actions(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        for source in self.store.hung_eligible_no_submission_actions():
+            latest = self.store.latest_transition(source)
+            if latest is not None and latest["terminal_status"] in {
+                "SKIPPED",
+                "FILLED",
+                "PARTIAL",
+                "ERROR",
+                "ERROR_INTERNAL",
+                "EXTERNAL_UNFILLABLE",
+                "SUPERSEDED_UNFILLED",
+            }:
+                continue
+            results.append(self._close_hung_eligible_no_submission(action=source))
+        return results
+
     def _process_source_action(
         self,
         *,
@@ -11816,6 +12409,31 @@ class LiveSourceFollower:
                 raise
             if status in {"ERROR", "ERROR_INTERNAL"} and transition_added:
                 return latest
+            if (
+                status in {"OBSERVED", "SCOPE_ELIGIBLE", "PENDING_CAUSAL_ORDER"}
+                and not self.store.action_has_unresolved_submission_side_effect(
+                    action.action_id
+                )
+                and self.store.action_target(action.action_id) is None
+                and not _is_retryable_external_error(exc)
+            ):
+                self.store.append_runtime_error(
+                    occurred_at_ms=int(self.clock_ms()),
+                    category="INTERNAL_RUNTIME",
+                    message=f"{type(exc).__name__}: {exc}",
+                    details={
+                        "action_id": action.action_id,
+                        "latest_status": status,
+                        "closed_without_chase": True,
+                        "new_order_submitted": False,
+                    },
+                )
+                return self._close_hung_eligible_no_submission(
+                    action=action,
+                    details={
+                        "closed_after_exception": f"{type(exc).__name__}: {exc}",
+                    },
+                )
             raise
 
     def run_cycle_to_head(
@@ -11842,6 +12460,10 @@ class LiveSourceFollower:
                 "current_head": last,
             }
         self.store.set_runtime("current_head", head)
+        drain_results = self._drain_closed_market_empty_book_pendings()
+        hung_closeout_results = self._drain_hung_eligible_no_submission_actions()
+        if hung_closeout_results:
+            drain_results = [*drain_results, *hung_closeout_results]
         if head == last:
             self.store.set_runtime("heartbeat_at_ms", self.clock_ms())
             self._complete_planned_operator_resume(processed_to_block=head)
@@ -11850,6 +12472,7 @@ class LiveSourceFollower:
                 "source_action_ids": [],
                 "last_processed_block": last,
                 "current_head": head,
+                "drained_empty_book_pendings": drain_results,
             }
         actions = self._new_source_actions(from_block=last + 1, to_block=head)
         self._persist_source_action_batch(actions)
@@ -11873,6 +12496,7 @@ class LiveSourceFollower:
             "action_results": results,
             "last_processed_block": head,
             "current_head": head,
+            "drained_empty_book_pendings": drain_results,
         }
 
     def _complete_planned_operator_resume(self, *, processed_to_block: int) -> None:
@@ -12068,20 +12692,98 @@ def cancel_due_active_gtd_orders(
             active_cancel_due_at_ms = int(str(raw_due_at_ms))
         except (TypeError, ValueError):
             raise LiveConfigurationError("ACTIVE_CANCEL_DUE_AT_MS_MISSING")
-        if active_cancel_due_at_ms > int(due_at_ms):
-            continue
+        deadline_elapsed = active_cancel_due_at_ms <= int(due_at_ms)
+        partial_matched_quantity: Decimal | None = None
+        if not deadline_elapsed:
+            if str(source.side).upper() != "BUY":
+                continue
+            get_order = getattr(execution, "get_order", None)
+            if not callable(get_order):
+                continue
+            try:
+                plan = details.get("plan")
+                if not isinstance(plan, Mapping):
+                    continue
+                expected_quantity = Decimal(
+                    str(plan.get("requested_quantity", "0"))
+                )
+                observed_order = get_order(order_id)
+                if not isinstance(observed_order, Mapping):
+                    continue
+                matched_quantity, _encoding = _matched_shares(
+                    dict(observed_order),
+                    expected_quantity=expected_quantity,
+                )
+            except (InvalidOperation, RuntimeError, TypeError, ValueError):
+                continue
+            if not (ZERO < matched_quantity < expected_quantity):
+                continue
+            partial_matched_quantity = matched_quantity
         if not callable(cancel):
             raise LiveConfigurationError("ACTIVE_CANCEL_EXECUTION_UNAVAILABLE")
-        cancellation = cancel(order_id)
+        try:
+            cancellation = cancel(order_id)
+        except RuntimeError as exc:
+            if str(exc) != "ACTIVE_CANCEL_ORDER_STILL_OPEN":
+                raise
+            cancellation = {
+                "active_cancel_verified": False,
+                "active_cancel_still_open": True,
+            }
+        if not (
+            isinstance(cancellation, Mapping)
+            and cancellation.get("active_cancel_verified") is True
+        ):
+            still_open_response = {
+                **dict(response),
+                **(
+                    dict(cancellation)
+                    if isinstance(cancellation, Mapping)
+                    else {"active_cancel_response": cancellation}
+                ),
+                "active_cancel_verified": False,
+                "active_cancel_still_open": True,
+            }
+            store.update_attempt_state(
+                attempt_id=str(details.get("attempt_id") or ""),
+                state="SUBMITTED_UNRECONCILED",
+                response=still_open_response,
+                updated_at_ms=int(due_at_ms),
+            )
+            store.append_transition(
+                source=source,
+                status="ACTIVE_CANCEL_ORDER_STILL_OPEN",
+                reason="GTC_ACTIVE_CANCEL_STILL_OPEN_AFTER_REQUEST",
+                created_at_ms=int(due_at_ms),
+                details={
+                    "attempt_id": str(details.get("attempt_id") or ""),
+                    "order_id": order_id,
+                    "active_cancel_due_at_ms": active_cancel_due_at_ms,
+                    "new_order_submitted": False,
+                    "reservation_released": False,
+                },
+            )
+            results.append(
+                {
+                    "order_id": order_id,
+                    "terminal_status": "ACTIVE_CANCEL_ORDER_STILL_OPEN",
+                }
+            )
+            continue
         updated_response = {
             **dict(response),
-            **(
-                dict(cancellation)
-                if isinstance(cancellation, Mapping)
-                else {"active_cancel_response": cancellation}
-            ),
+            **dict(cancellation),
             "active_cancel_verified": True,
         }
+        if partial_matched_quantity is not None:
+            updated_response.update(
+                {
+                    "active_cancel_trigger": "PARTIAL_FILL_DETECTED",
+                    "active_cancel_trigger_matched_quantity": str(
+                        partial_matched_quantity
+                    ),
+                }
+            )
         store.update_attempt_state(
             attempt_id=str(details.get("attempt_id") or ""),
             state="SUBMITTED_UNRECONCILED",
@@ -12091,16 +12793,35 @@ def cancel_due_active_gtd_orders(
         store.append_transition(
             source=source,
             status="ACTIVE_CANCEL_COMPLETED",
-            reason="GTC_ACTIVE_CANCEL_WINDOW_ELAPSED",
+            reason=(
+                "GTC_ACTIVE_CANCEL_PARTIAL_FILL_DETECTED"
+                if partial_matched_quantity is not None
+                else "GTC_ACTIVE_CANCEL_WINDOW_ELAPSED"
+            ),
             created_at_ms=int(due_at_ms),
             details={
                 "attempt_id": str(details.get("attempt_id") or ""),
                 "order_id": order_id,
                 "active_cancel_due_at_ms": active_cancel_due_at_ms,
+                "active_cancel_trigger_matched_quantity": (
+                    str(partial_matched_quantity)
+                    if partial_matched_quantity is not None
+                    else ""
+                ),
             },
         )
         results.append({"order_id": order_id, "terminal_status": "CANCELED"})
     return results
+
+
+def _configured_max_buy_notional_usd(store: LiveStore) -> Decimal | None:
+    raw = store.config("max_buy_notional_usd")
+    if raw is None or str(raw).strip() == "":
+        return None
+    value = Decimal(str(raw))
+    if not value.is_finite() or value <= ZERO:
+        raise LiveConfigurationError("INVALID_MAX_BUY_NOTIONAL_USD")
+    return value
 
 
 def execute_source_action(
@@ -12525,6 +13246,53 @@ def _fail_closed_stale_causal_target(
     return {"terminal_status": "ERROR_INTERNAL", "reason": reason}
 
 
+def _terminalize_official_market_closed_before_retry(
+    *,
+    store: LiveStore,
+    source: SourceAction,
+    lifecycle_details: Mapping[str, Any],
+    details_extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    reason = "OFFICIAL_MARKET_CLOSED_BEFORE_RETRY"
+    existing_target = store.action_target(source.action_id)
+    details: dict[str, Any] = {
+        "official_market_lifecycle": dict(lifecycle_details),
+        "new_order_submitted": False,
+    }
+    if details_extra is not None:
+        details.update(dict(details_extra))
+    if existing_target is not None:
+        cumulative = Decimal(str(existing_target["cumulative_filled_quantity"]))
+        terminal_status = "PARTIAL" if cumulative > ZERO else "EXTERNAL_UNFILLABLE"
+        store.set_action_target_state(
+            source=source,
+            state=terminal_status,
+            reason=reason,
+            updated_at_ms=now_ms(),
+        )
+    else:
+        proportional_quantity = (
+            source.source_quantity
+            * store.fixed_share_scale_for_source_block(source.block_number)
+        )
+        store.ensure_action_target(
+            source=source,
+            proportional_quantity=proportional_quantity,
+            target_quantity=proportional_quantity,
+            state="EXTERNAL_UNFILLABLE",
+            reason=reason,
+            updated_at_ms=now_ms(),
+        )
+        terminal_status = "EXTERNAL_UNFILLABLE"
+    store.append_transition(
+        source=source,
+        status=terminal_status,
+        reason=reason,
+        details=details,
+    )
+    return {"terminal_status": terminal_status, "reason": reason}
+
+
 def _execute_source_action_locked(
     *,
     store: LiveStore,
@@ -12898,6 +13666,29 @@ def _execute_source_action_locked(
                 "reason": retained_reason,
             }
         if _is_retryable_external_error(exc):
+            lifecycle_details: dict[str, Any] | None = None
+            frozen = store.frozen_action_metadata(source.action_id)
+            if frozen is not None:
+                lifecycle_details = dict(frozen["metadata"])
+            market_lifecycle_mapping = getattr(
+                execution, "market_lifecycle_mapping", None
+            )
+            if lifecycle_details is None and isinstance(
+                market_lifecycle_mapping, Mapping
+            ):
+                lifecycle_details = dict(market_lifecycle_mapping)
+            if (
+                lifecycle_details is not None
+                and _official_market_closed_from_lifecycle_details(
+                    lifecycle_details
+                )
+            ):
+                return _terminalize_official_market_closed_before_retry(
+                    store=store,
+                    source=source,
+                    lifecycle_details=lifecycle_details,
+                    details_extra={"external_error": reason},
+                )
             store.append_transition(
                 source=source,
                 status="PENDING_EXTERNAL_RETRY",
@@ -13138,6 +13929,135 @@ def _execute_source_action_locked(
         planning_source_quantity = remaining
         planning_scale = Decimal("1")
         allow_minimum_upscale = False
+    base_snapshot = snapshot
+    dynamic_buy_pricing: dict[str, Any] | None = None
+    if (
+        source.side == "BUY"
+        and not allow_minimum_upscale
+        and sizing_mode != SIZING_MODE_SOURCE_NOTIONAL
+    ):
+        target_for_price = planning_source_quantity * planning_scale
+        cumulative_filled = (
+            ZERO
+            if existing_target is None
+            else Decimal(str(existing_target["cumulative_filled_quantity"]))
+        )
+        try:
+            dynamic_buy_pricing = dynamic_buy_limit_price(
+                source_average_price=source_vwap,
+                target_quantity=(
+                    target_for_price
+                    if existing_target is None
+                    else Decimal(str(existing_target["target_quantity"]))
+                ),
+                cumulative_filled_quantity=cumulative_filled,
+                cumulative_filled_notional_usd=(
+                    ZERO
+                    if existing_target is None
+                    else store.action_filled_notional_usd(source.action_id)
+                ),
+                current_best_ask=Decimal(str(snapshot["best_price"])),
+                tick_size=Decimal(str(snapshot["tick_size"])),
+                raw_asks=(snapshot.get("raw_book") or {}).get("asks"),
+                preserve_first_attempt_price=existing_target is None,
+            )
+        except LiveConfigurationError as exc:
+            if str(exc) != "DYNAMIC_BUY_PRICE_BUDGET_EXHAUSTED":
+                raise
+            retained_state = (
+                "PENDING_PRICE_PROTECTION"
+                if existing_target is not None
+                else "EXTERNAL_UNFILLABLE"
+            )
+            reason = "DYNAMIC_BUY_PRICE_BUDGET_EXHAUSTED"
+            if existing_target is not None:
+                store.set_action_target_state(
+                    source=source,
+                    state=retained_state,
+                    reason=reason,
+                    updated_at_ms=now_ms(),
+                )
+            store.append_transition(
+                source=source,
+                status=retained_state,
+                reason=reason,
+                details={"new_order_submitted": False},
+            )
+            return {"terminal_status": retained_state, "reason": reason}
+        snapshot = {
+            **snapshot,
+            "best_price": str(dynamic_buy_pricing["order_limit_price"]),
+            "dynamic_buy_pricing": {
+                key: str(value) if isinstance(value, Decimal) else value
+                for key, value in dynamic_buy_pricing.items()
+            },
+        }
+    source_held_after: Decimal | None = None
+    if source.side == "SELL" and existing_target is None:
+        if "source_token_size" in snapshot:
+            source_held_after = infer_source_held_after(
+                observed_size=Decimal(str(snapshot["source_token_size"])),
+                source_sell_quantity=source.source_quantity,
+            )
+        elif callable(getattr(execution, "source_token_size", None)):
+            try:
+                observed_size = execution.source_token_size(
+                    token_id=source.token_id,
+                    source_wallet=store.config("source_wallet"),
+                )
+                source_held_after = infer_source_held_after(
+                    observed_size=observed_size,
+                    source_sell_quantity=source.source_quantity,
+                )
+            except Exception as exc:
+                store.append_runtime_error(
+                    occurred_at_ms=now_ms(),
+                    category="EXTERNAL_SOURCE_POSITION",
+                    message=str(exc),
+                    details={
+                        "token_id": source.token_id,
+                        "action_id": source.action_id,
+                    },
+                )
+                source_held_after = None
+        else:
+            source_wallet = str(store.config("source_wallet") or "").lower()
+            if re.fullmatch(r"0x[a-f0-9]{40}", source_wallet):
+                try:
+                    observed_size = fetch_source_token_size(
+                        source_wallet, source.token_id
+                    )
+                    source_held_after = infer_source_held_after(
+                        observed_size=observed_size,
+                        source_sell_quantity=source.source_quantity,
+                    )
+                except Exception as exc:
+                    store.append_runtime_error(
+                        occurred_at_ms=now_ms(),
+                        category="EXTERNAL_SOURCE_POSITION",
+                        message=str(exc),
+                        details={
+                            "token_id": source.token_id,
+                            "action_id": source.action_id,
+                        },
+                    )
+                    source_held_after = None
+    max_buy_notional_usd = _configured_max_buy_notional_usd(store)
+    if source.side == "BUY":
+        event_slug = ""
+        frozen_meta = store.frozen_action_metadata(source.action_id)
+        if frozen_meta is not None:
+            event_slug = str(
+                (frozen_meta.get("metadata") or {}).get("event_slug") or ""
+            )
+        profile_cap = max_buy_notional_usd_for_profile(
+            profile_key=profile_key,
+            event_slug=event_slug,
+            scale=execution_scale,
+        )
+        if profile_cap is not None:
+            if max_buy_notional_usd is None or profile_cap < max_buy_notional_usd:
+                max_buy_notional_usd = profile_cap
     plan = plan_action(
         side=source.side,
         source_quantity=planning_source_quantity,
@@ -13154,17 +14074,61 @@ def _execute_source_action_locked(
         available_cash=effective_cash,
         fee_exponent=Decimal(str(snapshot.get("fee_exponent", "1"))),
         allow_minimum_upscale=allow_minimum_upscale,
+        source_held_after=source_held_after,
+        max_buy_notional_usd=max_buy_notional_usd,
     )
-
     if (
         source.side == "BUY"
-        and plan.terminal_status == "READY"
-        and plan.worst_price > USER_SPECIFIED_HIGH_PRICE_BUY_CEILING
-        and plan.worst_price > source_vwap
+        and existing_target is None
+        and dynamic_buy_pricing is not None
+        and plan.terminal_status == "PENDING_CAPITAL"
     ):
+        # The new price improvement path must not turn an order that the old
+        # best-Ask plan could fund into a new local capital skip.
+        baseline_plan = plan_action(
+            side=source.side,
+            source_quantity=planning_source_quantity,
+            scale=planning_scale,
+            held_quantity=store.available_position_quantity(source.token_id),
+            minimum_order_size=Decimal(str(base_snapshot["minimum_order_size"])),
+            minimum_marketable_buy_notional_usd=Decimal(
+                str(base_snapshot["minimum_marketable_buy_notional_usd"])
+            ),
+            best_price=Decimal(str(base_snapshot["best_price"])),
+            minimum_fill_price=Decimal(str(base_snapshot["tick_size"])),
+            visible_best_level_size=Decimal(
+                str(base_snapshot["visible_best_level_size"])
+            ),
+            taker_fee_bps=Decimal(str(base_snapshot["fee_bps"])),
+            available_cash=effective_cash,
+            fee_exponent=Decimal(str(base_snapshot.get("fee_exponent", "1"))),
+            allow_minimum_upscale=False,
+            max_buy_notional_usd=max_buy_notional_usd,
+        )
+        if baseline_plan.terminal_status == "READY":
+            plan = baseline_plan
+            snapshot = {
+                **base_snapshot,
+                "dynamic_buy_pricing": {
+                    **snapshot["dynamic_buy_pricing"],
+                    "cash_no_regression_fallback": True,
+                },
+            }
+
+    # BUY > 0.90 skips only with execution loss versus source VWAP,
+    # including raw-unit truncation so a same-tick follow is not a loss.
+    effective_profile_key = str(profile_key or store.config("profile_key") or "")
+    price_gate_reason = buy_price_gate_reason(
+        side=source.side,
+        source_vwap=source_vwap,
+        source_quantity=source.source_quantity,
+        our_worst_price=plan.worst_price,
+        profile_key=effective_profile_key,
+    )
+    if source.side == "BUY" and plan.terminal_status == "READY" and price_gate_reason:
         plan = ActionPlan(
             terminal_status="EXTERNAL_UNFILLABLE",
-            reason="BUY_PRICE_ABOVE_0_90_WITH_EXECUTION_LOSS",
+            reason=price_gate_reason,
             side=plan.side,
             proportional_quantity=plan.proportional_quantity,
             requested_quantity=plan.requested_quantity,
@@ -13220,12 +14184,6 @@ def _execute_source_action_locked(
 
     liquidity_retry_details: dict[str, Any] | None = None
     if liquidity_retry is not None:
-        frozen_price = Decimal(str(liquidity_retry["frozen_worst_price"]))
-        price_blocked = (
-            source.side == "BUY" and plan.worst_price > frozen_price
-        ) or (
-            source.side == "SELL" and plan.worst_price < frozen_price
-        )
         liquidity_retry_details = {
             **liquidity_retry,
             "observed_current_worst_price": str(plan.worst_price),
@@ -13235,17 +14193,11 @@ def _execute_source_action_locked(
                 else "MINIMUM_SELL_PRICE"
             ),
         }
-        if plan.terminal_status == "READY" and price_blocked:
-            plan = ActionPlan(
-                terminal_status="PENDING_PRICE_PROTECTION",
-                reason="CURRENT_BOOK_OUTSIDE_FIRST_ATTEMPT_PRICE",
-                side=plan.side,
-                proportional_quantity=plan.proportional_quantity,
-                requested_quantity=plan.requested_quantity,
-                order_amount_usd=plan.order_amount_usd,
-                worst_price=plan.worst_price,
-                reserved_cash_usd=plan.reserved_cash_usd,
-            )
+        if dynamic_buy_pricing is not None:
+            liquidity_retry_details["dynamic_buy_pricing"] = {
+                key: str(value) if isinstance(value, Decimal) else value
+                for key, value in dynamic_buy_pricing.items()
+            }
 
     # When the authenticated account could not fund this newly discovered BUY,
     # retaining it
@@ -13752,33 +14704,6 @@ def retry_pending_actions(
     if not pending_sources:
         return results
 
-    # GTD replaces the old liquidity-retry policy. Close every proven old
-    # remainder without submitting another order, then let future actions use
-    # one fresh GTD order only.
-    for source in pending_sources:
-        target = store.action_target(source.action_id)
-        if target is None:
-            raise LiveConfigurationError("RETRYABLE_TARGET_MISSING")
-        filled = Decimal(str(target["cumulative_filled_quantity"]))
-        terminal = "PARTIAL" if filled > ZERO else "EXTERNAL_UNFILLABLE"
-        reason = "GTD_POLICY_REPLACED_LIQUIDITY_RETRY"
-        closed_at_ms = now_ms()
-        store.set_action_target_state(
-            source=source,
-            state=terminal,
-            reason=reason,
-            updated_at_ms=closed_at_ms,
-        )
-        store.append_transition(
-            source=source,
-            status=terminal,
-            reason=reason,
-            created_at_ms=closed_at_ms,
-            details={"new_order_submitted": False},
-        )
-        results.append({"terminal_status": terminal, "reason": reason})
-    return results
-
     def causal_key(source: SourceAction) -> tuple[int, int, int, str, str, str, str]:
         return (
             int(source.block_number),
@@ -14225,10 +15150,36 @@ def reconcile_submitted_actions(
                         {"terminal_status": "PENDING", "reason": "GTD_ORDER_STILL_OPEN"}
                     )
                     continue
+        gtc_active_cancel_observed_head_block: int | None = None
+        if execution_order_type == "GTC_ACTIVE_CANCEL":
+            if not active_cancel_verified:
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_AWAITING_CANCEL_OR_FILL",
+                    }
+                )
+                continue
+            try:
+                gtc_active_cancel_observed_head_block = int(
+                    str(
+                        recorded_response.get(
+                            "active_cancel_observed_head_block"
+                        )
+                    )
+                )
+            except (AttributeError, TypeError, ValueError):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_FINALITY_BOUNDARY_MISSING",
+                    }
+                )
+                continue
         response = recorded_response
         authoritative_reader = getattr(execution, "authoritative_submission_execution", None)
         authoritative: dict[str, Any] | None = None
-        if callable(authoritative_reader):
+        if execution_order_type != "GTC_ACTIVE_CANCEL" and callable(authoritative_reader):
             try:
                 authoritative = authoritative_reader(
                     source=source,
@@ -14250,6 +15201,16 @@ def reconcile_submitted_actions(
                 # from Polygon RPCs.  Preserve the external error, then use
                 # the finalized order-hash scan below before leaving PENDING.
         order_hash_reader = getattr(execution, "authoritative_order_hash_execution", None)
+        if execution_order_type == "GTC_ACTIVE_CANCEL" and not callable(
+            order_hash_reader
+        ):
+            results.append(
+                {
+                    "terminal_status": "PENDING",
+                    "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF",
+                }
+            )
+            continue
         if authoritative is None and callable(order_hash_reader):
             try:
                 authoritative = order_hash_reader(source=source, order_id=order_id)
@@ -14260,8 +15221,108 @@ def reconcile_submitted_actions(
                     message=f"{type(exc).__name__}: {exc}",
                     details={"order_id": order_id, "action_id": source.action_id},
                 )
+        gtc_active_cancel_finality_proof = None
+        if execution_order_type == "GTC_ACTIVE_CANCEL":
+            if not isinstance(authoritative, Mapping):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF",
+                    }
+                )
+                continue
+            try:
+                scan_to_block = int(str(authoritative.get("scan_to_block")))
+            except (TypeError, ValueError):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_FINALITY_BOUNDARY_MISSING",
+                    }
+                )
+                continue
+            if scan_to_block < int(gtc_active_cancel_observed_head_block):
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALITY",
+                    }
+                )
+                continue
         if authoritative is not None:
                 if authoritative.get("authoritative_no_fill") is True:
+                    gtc_active_cancel_zero_fill_proof = None
+                    if execution_order_type == "GTC_ACTIVE_CANCEL":
+                        try:
+                            cancel_head_block = int(
+                                str(
+                                    recorded_response.get(
+                                        "active_cancel_observed_head_block"
+                                    )
+                                )
+                            )
+                            scan_to_block = int(
+                                str(authoritative.get("scan_to_block"))
+                            )
+                        except (TypeError, ValueError):
+                            results.append(
+                                {
+                                    "terminal_status": "PENDING",
+                                    "reason": "GTC_ACTIVE_CANCEL_FINALITY_BOUNDARY_MISSING",
+                                }
+                            )
+                            continue
+                        if scan_to_block < cancel_head_block:
+                            results.append(
+                                {
+                                    "terminal_status": "PENDING",
+                                    "reason": "GTC_ACTIVE_CANCEL_AWAITING_FINALITY",
+                                }
+                            )
+                            continue
+                        canceled_statuses = {
+                            "ORDER_STATUS_INVALID",
+                            "ORDER_STATUS_CANCELED",
+                            "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+                            "INVALID",
+                            "CANCELED",
+                        }
+                        try:
+                            official_matched_quantity = (
+                                ZERO
+                                if prefetched_order is None
+                                else _matched_shares(
+                                    prefetched_order,
+                                    expected_quantity=expected,
+                                )[0]
+                            )
+                        except Exception:
+                            official_matched_quantity = Decimal("-1")
+                        if (
+                            prefetched_order is None
+                            or str(prefetched_order.get("status", "")).upper()
+                            not in canceled_statuses
+                            or official_matched_quantity != ZERO
+                        ):
+                            results.append(
+                                {
+                                    "terminal_status": "PENDING",
+                                    "reason": "GTC_ACTIVE_CANCEL_OFFICIAL_ZERO_FILL_NOT_PROVEN",
+                                }
+                            )
+                            continue
+                        gtc_active_cancel_zero_fill_proof = {
+                            "schema": "GTC_ACTIVE_CANCEL_FINALITY_V1",
+                            "active_cancel_verified": True,
+                            "cancel_head_block": cancel_head_block,
+                            "scan_to_block": scan_to_block,
+                            "official_status": str(
+                                prefetched_order.get("status", "")
+                            ).upper(),
+                            "official_matched_quantity": str(
+                                official_matched_quantity
+                            ),
+                        }
                     attempt_id = str(details.get("attempt_id") or "")
                     if not attempt_id:
                         raise LiveConfigurationError("MISSING_ATTEMPT_ID_FOR_RECONCILIATION")
@@ -14269,15 +15330,15 @@ def reconcile_submitted_actions(
                         source
                     )
                     terminal_status = (
-                        "EXTERNAL_UNFILLABLE"
-                        if execution_order_type in {"GTD", "GTC_ACTIVE_CANCEL"}
-                        else
                         "PENDING_CONFIRMED_ZERO_FILL"
                         if liquidity_policy is not None
                         else "EXTERNAL_UNFILLABLE"
                     )
                     reason = (
-                        "GTC_ACTIVE_CANCEL_ZERO_FILL"
+                        "GTC_ACTIVE_CANCEL_ZERO_FILL_RETRYABLE"
+                        if execution_order_type == "GTC_ACTIVE_CANCEL"
+                        and liquidity_policy is not None
+                        else "GTC_ACTIVE_CANCEL_ZERO_FILL"
                         if execution_order_type == "GTC_ACTIVE_CANCEL"
                         else "GTD_EXPIRED_ZERO_FILL"
                         if execution_order_type == "GTD"
@@ -14303,6 +15364,15 @@ def reconcile_submitted_actions(
                             },
                             "historical_repost": False,
                             "liquidity_retry_policy": liquidity_policy,
+                            **(
+                                {
+                                    "gtc_active_cancel_zero_fill_proof": (
+                                        gtc_active_cancel_zero_fill_proof
+                                    )
+                                }
+                                if gtc_active_cancel_zero_fill_proof is not None
+                                else {}
+                            ),
                         },
                         attempt_id=attempt_id,
                         attempt_state="NO_FILL",
@@ -14324,6 +15394,21 @@ def reconcile_submitted_actions(
                     raise LiveConfigurationError("INVALID_AUTHORITATIVE_FILL_RESULT") from exc
                 if quantity <= ZERO or notional <= ZERO or fee < ZERO or vwap <= ZERO:
                     raise LiveConfigurationError("INVALID_AUTHORITATIVE_FILL_RESULT")
+                if execution_order_type == "GTC_ACTIVE_CANCEL":
+                    gtc_active_cancel_finality_proof = {
+                        "schema": "GTC_ACTIVE_CANCEL_FINALITY_V1",
+                        "active_cancel_verified": True,
+                        "cancel_head_block": int(
+                            gtc_active_cancel_observed_head_block
+                        ),
+                        "scan_to_block": int(
+                            str(authoritative.get("scan_to_block"))
+                        ),
+                        "official_status": str(
+                            (prefetched_order or {}).get("status", "")
+                        ).upper(),
+                        "official_matched_quantity": str(quantity),
+                    }
                 target = store.action_target(source.action_id)
                 remaining = (
                     expected
@@ -14419,6 +15504,13 @@ def reconcile_submitted_actions(
                 terminal = (
                     "FILLED"
                     if quantity >= remaining or buy_cash_order_complete
+                    else "PARTIAL_PENDING"
+                    if (
+                        execution_order_type == "GTC_ACTIVE_CANCEL"
+                        and target is not None
+                        and store.liquidity_retry_policy_for_source(source)
+                        is not None
+                    )
                     else "PARTIAL"
                     if execution_order_type in {"GTD", "GTC_ACTIVE_CANCEL"}
                     else "PARTIAL" if target is None else "PARTIAL_PENDING"
@@ -14499,6 +15591,24 @@ def reconcile_submitted_actions(
                             else ZERO
                         ),
                         "partial_remainder_evidence": partial_remainder_evidence,
+                        **(
+                            {
+                                "gtc_active_cancel_zero_fill_proof": (
+                                    gtc_active_cancel_finality_proof
+                                ),
+                                "chain_scan": {
+                                    "from_block": authoritative.get(
+                                        "scan_from_block"
+                                    ),
+                                    "to_block": authoritative.get(
+                                        "scan_to_block"
+                                    ),
+                                    "finality": authoritative.get("finality"),
+                                },
+                            }
+                            if gtc_active_cancel_finality_proof is not None
+                            else {}
+                        ),
                     },
                     maximum_buy_notional_usd=(
                         maximum_buy_notional
@@ -14844,6 +15954,16 @@ def reconcile_submitted_actions(
             "INVALID",
             "CANCELED",
         }:
+            if execution_order_type == "GTC_ACTIVE_CANCEL":
+                results.append(
+                    {
+                        "terminal_status": "PENDING",
+                        "reason": (
+                            "GTC_ACTIVE_CANCEL_AWAITING_FINALIZED_ZERO_FILL_PROOF"
+                        ),
+                    }
+                )
+                continue
             liquidity_policy = store.liquidity_retry_policy_for_source(source)
             bounded_retry = (
                 None
@@ -18082,6 +19202,64 @@ def fetch_source_open_position_value_usd(source_wallet: str) -> Decimal:
     return parse_source_open_position_value(payload)
 
 
+def _position_row_token_id(row: Mapping[str, Any]) -> str:
+    for key in ("asset", "asset_id", "token_id"):
+        if row.get(key) not in {None, ""}:
+            return str(row[key]).strip()
+    return ""
+
+
+def fetch_source_token_size(source_wallet: str, token_id: str) -> Decimal:
+    """Read one source wallet's remaining token size from the official positions API."""
+
+    normalized_wallet = str(source_wallet or "").lower()
+    if re.fullmatch(r"0x[a-f0-9]{40}", normalized_wallet) is None:
+        raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+    normalized_token = str(token_id).strip()
+    page_size = 50
+    offset = 0
+    full_pages = 0
+    while True:
+        url = "https://data-api.polymarket.com/positions?" + urlencode(
+            {
+                "user": normalized_wallet,
+                "sizeThreshold": 0,
+                "includeArchived": "true",
+                "limit": page_size,
+                "offset": offset,
+            }
+        )
+        try:
+            payload = _bounded_public_json(url)
+        except Exception as exc:
+            raise LiveConfigurationError(
+                f"SOURCE_TOKEN_SIZE_UNAVAILABLE:{type(exc).__name__}"
+            ) from exc
+        if not isinstance(payload, list):
+            raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+        for row in payload:
+            if not isinstance(row, Mapping):
+                continue
+            if _position_row_token_id(row) != normalized_token:
+                continue
+            raw_size = row.get("size")
+            if raw_size in {None, ""}:
+                raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+            try:
+                size = Decimal(str(raw_size))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE") from exc
+            if not size.is_finite() or size < ZERO:
+                raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+            return size
+        if len(payload) < page_size:
+            raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+        full_pages += 1
+        if full_pages > 40:
+            raise LiveConfigurationError("SOURCE_TOKEN_SIZE_UNAVAILABLE")
+        offset += page_size
+
+
 def _decimal_config(env: Mapping[str, str], key: str) -> Decimal:
     try:
         value = Decimal(str(env[key]))
@@ -19099,7 +20277,10 @@ def run_live_service(
         clock_ms=now_ms,
         action_scope=action_scope,
         public_get_json=(
-            _bounded_public_json if profile_key == LIVE_PROFILE_CD90 else None
+            _bounded_public_json
+            if source_action_detection_contract_for_profile(profile_key)
+            == SOURCE_ACTION_DETECTION_CONTRACT_FULL_WALLET
+            else None
         ),
         wallet_lock_path=wallet_lock_path,
         coordinator=coordinator,

@@ -31,6 +31,20 @@ ORDER_FILLED_TOPIC = (
 RPC_MAX_LOG_BLOCK_RANGE = 10_000
 TOKEN_SCALE = D("1000000")
 
+
+def rpc_log_block_windows(from_block: int, to_block: int) -> list[tuple[int, int]]:
+    """Inclusive block windows that stay within the public RPC log-range cap."""
+    start = int(from_block)
+    limit = int(to_block)
+    if start > limit:
+        return []
+    windows: list[tuple[int, int]] = []
+    while start <= limit:
+        end = min(start + RPC_MAX_LOG_BLOCK_RANGE - 1, limit)
+        windows.append((start, end))
+        start = end + 1
+    return windows
+
 # Public read endpoints already used by the live follower.
 DEFAULT_RPC_URLS = (
     "https://polygon-bor-rpc.publicnode.com",
@@ -629,24 +643,28 @@ class RpcClient:
             topics.append(address_topic(source_wallet))
         else:
             topics.extend([None, address_topic(source_wallet)])
-        shared_filter = {
-            "fromBlock": hex(from_block),
-            "toBlock": hex(to_block),
-            "topics": topics,
-        }
         errors: list[str] = []
         for url in self.urls:
             if url not in self._split_log_filter_urls:
                 try:
-                    result, latency_ms = self._call_url(
-                        url,
-                        "eth_getLogs",
-                        [{**shared_filter, "address": list(V2_EXCHANGE_ADDRESSES)}],
-                        result_validator=lambda value: isinstance(value, list),
-                    )
+                    rows: list[dict[str, Any]] = []
+                    latency_ms = 0
+                    for start, end in rpc_log_block_windows(from_block, to_block):
+                        result, latency_ms = self._call_url(
+                            url,
+                            "eth_getLogs",
+                            [{
+                                "fromBlock": hex(start),
+                                "toBlock": hex(end),
+                                "topics": topics,
+                                "address": list(V2_EXCHANGE_ADDRESSES),
+                            }],
+                            result_validator=lambda value: isinstance(value, list),
+                        )
+                        rows.extend(row for row in result if isinstance(row, dict))
                     self.last_url = url
                     self.last_latency_ms = latency_ms
-                    return [row for row in result if isinstance(row, dict)]
+                    return rows
                 except Exception as exc:
                     # Cache the endpoint's proven request-shape constraint so
                     # every later head does not repeat a request known to fail.
@@ -658,22 +676,28 @@ class RpcClient:
             try:
                 latency_ms = 0
                 for exchange_address in V2_EXCHANGE_ADDRESSES:
-                    partial, latency_ms = self._call_url(
-                        url,
-                        "eth_getLogs",
-                        [{**shared_filter, "address": exchange_address}],
-                        result_validator=lambda value: isinstance(value, list),
-                    )
-                    for row in partial:
-                        if not isinstance(row, dict):
-                            continue
-                        identity = (
-                            str(row.get("transactionHash", "")).lower(),
-                            str(row.get("logIndex", "")).lower(),
+                    for start, end in rpc_log_block_windows(from_block, to_block):
+                        partial, latency_ms = self._call_url(
+                            url,
+                            "eth_getLogs",
+                            [{
+                                "fromBlock": hex(start),
+                                "toBlock": hex(end),
+                                "topics": topics,
+                                "address": exchange_address,
+                            }],
+                            result_validator=lambda value: isinstance(value, list),
                         )
-                        if not identity[0] or not identity[1]:
-                            raise RpcError("source log lacks transaction/log identity")
-                        rows_by_identity[identity] = row
+                        for row in partial:
+                            if not isinstance(row, dict):
+                                continue
+                            identity = (
+                                str(row.get("transactionHash", "")).lower(),
+                                str(row.get("logIndex", "")).lower(),
+                            )
+                            if not identity[0] or not identity[1]:
+                                raise RpcError("source log lacks transaction/log identity")
+                            rows_by_identity[identity] = row
                 self.last_url = url
                 self.last_latency_ms = latency_ms
                 return [rows_by_identity[key] for key in sorted(rows_by_identity)]
@@ -700,9 +724,8 @@ class RpcClient:
         for url in self.urls:
             try:
                 rows: list[dict[str, Any]] = []
-                start = int(from_block)
-                while start <= int(to_block):
-                    end = min(start + RPC_MAX_LOG_BLOCK_RANGE - 1, int(to_block))
+                latency_ms = 0
+                for start, end in rpc_log_block_windows(from_block, to_block):
                     result, latency_ms = self._call_url(
                         url,
                         "eth_getLogs",
@@ -716,7 +739,6 @@ class RpcClient:
                     rows.extend(row for row in result if isinstance(row, dict))
                     self.last_url = url
                     self.last_latency_ms = latency_ms
-                    start = end + 1
                 return rows
             except Exception as exc:
                 array_error = f"{url}: {type(exc).__name__}: {exc}"
@@ -724,12 +746,7 @@ class RpcClient:
                 rows_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
                 latency_ms = 0
                 for exchange_address in V2_EXCHANGE_ADDRESSES:
-                    start = int(from_block)
-                    while start <= int(to_block):
-                        end = min(
-                            start + RPC_MAX_LOG_BLOCK_RANGE - 1,
-                            int(to_block),
-                        )
+                    for start, end in rpc_log_block_windows(from_block, to_block):
                         partial, latency_ms = self._call_url(
                             url,
                             "eth_getLogs",
@@ -753,7 +770,6 @@ class RpcClient:
                                     "order-fill log lacks transaction/log identity"
                                 )
                             rows_by_identity[identity] = row
-                        start = end + 1
                 self.last_url = url
                 self.last_latency_ms = latency_ms
                 return [rows_by_identity[key] for key in sorted(rows_by_identity)]

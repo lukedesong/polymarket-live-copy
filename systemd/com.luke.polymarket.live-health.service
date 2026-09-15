@@ -1,7 +1,7 @@
 [Unit]
 Description=Polymarket cash-live multi-wallet invariant audit
 Wants=network-online.target
-After=network-online.target com.luke.polymarket.cd90-live.service com.luke.polymarket.zockdo-live.service com.luke.polymarket.wallet-9506-live.service com.luke.polymarket.cd90-live-hot-standby.service com.luke.polymarket.zockdo-live-hot-standby.service com.luke.polymarket.wallet-9506-live-hot-standby.service
+After=network-online.target com.luke.polymarket.zockdo-live.service com.luke.polymarket.wallet-42b79c-live.service com.luke.polymarket.mauricebishop-live.service com.luke.polymarket.albumista-live.service com.luke.polymarket.zockdo-live-hot-standby.service com.luke.polymarket.wallet-42b79c-live-hot-standby.service com.luke.polymarket.mauricebishop-live-hot-standby.service com.luke.polymarket.albumista-live-hot-standby.service
 
 [Service]
 Type=oneshot
@@ -20,6 +20,9 @@ ReadWritePaths=/srv/polymarket-live/runtime/server_health
 ReadWritePaths=/srv/polymarket-live/runtime/cd90_live
 ReadWritePaths=/srv/polymarket-live/runtime/zockdo_live
 ReadWritePaths=/srv/polymarket-live/runtime/wallet_9506_live
+ReadWritePaths=/srv/polymarket-live/runtime/wallet_42b79c_live
+ReadWritePaths=/srv/polymarket-live/runtime/mauricebishop_live
+ReadWritePaths=/srv/polymarket-live/runtime/albumista_live
 ReadWritePaths=/srv/polymarket-live/runtime/shared_wallet
 ProtectProc=invisible
 ProcSubset=pid

@@ -31,18 +31,13 @@ import urllib.request
 from pathlib import Path
 
 RUNTIME_DIR = Path("/srv/polymarket-live/runtime")
-STATUS_JSON = RUNTIME_DIR / "zockdo_live" / "status.json"
 AUDIT_JSONL = RUNTIME_DIR / "server_health" / "server_health_audit.jsonl"
 STATE_FILE = RUNTIME_DIR / "server_health" / "deadman_alerter_state.json"
 
-REQUIRED_UNITS = (
-    "com.luke.polymarket.cd90-live.service",
-    "com.luke.polymarket.cd90-live-hot-standby.service",
-    "com.luke.polymarket.zockdo-live.service",
-    "com.luke.polymarket.zockdo-live-hot-standby.service",
-    "com.luke.polymarket.wallet-9506-live.service",
-    "com.luke.polymarket.wallet-9506-live-hot-standby.service",
-)
+# No hardcoded source. If the health audit is missing or every registered
+# sleeve is paused, do not invent a previous wallet and bark that it stopped.
+FALLBACK_UNITS: tuple[str, ...] = ()
+REQUIRED_UNITS = FALLBACK_UNITS
 
 WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 WEBHOOK_KIND = os.environ.get("ALERT_WEBHOOK_KIND", "wecom").strip().lower()
@@ -50,10 +45,45 @@ HEARTBEAT_MAX_AGE_S = int(os.environ.get("HEARTBEAT_MAX_AGE_S", "180"))
 REPEAT_INTERVAL_S = int(os.environ.get("REPEAT_INTERVAL_S", "1800"))
 
 PROFILE_DISPLAY_NAMES = {
-    "cd90": "CD90",
-    "zockdo": "zockdo",
-    "zockdo_full_wallet": "zockdo",
-    "wallet_9506_full_wallet": "0x9506",
+    "cd90": "已删除的 CD90 账本",
+    "zockdo": "全钱包跟单 zockdo",
+    "zockdo_full_wallet": "全钱包跟单 zockdo",
+    "wallet_9506_full_wallet": "已删除的钱包 9506",
+    "wallet_42b79c_full_wallet": "已停的 Grand-Vista 全钱包跟单",
+    "mauricebishop_full_wallet": "已停的 mauricebishop 全钱包跟单",
+    "albumista_full_wallet": "albumista 全钱包跟单",
+    "wallet_44b0_netflix": "已停的 Netflix 钱包",
+    "fuu_full_wallet": "已停的 FUU 钱包",
+    "tennis_atp_wta_mainline": "已停的网球主线",
+}
+
+UNIT_DISPLAY_NAMES = {
+    "com.luke.polymarket.zockdo-live.service": "全钱包跟单 zockdo 主进程",
+    "com.luke.polymarket.zockdo-live-hot-standby.service": "全钱包跟单 zockdo 热备",
+    "com.luke.polymarket.wallet-42b79c-live.service": "Grand-Vista 全钱包跟单 主进程",
+    "com.luke.polymarket.wallet-42b79c-live-hot-standby.service": "已停的 Grand-Vista 全钱包跟单 热备",
+    "com.luke.polymarket.mauricebishop-live.service": "已停的 mauricebishop 全钱包跟单 主进程",
+    "com.luke.polymarket.mauricebishop-live-hot-standby.service": "已停的 mauricebishop 全钱包跟单 热备",
+    "com.luke.polymarket.albumista-live.service": "albumista 全钱包跟单 主进程",
+    "com.luke.polymarket.albumista-live-hot-standby.service": "albumista 全钱包跟单 热备",
+    "com.luke.polymarket.wallet-9506-live.service": "已删除的钱包 9506 主进程",
+    "com.luke.polymarket.wallet-9506-live-hot-standby.service": "已删除的钱包 9506 热备",
+}
+
+# Copy-completeness counters are not incidents. Barking them makes every
+# skipped source action look like an outage.
+SILENT_ISSUE_SUFFIXES = (
+    "EXTERNAL_OR_CAUSAL_UNFILLED",
+    "PENDING_ACTION_TARGETS",
+    "POST_RELEASE_EXTERNAL_ERROR_EVENTS",
+    "HOT_STANDBY_INACTIVE",
+    "LIQUIDITY_RETRY_PENDING",
+)
+
+HEADLINES = {
+    "发现需要关注的跟单问题。",
+    "系统仍在运行，但存在未完成跟单或外部限制。",
+    "健康检查发现异常，需要检查。",
 }
 
 
@@ -81,16 +111,32 @@ def expected_active_units() -> tuple[str, ...]:
     payload = _latest_audit_payload()
     profiles = payload.get("profiles") if payload else None
     if not isinstance(profiles, dict):
-        return REQUIRED_UNITS
+        return FALLBACK_UNITS
     units = []
     for row in profiles.values():
         if not isinstance(row, dict) or row.get("paused") is True:
             continue
         for field in ("unit", "hot_standby_unit"):
             unit = row.get(field)
-            if isinstance(unit, str) and unit in REQUIRED_UNITS and unit not in units:
+            if isinstance(unit, str) and unit and unit not in units:
                 units.append(unit)
-    return tuple(units) if units else REQUIRED_UNITS
+    return tuple(units)
+
+
+def _heartbeat_targets() -> list[tuple[str, Path]]:
+    payload = _latest_audit_payload()
+    profiles = payload.get("profiles") if payload else None
+    targets: list[tuple[str, Path]] = []
+    if isinstance(profiles, dict):
+        for key, row in profiles.items():
+            if not isinstance(row, dict) or row.get("paused") is True:
+                continue
+            runtime = row.get("runtime_dir")
+            if not runtime:
+                continue
+            who = PROFILE_DISPLAY_NAMES.get(str(key), "跟单账户")
+            targets.append((who, Path(str(runtime)) / "status.json"))
+    return targets
 
 
 def now_ms() -> int:
@@ -108,48 +154,127 @@ def check_units() -> list[str]:
         except Exception as exc:  # systemctl 本身失败也要告警
             out = f"check_error:{type(exc).__name__}"
         if out != "active":
-            problems.append(f"单元 {unit} 状态 {out}")
+            who = UNIT_DISPLAY_NAMES.get(unit, "跟单进程")
+            problems.append(
+                _brief(
+                    running="跟单可能停了",
+                    who=who,
+                    what=f"这个进程现在不是运行中，当前状态是{out}。",
+                    you="不用自己下单。系统会尝试自动拉起。",
+                )
+            )
     return problems
 
 
 def check_heartbeat() -> list[str]:
     problems = []
-    try:
-        payload = json.loads(STATUS_JSON.read_text())
-    except Exception as exc:
-        return [f"status.json 不可读/不可解析: {type(exc).__name__}"]
-    hb = payload.get("heartbeat_at_ms") or (
-        payload.get("runtime", {}) or {}
-    ).get("heartbeat_at_ms")
-    try:
-        age_s = (now_ms() - int(hb)) / 1000
-    except (TypeError, ValueError):
-        problems.append("status.json 缺 heartbeat_at_ms")
-        age_s = None
-    if age_s is not None and age_s > HEARTBEAT_MAX_AGE_S:
-        problems.append(f"心跳年龄 {int(age_s)}s 超过阈值 {HEARTBEAT_MAX_AGE_S}s")
-    try:
-        mtime_age = time.time() - STATUS_JSON.stat().st_mtime
-        if mtime_age > 300:
-            problems.append(f"status.json 文件 {int(mtime_age)}s 未更新")
-    except OSError:
-        pass
+    for who, status_json in _heartbeat_targets():
+        try:
+            payload = json.loads(status_json.read_text())
+        except Exception:
+            problems.append(
+                _brief(
+                    running="跟单可能停了",
+                    who=who,
+                    what="状态文件读不到，没法确认这一轮有没有跟上。",
+                    you="不用自己下单。正在自动检查。",
+                )
+            )
+            continue
+        hb = payload.get("heartbeat_at_ms") or (
+            payload.get("runtime", {}) or {}
+        ).get("heartbeat_at_ms")
+        try:
+            age_s = (now_ms() - int(hb)) / 1000
+        except (TypeError, ValueError):
+            problems.append(
+                _brief(
+                    running="跟单可能停了",
+                    who=who,
+                    what="状态文件里没有心跳时间，没法确认进程是否还在干活。",
+                    you="不用自己下单。正在自动检查。",
+                )
+            )
+            age_s = None
+        if age_s is not None and age_s > HEARTBEAT_MAX_AGE_S:
+            problems.append(
+                _brief(
+                    running="跟单可能停了",
+                    who=who,
+                    what="心跳超过 3 分钟没更新，这一路可能已经停转。",
+                    you="不用自己下单。正在自动检查。",
+                )
+            )
+        try:
+            mtime_age = time.time() - status_json.stat().st_mtime
+            if mtime_age > 300:
+                problems.append(
+                    _brief(
+                        running="跟单可能停了",
+                        who=who,
+                        what="状态文件超过 5 分钟没更新，这一路可能已经停转。",
+                        you="不用自己下单。正在自动检查。",
+                    )
+                )
+        except OSError:
+            pass
     return problems
+
+
+def _brief(*, running: str, who: str, what: str, you: str) -> str:
+    return f"{running}\n谁：{who}\n事：{what}\n你：{you}"
 
 
 def _plain_error_detail(detail: str) -> str:
     translations = {
-        "database unavailable": "数据库不可用",
-        "unable to open database file": "无法打开数据库文件",
-        "database is locked": "数据库被锁定",
+        "database unavailable": "数据库打不开",
+        "unable to open database file": "数据库文件打不开",
+        "database is locked": "数据库被锁住了",
     }
     normalized = str(detail).strip()
-    return translations.get(normalized.lower(), normalized or "未提供错误明细")
+    return translations.get(normalized.lower(), "程序自己报错了")
 
 
-def _humanize_audit_problem(*, profile: str, field: str, value: str) -> str:
-    wallet = PROFILE_DISPLAY_NAMES.get(str(profile), str(profile))
+def _issue_suffix(issue: str) -> str:
+    code = str(issue).split(":", 1)[0]
+    suffixes = (
+        "LIQUIDITY_RETRY_PENDING",
+        "UNRESOLVED_ACTIONS",
+        "PENDING_ACTION_TARGETS",
+        "POST_RELEASE_EXTERNAL_ERROR_EVENTS",
+        "EXTERNAL_OR_CAUSAL_UNFILLED",
+        "POST_RELEASE_INTERNAL_ERROR_EVENTS",
+        "ACTION_FIDELITY_INTERNAL_ERRORS",
+        "ACTION_FIDELITY_NONCONSERVATION",
+        "ACTION_FIDELITY_UNCLASSIFIED_TARGETS",
+        "BOUNDED_RETRY_TARGET_NONCONSERVATION",
+        "HOT_STANDBY_INACTIVE",
+        "STATUS_MISSING_OR_MALFORMED",
+        "WS_SUBSCRIPTION_INACTIVE",
+        "LAST_CYCLE_NOT_SUCCESS",
+        "CHAIN_CURSOR_LAG_INVALID",
+        "LOSSLESS_HANDOFF_FAILURE",
+        "AVAILABLE_CASH_INVALID",
+        "INTERNAL_RUNTIME",
+    )
+    for suffix in suffixes:
+        if code == suffix or code.endswith("_" + suffix):
+            return suffix
+    if code.startswith("INTERNAL_RUNTIME"):
+        return "INTERNAL_RUNTIME"
+    return code
+
+
+def _is_silent_issue(issue: str) -> bool:
+    return _issue_suffix(issue) in SILENT_ISSUE_SUFFIXES
+
+
+def _humanize_audit_problem(*, profile: str, field: str, value: str) -> str | None:
+    wallet = PROFILE_DISPLAY_NAMES.get(str(profile), "跟单账户")
     issue = str(value).strip()
+    if _is_silent_issue(issue):
+        return None
+    suffix = _issue_suffix(issue)
     retry_match = re.fullmatch(
         r"[A-Z0-9_]*LIQUIDITY_RETRY_PENDING:(\{.*\})", issue
     )
@@ -160,74 +285,137 @@ def _humanize_audit_problem(*, profile: str, field: str, value: str) -> str:
             detail = {}
         reason_text = {
             "CURRENT_BOOK_OUTSIDE_FIRST_ATTEMPT_PRICE": (
-                "当前可成交价格差于首次冻结边界"
+                "现在的可成交价比当时记下的上限差"
             ),
             "OFFICIAL_CONFIRMED_ZERO_FILL_RETRYABLE": (
-                "上一笔已确认零成交，正在等待符合边界的流动性"
+                "上一笔官方确认没成交，还在等合适盘口"
             ),
             "FINALIZED_CHAIN_PROVES_FAK_ZERO_FILL_RETRYABLE": (
-                "链上已确认上一笔零成交，正在等待符合边界的流动性"
+                "链上确认上一笔没成交，还在等合适盘口"
             ),
-            "FAK_PARTIAL_FILL": "上一笔只成交一部分，正在补剩余数量",
+            "FAK_PARTIAL_FILL": "上一笔只成交一部分，还在补剩下的",
             "CURRENT_BOOK_UNAVAILABLE_FOR_LIQUIDITY_RETRY": (
-                "当前盘口暂时不可读取，本轮没有提交订单"
+                "这轮盘口暂时读不到，所以没再下单"
             ),
-        }.get(str(detail.get("reason") or ""), "当前盘口没有满足受控重试条件")
-        event_slug = str(detail.get("event_slug") or "未提供事件")
-        market_slug = str(detail.get("market_slug") or "未提供市场")
-        return (
-            f"{wallet}：{event_slug} / {market_slug} 的 "
-            f"{detail.get('side') or 'UNKNOWN'} 跟单，"
-            f"目标 {detail.get('target_quantity') or '未知'} 份，"
-            f"已成交 {detail.get('cumulative_filled_quantity') or '未知'} 份，"
-            f"剩余 {detail.get('remaining_quantity') or '未知'} 份；"
-            f"首次冻结价格边界 {detail.get('frozen_worst_price') or '未知'}；"
-            f"本次未继续成交原因：{reason_text}。"
+        }.get(str(detail.get("reason") or ""), "这轮盘口还不满足补单条件")
+        market = str(detail.get("market_slug") or detail.get("event_slug") or "未知市场")
+        side = "买" if str(detail.get("side") or "").upper() == "BUY" else (
+            "卖" if str(detail.get("side") or "").upper() == "SELL" else "跟单"
         )
-    match = re.fullmatch(r"[A-Z0-9_]*UNRESOLVED_ACTIONS:(\d+)", issue)
-    if match:
-        return (
-            f"{wallet}：有 {match.group(1)} 个跟单动作尚未完成处理。"
-            "系统正在只读核对，不会重复下单，期间可能延迟确认成交。"
+        return _brief(
+            running="跟单还在跑",
+            who=wallet,
+            what=(
+                f"{market} 这一笔{side}还没补完：目标 "
+                f"{detail.get('target_quantity') or '未知'} 份，已成交 "
+                f"{detail.get('cumulative_filled_quantity') or '未知'} 份，剩下 "
+                f"{detail.get('remaining_quantity') or '未知'} 份。"
+                f"{reason_text}。"
+            ),
+            you="不用管。系统不会为了补上而乱加仓。",
         )
-    match = re.fullmatch(r"[A-Z0-9_]*PENDING_ACTION_TARGETS:(\d+)", issue)
-    if match:
-        return (
-            f"{wallet}：有 {match.group(1)} 个源动作仍在等待处理，"
-            "尚不能算作已完整跟单。"
+    if suffix == "UNRESOLVED_ACTIONS":
+        count = issue.rsplit(":", 1)[-1]
+        return _brief(
+            running="跟单还在跑",
+            who=wallet,
+            what=f"有 {count} 笔订单还没和官方结果对上。",
+            you="不用管，更不要补单。系统只核对，不会重复下单。",
         )
-    match = re.fullmatch(
-        r"[A-Z0-9_]*POST_RELEASE_EXTERNAL_ERROR_EVENTS:(\d+)", issue
-    )
-    if match:
-        return (
-            f"{wallet}：发布后外部核对接口累计失败 {match.group(1)} 次。"
-            "这会延迟成交确认，但系统不会因此重复下单。"
+    if suffix == "POST_RELEASE_EXTERNAL_ERROR_EVENTS":
+        return _brief(
+            running="跟单还在跑",
+            who=wallet,
+            what="官方对账接口这一阵对不上，成交确认可能慢一点。",
+            you="不用管。系统不会改账，也不会重复下单。",
         )
-    match = re.fullmatch(r"[A-Z0-9_]*EXTERNAL_OR_CAUSAL_UNFILLED:(\d+)", issue)
-    if match:
-        return (
-            f"{wallet}：本版本发布后有 {match.group(1)} 个源动作未完成跟单"
-            "（可能包括盘口无深度、低于最低下单量或没有对应持仓）。"
-            "这不代表服务停止。"
+    if suffix == "POST_RELEASE_INTERNAL_ERROR_EVENTS":
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what="程序自己记到了内部错误，可能影响这一路跟单。",
+            you="需要马上看一下。你自己不用下单。",
         )
-    match = re.fullmatch(r"[A-Z0-9_]*POST_RELEASE_INTERNAL_ERROR_EVENTS:(\d+)", issue)
-    if match:
-        return (
-            f"{wallet}：本次发布后记录到 {match.group(1)} 个内部错误，"
-            "可能影响跟单，需要立即检查。"
+    if suffix == "INTERNAL_RUNTIME" or issue.startswith("INTERNAL_RUNTIME:"):
+        detail = _plain_error_detail(issue.split(":", 1)[1] if ":" in issue else "")
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what=f"程序内部出错了：{detail}。",
+            you="需要马上看一下。你自己不用下单。",
         )
-    if issue.startswith("INTERNAL_RUNTIME:"):
-        detail = _plain_error_detail(issue.split(":", 1)[1])
-        return f"{wallet}：内部运行错误：{detail}，可能影响跟单，需要立即检查。"
+    if suffix == "ACTION_FIDELITY_NONCONSERVATION":
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what="有源钱包动作对不上处理结果，可能漏记。",
+            you="需要马上看一下。你自己不用下单。",
+        )
+    if suffix in {
+        "ACTION_FIDELITY_INTERNAL_ERRORS",
+        "ACTION_FIDELITY_UNCLASSIFIED_TARGETS",
+        "BOUNDED_RETRY_TARGET_NONCONSERVATION",
+    }:
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what="跟单记账对不齐，这一路可能记错或漏记。",
+            you="需要马上看一下。你自己不用下单。",
+        )
+    if suffix == "HOT_STANDBY_INACTIVE":
+        return _brief(
+            running="跟单还在跑",
+            who=wallet,
+            what="热备进程停了。主进程若还在，跟单本身没停，只是少一层备份。",
+            you="不用自己下单。系统会尝试拉起热备。",
+        )
+    if suffix == "STATUS_MISSING_OR_MALFORMED":
+        return _brief(
+            running="跟单可能停了",
+            who=wallet,
+            what="状态文件读不到，没法确认这一轮有没有跟上。",
+            you="不用自己下单。正在自动检查。",
+        )
+    if suffix == "WS_SUBSCRIPTION_INACTIVE":
+        return _brief(
+            running="跟单可能变慢",
+            who=wallet,
+            what="实时行情断了，发现源钱包新动作可能变慢。",
+            you="不用自己下单。系统会重连。",
+        )
+    if suffix == "LAST_CYCLE_NOT_SUCCESS":
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what="这一轮跟单循环没有成功结束。",
+            you="需要马上看一下。你自己不用下单。",
+        )
+    if suffix == "CHAIN_CURSOR_LAG_INVALID":
+        return _brief(
+            running="跟单可能漏动作",
+            who=wallet,
+            what="链上进度落后或读数不对，可能暂时跟不上新动作。",
+            you="需要马上看一下。你自己不用下单。",
+        )
+    if suffix == "AVAILABLE_CASH_INVALID":
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what="共享钱包账本打不开，这一路暂时算不出还能买多少。新的买单可能下不去。",
+            you="需要马上看一下。你自己不用下单。",
+        )
     if field == "status_issues":
-        return (
-            f"{wallet}：健康检查发现内部问题，可能影响跟单，需要立即检查。"
-            f"详细标识：{issue}"
+        return _brief(
+            running="跟单可能受影响",
+            who=wallet,
+            what="内部检查发现了问题，可能影响这一路跟单。",
+            you="需要马上看一下。你自己不用下单。",
         )
-    return (
-        f"{wallet}：外部服务或市场条件限制了跟单，系统仍在运行。"
-        f"详细标识：{issue}"
+    return _brief(
+        running="跟单还在跑",
+        who=wallet,
+        what="官方接口或盘口限制了这一笔，所以没跟上。",
+        you="不用管。系统不会因此重复下单。",
     )
 
 
@@ -240,45 +428,54 @@ def check_audit_state() -> str | None:
                 if line:
                     last = line
         if last is None:
-            return "审计 JSONL 为空"
+            return _brief(
+                running="跟单可能停了",
+                who="健康检查",
+                what="健康记录是空的，没法确认现在正不正常。",
+                you="需要马上看一下。你自己不用下单。",
+            )
         payload = json.loads(last)
         state = payload.get("overall_state")
-        if state != "OK":
-            details = []
-            profiles = payload.get("profiles")
-            if isinstance(profiles, dict):
-                for profile, row in sorted(profiles.items()):
-                    if not isinstance(row, dict):
+        if state == "OK":
+            return None
+        details = []
+        profiles = payload.get("profiles")
+        if isinstance(profiles, dict):
+            for profile, row in sorted(profiles.items()):
+                if not isinstance(row, dict):
+                    continue
+                for field in ("status_issues", "external_limitations"):
+                    values = row.get(field)
+                    if not isinstance(values, list):
                         continue
-                    for field in ("status_issues", "external_limitations"):
-                        values = row.get(field)
-                        if isinstance(values, list):
-                            details.extend(
-                                _humanize_audit_problem(
-                                    profile=str(profile),
-                                    field=field,
-                                    value=str(value),
-                                )
-                                for value in values
-                                if value
-                            )
-            if state == "INTERNAL_DEGRADED":
-                headline = "发现需要关注的跟单问题。"
-            elif state == "EXTERNAL_DEGRADED":
-                headline = "系统仍在运行，但存在未完成跟单或外部限制。"
-            else:
-                headline = "健康检查发现异常，需要检查。"
-            return "\n".join((headline, *details[:8]))
-    except Exception as exc:
-        return f"审计 JSONL 读取失败: {type(exc).__name__}"
-    return None
+                    for value in values:
+                        if not value:
+                            continue
+                        text = _humanize_audit_problem(
+                            profile=str(profile),
+                            field=field,
+                            value=str(value),
+                        )
+                        if text:
+                            details.append(text)
+        if not details:
+            return None
+        return "\n\n".join(details[:8])
+    except Exception:
+        return _brief(
+            running="跟单可能停了",
+            who="健康检查",
+            what="健康记录读失败，没法确认现在正不正常。",
+            you="需要马上看一下。你自己不用下单。",
+        )
 
 
 def build_payload(text: str) -> bytes:
     if WEBHOOK_KIND in ("wecom", "dingtalk"):
         body = {"msgtype": "text", "text": {"content": text}}
     elif WEBHOOK_KIND == "bark":
-        body = {"title": "Polymarket 告警", "body": text}
+        title = text.splitlines()[0][:40] if text.strip() else "跟单提醒"
+        body = {"title": title, "body": text}
     else:  # slack / generic
         body = {"text": text}
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -315,20 +512,19 @@ def _individual_problems(warning: str | None) -> list[str]:
 
     if not warning:
         return []
-    lines = [line.strip() for line in str(warning).splitlines() if line.strip()]
-    if len(lines) > 1 and lines[0] in {
-        "发现需要关注的跟单问题。",
-        "系统仍在运行，但存在未完成跟单或外部限制。",
-        "健康检查发现异常，需要检查。",
-    }:
-        lines = lines[1:]
-    return list(dict.fromkeys(lines))
+    text = str(warning).strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and lines[0] in HEADLINES:
+        text = "\n".join(lines[1:]).strip()
+    return list(dict.fromkeys(block.strip() for block in text.split("\n\n") if block.strip()))
 
 
 def _dedupe_key(fingerprint: str) -> str:
     """Keep a wording correction from re-sending the same active problem."""
 
-    return str(fingerprint).replace("：累计历史上有 ", "：本版本发布后有 ")
+    text = str(fingerprint).replace("：累计历史上有 ", "：本版本发布后有 ")
+    # Age in seconds used to change every run and re-Bark the same outage.
+    return re.sub(r"已经 \d+ 秒没更新", "已经超时没更新", text)
 
 
 def main() -> int:
@@ -351,9 +547,20 @@ def main() -> int:
     for fingerprint, severity, problem in current_rows:
         if _dedupe_key(fingerprint) in previous:
             continue
-        message = f"【{severity}】Polymarket 跟单告警\n{problem}"
+        message = problem
         results[fingerprint] = (
             send_alert(message) if WEBHOOK_URL else "no_webhook_configured"
+        )
+    had_critical = any(str(item).startswith("CRITICAL|") for item in previous)
+    if not current and had_critical:
+        recovered = _brief(
+            running="跟单恢复了",
+            who="实盘跟单",
+            what="刚才可能停了的进程已经在跑，心跳正常。",
+            you="不用管。",
+        )
+        results["RECOVERED"] = (
+            send_alert(recovered) if WEBHOOK_URL else "no_webhook_configured"
         )
     state.update(
         alerting=bool(critical),
@@ -370,7 +577,8 @@ def main() -> int:
     else:
         print(json.dumps({"state": "WARNING", "detail": warning}, ensure_ascii=False))
     save_state(state)
-    return 1 if critical else 0
+    # Exit 0 even on CRITICAL so a oneshot timer keeps scheduling.
+    return 0
 
 
 if __name__ == "__main__":
