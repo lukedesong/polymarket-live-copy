@@ -2626,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "predict-mm-probe"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

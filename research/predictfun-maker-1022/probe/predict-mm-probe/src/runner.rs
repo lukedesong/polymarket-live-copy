@@ -237,10 +237,11 @@ impl Runner {
             };
             let succeeded = res.is_ok();
             let _ = tx.send(Ev::CancelDone { order_id: order_id.clone(), res });
-            // 撤单成功后查一次单:撤单生效前被吃了多少(校准用)
+            // 撤单成功后查一次单:撤单生效前被吃了多少(校准用)。成交已由钱包"已撮合"推送覆盖,
+            // 这里只是核对:通用额度剩一半以上才查,否则跳过(10-24 实盘查单占满通用额度的 87%)
             if succeeded {
                 if let Some(h) = hash {
-                    match api.order(&h).await {
+                    match api.order_with(&h, Priority::Background).await {
                         Ok(d) => {
                             let _ = tx.send(Ev::Detail { order_id, detail: d, after_cancel: true });
                         }
@@ -280,8 +281,10 @@ impl Runner {
         let Some(hash) = self.strat.order_by_id(order_id).and_then(|o| o.hash.clone()) else { return };
         self.detail_inflight.insert(order_id.to_string());
         let (api, tx, oid) = (self.api.clone(), self.ev_tx.clone(), order_id.to_string());
+        // 撤单后的核对是尽力查询;其余(单子状态不明)是普通查询
+        let prio = if after_cancel { Priority::Background } else { Priority::Query };
         tokio::spawn(async move {
-            match api.order(&hash).await {
+            match api.order_with(&hash, prio).await {
                 Ok(d) => {
                     let _ = tx.send(Ev::Detail { order_id: oid, detail: d, after_cancel });
                 }
@@ -396,11 +399,18 @@ impl Runner {
         ids.sort();
         ids.dedup();
         for id in ids {
-            // 钱包事件里的数量按"累计成交"用(只增不减,不会重复记账);同时用 REST 查单核实
+            // 钱包事件里的数量按"累计成交"用(只增不减,不会重复记账)
             if let Some(f) = h.amount_filled {
                 self.record_fill(t, &id, f, "wallet", h.price, h.counterparty.clone(), json!({"kind": h.kind}));
             }
-            self.query_detail(&id, false);
+            // 只在单子状态不明时查单:"已接受"有下单回包确认、我们自己撤的有撤单回包,都不查
+            // (10-24 实盘这两类推送引出约 1150 次查单,占满通用额度)
+            let ours_cancelling = self.strat.is_cancelling(&id) || self.strat.order_by_id(&id).is_some_and(|o| o.closed);
+            match h.kind.as_deref() {
+                Some("orderAccepted") => {}
+                Some("orderCancelled") if ours_cancelling => {}
+                _ => self.query_detail(&id, false),
+            }
         }
     }
 
@@ -757,7 +767,7 @@ async fn chain_exec(chain: &Chain, action: &str, market_id: u64, target: alloy_p
 /// 撤掉账户所有挂单:已知的 + GET /v1/orders 列出来的;每批 ≤ 100;失败退避重试(最多 8 次)
 async fn cancel_all_sweep(api: &Api, log: &Log, known: Vec<String>) -> (Vec<String>, Vec<(String, String)>) {
     let mut ids: BTreeSet<String> = known.into_iter().collect();
-    match api.open_orders(Priority::Cancel).await {
+    match api.open_orders(Priority::QueryUrgent).await {
         Ok(list) => {
             for o in list {
                 if o.open != Some(false) {

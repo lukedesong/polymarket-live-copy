@@ -1,3 +1,5 @@
 # 东京可以安装的探针程序(网关 /deploy/install 只认这里登记过的 sha256;只认 predict-probe 分支上的这份文件)
 # v4:提交 ec23141 之后的代码 + 启动时结掉账本里上次没结算的轮;x86_64 静态链接(musl),不依赖系统库
 59f1c93f8f75df1dc317e1fa7df45f7927b98aab7434a0ebe1d2672d39b61436  predict-mm-probe.v4
+# v5:限速按平台类别分开(交易 500/分钟 + 40/秒;通用 250/分钟),查单大幅减少
+e95e00f57b532d6cebb18d3b2264dcef7c9c90e8ce7c36439840f27804e1c460  predict-mm-probe.v5

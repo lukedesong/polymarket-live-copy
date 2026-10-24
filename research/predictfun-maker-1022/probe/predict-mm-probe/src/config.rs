@@ -96,10 +96,16 @@ pub struct Cli {
     pub day_offset_hours: i64,
 
     // ---- 限额 ----
-    #[arg(long, env = "PROBE_RATE_PER_SEC", default_value_t = 40)]
+    /// 交易类(下单、撤单)平台限额
+    #[arg(long, env = "PROBE_RATE_PER_SEC", default_value_t = crate::ratelimit::PLATFORM_TRADE_PER_SEC)]
     pub rate_per_sec: u32,
-    #[arg(long, env = "PROBE_RATE_PER_MIN", default_value_t = 500)]
+    #[arg(long, env = "PROBE_RATE_PER_MIN", default_value_t = crate::ratelimit::PLATFORM_TRADE_PER_MIN)]
     pub rate_per_min: u32,
+    /// 通用类(查单、盘口、市场、账户)平台限额
+    #[arg(long, env = "PROBE_RATE_GENERAL_PER_SEC", default_value_t = crate::ratelimit::PLATFORM_GENERAL_PER_SEC)]
+    pub rate_general_per_sec: u32,
+    #[arg(long, env = "PROBE_RATE_GENERAL_PER_MIN", default_value_t = crate::ratelimit::PLATFORM_GENERAL_PER_MIN)]
+    pub rate_general_per_min: u32,
     #[arg(long, env = "PROBE_RATE_MARGIN", default_value_t = 0.2)]
     pub rate_margin: f64,
     /// REST 查挂单兜底的间隔
@@ -166,12 +172,19 @@ impl Cli {
     }
 
     pub fn rate(&self) -> RateLimitConfig {
-        RateLimitConfig { per_sec: self.rate_per_sec, per_min: self.rate_per_min, margin: self.rate_margin, ..Default::default() }
+        RateLimitConfig {
+            per_sec: self.rate_per_sec,
+            per_min: self.rate_per_min,
+            general_per_sec: self.rate_general_per_sec,
+            general_per_min: self.rate_general_per_min,
+            margin: self.rate_margin,
+            ..Default::default()
+        }
     }
 
     /// 参数合法性 + --send 时的硬上限(防手滑把探针变成真做市)
     pub fn validate(&self, creds: &Creds) -> Result<()> {
-        if !(0.0..1.0).contains(&self.rate_margin) || self.rate_per_sec == 0 || self.rate_per_min == 0 {
+        if !(0.0..1.0).contains(&self.rate_margin) || [self.rate_per_sec, self.rate_per_min, self.rate_general_per_sec, self.rate_general_per_min].contains(&0) {
             bail!("限额参数不合法");
         }
         if self.stop_before_end_s < 0
@@ -207,8 +220,14 @@ impl Cli {
             {
                 bail!("--send 下单量/库存/亏损/合计投入上限超过探针的硬上限(单量 ≤ $5、库存 ≤ $30、日亏 ≤ $100、累计 ≤ $100、每轮合计 ≤ $300、未结算合计 ≤ $500)");
             }
-            if self.rate_margin < 0.1 || self.rate_per_sec > 40 || self.rate_per_min > 500 {
-                bail!("--send 限额不能超过实测值(40/秒、500/分钟)且余量 ≥ 10%");
+            use crate::ratelimit::*;
+            if self.rate_margin < 0.1
+                || self.rate_per_sec > PLATFORM_TRADE_PER_SEC
+                || self.rate_per_min > PLATFORM_TRADE_PER_MIN
+                || self.rate_general_per_sec > PLATFORM_GENERAL_PER_SEC
+                || self.rate_general_per_min > PLATFORM_GENERAL_PER_MIN
+            {
+                bail!("--send 限额不能超过平台限额(交易 {PLATFORM_TRADE_PER_SEC}/秒、{PLATFORM_TRADE_PER_MIN}/分钟,通用 {PLATFORM_GENERAL_PER_MIN}/分钟)且余量 ≥ 10%");
             }
         }
         Ok(())

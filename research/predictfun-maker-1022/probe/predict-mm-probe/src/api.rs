@@ -183,14 +183,17 @@ impl Api {
         self.jwt.read().unwrap().clone()
     }
 
-    pub async fn acquire(&self, prio: Priority) {
-        let t0 = mono_ns();
+    /// 拿令牌;尽力查询(Background)拿不到立刻返回 false,其余等到拿到为止
+    pub async fn acquire(&self, prio: Priority) -> bool {
         loop {
             let wait = {
                 let mut rl = self.rl.lock().unwrap();
                 let t = mono_ns();
-                if rl.try_acquire(t, crate::ratelimit::aged_priority(prio, t.saturating_sub(t0))) {
-                    return;
+                if rl.try_acquire(t, prio) {
+                    return true;
+                }
+                if prio == Priority::Background {
+                    return false;
                 }
                 if prio == Priority::Cancel {
                     rl.next_cancel_slot(t).saturating_sub(t).max(1_000_000)
@@ -216,7 +219,10 @@ impl Api {
         extra: Value,
     ) -> Result<Resp> {
         if let Some(p) = prio {
-            self.acquire(p).await;
+            if !self.acquire(p).await {
+                self.log.ev("req_skipped", json!({"tag": tag, "path": path, "msg": "通用额度不到一半,尽力查询跳过"}));
+                bail!("{tag} 尽力查询跳过(通用额度不足)");
+            }
         }
         let mut rb = self.http.request(method.clone(), format!("{}{}", self.base, path)).header("content-type", "application/json").timeout(Duration::from_secs(10));
         if let Some(k) = &self.api_key {
@@ -309,12 +315,12 @@ impl Api {
     /// GET /v1/auth/message → 签名 → POST /v1/auth → JWT
     pub async fn auth(&self, signer: &crate::signing::OrderSigner) -> Result<String> {
         let account = signer.maker_string();
-        let m = self.request("auth_message", reqwest::Method::GET, "/v1/auth/message", None, false, Some(Priority::Cancel), true, Value::Null).await?;
+        let m = self.request("auth_message", reqwest::Method::GET, "/v1/auth/message", None, false, Some(Priority::QueryUrgent), true, Value::Null).await?;
         let msg = m.json["data"]["message"].as_str().ok_or_else(|| anyhow!("auth/message 返回 {}", m.status))?.to_string();
         let signature = signer.sign_auth_message(&msg)?;
         let body = json!({"signer": account, "message": msg, "signature": signature}).to_string();
         // 回包里有 JWT:不记 body
-        let a = self.request("auth", reqwest::Method::POST, "/v1/auth", Some(body), false, Some(Priority::Cancel), false, Value::Null).await?;
+        let a = self.request("auth", reqwest::Method::POST, "/v1/auth", Some(body), false, Some(Priority::QueryUrgent), false, Value::Null).await?;
         let jwt = a.json["data"]["token"].as_str().ok_or_else(|| anyhow!("鉴权失败,状态 {}", a.status))?.to_string();
         self.set_jwt(Some(jwt.clone()));
         Ok(jwt)
@@ -354,7 +360,11 @@ impl Api {
     }
 
     pub async fn order(&self, hash: &str) -> Result<OrderDetail> {
-        let r = self.request("order", reqwest::Method::GET, &format!("/v1/orders/{hash}"), None, true, Some(Priority::Query), true, Value::Null).await?;
+        self.order_with(hash, Priority::Query).await
+    }
+
+    pub async fn order_with(&self, hash: &str, prio: Priority) -> Result<OrderDetail> {
+        let r = self.request("order", reqwest::Method::GET, &format!("/v1/orders/{hash}"), None, true, Some(prio), true, Value::Null).await?;
         if !r.ok() {
             bail!("order {hash} 返回 {}", r.status);
         }
