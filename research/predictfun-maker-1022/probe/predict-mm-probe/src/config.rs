@@ -60,6 +60,9 @@ pub struct Cli {
     pub bn_move_bp: f64,
     #[arg(long, env = "PROBE_BN_QUIET_MS", default_value_t = 300)]
     pub bn_quiet_ms: u64,
+    /// 挂单做法:aligned = 两边同股数、多出来只挂另一边补齐且这一对不超过 $1(默认);independent = 旧做法两边各挂各的
+    #[arg(long, env = "PROBE_MODE", default_value = "aligned", value_parser = ["aligned", "independent"])]
+    pub mode: String,
     #[arg(long, env = "PROBE_INVENTORY_CAP_USD", default_value_t = 6.0)]
     pub inventory_cap_usd: f64,
     /// 每轮两边合计投入上限(已成交成本 + 在挂单金额);只限净持仓会把余额全押进一轮(10-24 实盘)
@@ -146,6 +149,7 @@ impl Cli {
             bn_move_bp: self.bn_move_bp,
             bn_quiet_ms: self.bn_quiet_ms,
             inventory_cap_usd: self.inventory_cap_usd,
+            aligned: self.mode == "aligned",
             gross_cap_usd: self.gross_cap_usd,
             gross_per_min_usd: self.gross_per_min_usd,
             capital_cap_usd: self.capital_cap_usd,

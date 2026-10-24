@@ -272,6 +272,23 @@ def load(paths):
                 r = L.orders.get(L.by_oid.get(oid))
                 if r and r["cancel_ack_ms"] is None:
                     r["cancel_ack_ms"] = t
+        elif k == "fill_revert":
+            # 撮合后上链失败:扣回这张单最近记的成交
+            o = l.get("order") or {}
+            r = L.orders.get(L.by_oid.get(l.get("order_id"), o.get("cid")))
+            left = -float(l.get("delta_shares") or 0)
+            if r is None or left <= 0:
+                continue
+            r["filled"] = float(l.get("cum_shares") or 0)
+            for f in reversed(r["fills"]):
+                take = min(left, f["shares"])
+                f["shares"] -= take
+                left -= take
+                if left <= 1e-12:
+                    break
+            r["fills"] = [f for f in r["fills"] if f["shares"] > 1e-12]
+            L.fills = [f for f in L.fills if f["shares"] > 1e-12]
+            r["first_fill_ms"] = r["fills"][0]["wall_ms"] if r["fills"] else None
         elif k == "fill":
             o = l.get("order") or {}
             cid = L.by_oid.get(l.get("order_id"), o.get("cid"))

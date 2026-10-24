@@ -199,6 +199,77 @@ pub fn parse_price(v: &Value) -> Option<f64> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillEventKind {
+    /// orderTransactionSubmitted:平台已撮合(约 0.3 秒推到),上链结果未出
+    Submitted,
+    /// orderTransactionSuccess:上链成功
+    Success,
+    /// orderTransactionFailed:上链失败,这笔撮合作废
+    Failed,
+}
+
+/// 钱包事件里的一笔撮合(10-24 实盘录到的格式):同一笔撮合的 已撮合 / 上链成功 / 上链失败 靠 settlementId 对上;
+/// fill.executedSizeWei 是这一笔的股数(不是累计)
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalletFill {
+    pub kind: FillEventKind,
+    pub order_id: String,
+    pub settlement_id: String,
+    pub shares: f64,
+    pub price: Option<f64>,
+    pub platform_ts: Option<i64>,
+}
+
+pub fn parse_wallet_fill(data: &Value) -> Option<WalletFill> {
+    let kind = match data.get("type")?.as_str()? {
+        "orderTransactionSubmitted" => FillEventKind::Submitted,
+        "orderTransactionSuccess" => FillEventKind::Success,
+        "orderTransactionFailed" => FillEventKind::Failed,
+        _ => return None,
+    };
+    let order_id = match data.get("orderId")? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    let fill = data.get("fill")?;
+    Some(WalletFill {
+        kind,
+        order_id,
+        settlement_id: data.get("settlementId")?.as_str()?.to_string(),
+        shares: parse_shares(fill.get("executedSizeWei")?)?,
+        price: fill.get("executedPriceWei").and_then(parse_price),
+        platform_ts: data.get("timestamp").and_then(|t| t.as_i64()),
+    })
+}
+
+/// 一张单子的所有撮合(settlementId → (股数, 是否上链失败))
+#[derive(Debug, Clone, Default)]
+pub struct Settlements(pub std::collections::HashMap<String, (f64, bool)>);
+
+impl Settlements {
+    /// 记一条撮合事件。filled = 记账里这张单已记的成交股数(可能含 REST 查单记上的)。
+    /// 返回 (钱包累计, 新的记账目标, 是否允许往下扣)。
+    /// 只有"上链失败"能往下扣,且只扣这一笔、之前记过的才扣:漏推的事件可能已由 REST 查单记上,
+    /// 不能拿钱包累计去覆盖;其余事件只增不减
+    pub fn apply(&mut self, w: &WalletFill, filled: f64) -> (f64, f64, bool) {
+        let counted = self.0.get(&w.settlement_id).is_some_and(|x| !x.1);
+        let s = self.0.entry(w.settlement_id.clone()).or_insert((w.shares, false));
+        s.0 = w.shares;
+        if w.kind == FillEventKind::Failed {
+            s.1 = true;
+        }
+        let cum: f64 = self.0.values().filter(|x| !x.1).map(|x| x.0).sum();
+        let (target, dec) = match w.kind {
+            FillEventKind::Failed if counted => (filled - w.shares, true),
+            FillEventKind::Failed => (filled, false),
+            _ => (cum, false),
+        };
+        (cum, target, dec)
+    }
+}
+
 /// 从钱包事件里尽量抠出与订单相关的信息。找不到就全是 None,调用方应改用 REST 查单。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WalletEventHint {
@@ -292,6 +363,40 @@ mod tests {
         assert_eq!(price_to_cents(1.0), None);
         assert_eq!(price_to_cents(0.0), None);
         assert_eq!(price_to_cents(0.505), None, "非整 tick 不接受");
+    }
+
+    #[test]
+    fn wallet_fill_events_from_live_log() {
+        // 10-24 13:35 实盘录到的原样(去掉 details)
+        let sub: Value = serde_json::from_str(r#"{"fill":{"executedPriceWei":"480000000000000000","executedSizeWei":"1923076923076923200","executedValueWei":"923076923076923136"},"isMaker":true,"kind":"PURCHASE","orderHash":"0x47848a65ef90427c257522ea09767776f4310feb52706e08e6a66c47aa59b07e","orderId":"6188106220","settlementId":"01a16e1f-310f-7362-9c7a-354463463d30","timestamp":1792848900367,"type":"orderTransactionSubmitted"}"#).unwrap();
+        let w = parse_wallet_fill(&sub).unwrap();
+        assert_eq!(w.kind, FillEventKind::Submitted);
+        assert_eq!(w.order_id, "6188106220");
+        assert_eq!(w.settlement_id, "01a16e1f-310f-7362-9c7a-354463463d30");
+        assert!((w.shares - 1.9230769230769232).abs() < 1e-12);
+        assert_eq!(w.price, Some(0.48));
+        assert_eq!(w.platform_ts, Some(1792848900367));
+        let failed: Value = serde_json::from_str(r#"{"fill":{"executedPriceWei":"350000000000000000","executedSizeWei":"1050000000000000000","executedValueWei":"367500000000000000"},"orderHash":"0xc9","orderId":"6188183576","settlementId":"01a16e20-7d34-7f30-9713-98cc6aab8cbd","timestamp":1792848985421,"type":"orderTransactionFailed"}"#).unwrap();
+        assert_eq!(parse_wallet_fill(&failed).unwrap().kind, FillEventKind::Failed);
+        assert!(parse_wallet_fill(&serde_json::json!({"type": "orderAccepted", "orderId": "1"})).is_none());
+    }
+
+    #[test]
+    fn settlements_only_failed_can_decrease() {
+        let ev = |kind, sid: &str, sh| WalletFill { kind, order_id: "1".into(), settlement_id: sid.into(), shares: sh, price: None, platform_ts: None };
+        let mut s = Settlements::default();
+        assert_eq!(s.apply(&ev(FillEventKind::Submitted, "a", 2.0), 0.0), (2.0, 2.0, false));
+        assert_eq!(s.apply(&ev(FillEventKind::Success, "a", 2.0), 2.0), (2.0, 2.0, false), "上链成功不重复记");
+        assert_eq!(s.apply(&ev(FillEventKind::Submitted, "b", 3.0), 2.0), (5.0, 5.0, false));
+        assert_eq!(s.apply(&ev(FillEventKind::Failed, "b", 3.0), 5.0), (2.0, 2.0, true), "失败扣回这一笔");
+        assert_eq!(s.apply(&ev(FillEventKind::Failed, "b", 3.0), 2.0), (2.0, 2.0, false), "重复的失败不再扣");
+        assert_eq!(s.apply(&ev(FillEventKind::Failed, "c", 1.0), 2.0), (2.0, 2.0, false), "没见过撮合的失败不扣");
+        // 漏推:REST 已记 6 股(含钱包没推到的 a2),之后来了 b2 的已撮合:钱包累计 3 < 6,不能往下扣
+        let mut s = Settlements::default();
+        let (cum, target, dec) = s.apply(&ev(FillEventKind::Submitted, "b2", 3.0), 6.0);
+        assert_eq!((cum, dec), (3.0, false));
+        assert!(target < 6.0, "目标比已记少,但不允许扣 —— 记账保持 6");
+        assert_eq!(s.apply(&ev(FillEventKind::Failed, "b2", 3.0), 6.0), (0.0, 3.0, true), "它失败了照样只扣它自己 3 股");
     }
 
     #[test]

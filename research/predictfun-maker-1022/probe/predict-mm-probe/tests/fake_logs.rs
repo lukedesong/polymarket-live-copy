@@ -84,6 +84,7 @@ struct Sim {
     truth_fills: Vec<Value>,
     truth_orders: Vec<Value>,
     last_book: HashMap<u64, (u32, u32)>,
+    settle_seq: u64,
 }
 
 type S = Arc<Mutex<Sim>>;
@@ -141,12 +142,16 @@ impl Sim {
         }
     }
 
-    fn wallet_event(&mut self, i: usize) {
+    /// 实盘格式:每笔撮合一个 settlementId,先"已撮合",再"上链成功";executedSizeWei 是这一笔的股数
+    fn wallet_event(&mut self, i: usize, qty: f64) {
+        self.settle_seq += 1;
         let o = &self.orders[i];
-        let wei = format!("{}", (o.filled * 1e18).round() as u128);
-        let ev = json!({"type": "M", "topic": format!("predictWalletEvents/{JWT}"), "data": {"type": "ORDER_FILLED",
-            "order": {"id": o.id, "hash": o.hash, "amountFilled": wei, "price": format!("{}", o.price_c as f64 / 100.0)}}});
-        self.pf_out.push(ev.to_string());
+        let fill = json!({"executedPriceWei": format!("{}", o.price_c as u128 * 10_000_000_000_000_000u128), "executedSizeWei": format!("{}", (qty * 1e18).round() as u128), "executedValueWei": "0"});
+        for typ in ["orderTransactionSubmitted", "orderTransactionSuccess"] {
+            let ev = json!({"type": "M", "topic": format!("predictWalletEvents/{JWT}"), "data": {"type": typ, "orderId": o.id, "orderHash": o.hash,
+                "settlementId": format!("sim-{}", self.settle_seq), "fill": fill, "isMaker": true, "timestamp": now_ms()}});
+            self.pf_out.push(ev.to_string());
+        }
     }
     fn fill(&mut self, i: usize, qty: f64, kind: &str, t: i64) {
         let qty = qty.min(self.orders[i].shares - self.orders[i].filled);
@@ -161,7 +166,7 @@ impl Sim {
         let fair = self.up_fair(o.market, t);
         self.truth_fills.push(json!({"order_id": o.id, "wall_ms": t, "shares": qty, "price": o.price_c as f64 / 100.0, "is_up": o.is_up, "kind": kind,
             "market_id": o.market, "up_fair": fair, "btc": self.btc}));
-        self.wallet_event(i);
+        self.wallet_event(i, qty);
     }
     /// 一拍:盘口更新、处理成交、推送
     fn tick(&mut self) {

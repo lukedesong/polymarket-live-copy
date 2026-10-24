@@ -120,9 +120,14 @@ fn route(s: &S, method: &str, path: &str, headers: &[(String, String)], body: &s
                         if o.status == "OPEN" {
                             o.status = "FILLED".into();
                             o.filled = o.shares;
+                            // 实盘录到的格式:先"已撮合"(按 settlementId),再"上链成功"(同一 settlementId,不能重复记账)
                             let wei = format!("{}000000000000000000", o.shares as u64);
-                            let ev = json!({"type": "M", "topic": format!("predictWalletEvents/{JWT}"), "data": {"type": "ORDER_FILLED", "order": {"id": id2, "hash": h2, "amountFilled": wei, "price": "0.5"}}});
-                            st.wallet_events.push(ev.to_string());
+                            let fill = json!({"executedPriceWei": "500000000000000000", "executedSizeWei": wei, "executedValueWei": "0"});
+                            for typ in ["orderTransactionSubmitted", "orderTransactionSuccess"] {
+                                let ev = json!({"type": "M", "topic": format!("predictWalletEvents/{JWT}"), "data": {"type": typ, "orderId": id2, "orderHash": h2,
+                                    "settlementId": "s-1", "fill": fill, "isMaker": true, "timestamp": 1792848900367i64}});
+                                st.wallet_events.push(ev.to_string());
+                            }
                         }
                     }
                 });
@@ -403,7 +408,10 @@ async fn e2e_send_against_mock() {
     let first_post = idx(&|r| r.0 == "POST" && r.1 == "/v1/orders").unwrap();
     assert!(auth < first_list && first_list < first_post, "{:?}", st.requests);
     // 请求体结构
-    assert!(st.posts.len() >= 3, "下单 {} 次", st.posts.len());
+    // 对齐做法(默认):开盘两边同股数各一张;Up 成交后 Up 不再挂,只挂 Down 补齐(模拟器不会成交 Down)
+    assert!(st.posts.len() >= 2, "下单 {} 次", st.posts.len());
+    let sizes: Vec<String> = st.posts.iter().take(2).map(|b| b["data"]["order"]["takerAmount"].as_str().unwrap().to_string()).collect();
+    assert_eq!(sizes[0], sizes[1], "两边同股数");
     for b in &st.posts {
         let d = &b["data"];
         assert_eq!(d["strategy"], "LIMIT");
@@ -425,7 +433,9 @@ async fn e2e_send_against_mock() {
     drop(st);
     // 成交被记录(钱包事件 + REST 核实),账本有持仓
     let fills = kinds(&r.logs, "fill");
-    assert!(fills.iter().any(|f| f["source"] == "wallet"), "{fills:?}");
+    assert!(fills.iter().any(|f| f["source"] == "wallet_submitted"), "收到'已撮合'就记成交: {fills:?}");
+    assert!(!fills.iter().any(|f| f["source"] == "wallet_success"), "'上链成功'是同一笔,不能再记一次: {fills:?}");
+
     let exit = kinds(&r.logs, "exit");
     assert_eq!(exit.len(), 1);
     let open = exit[0]["ledger"]["open"].as_array().unwrap();
@@ -448,7 +458,7 @@ async fn e2e_429_cancels_all_and_cools_down() {
     let signer = OrderSigner::random(None).unwrap();
     let account = OrderSigner::random(None).unwrap().signer_address().to_checksum(None);
     let s: S = Arc::new(Mutex::new(State { owner: signer.signer_address().to_checksum(None), fail_429_on_place: Some(3), ..Default::default() }));
-    let r = run_probe(&s, true, &["--cooldown-s", "60"], 8, &signer, &account).await;
+    let r = run_probe(&s, true, &["--cooldown-s", "60", "--mode", "independent"], 8, &signer, &account).await;
     assert_eq!(r.code, 0, "{}", r.stderr);
     let st = s.lock().unwrap();
     // 第 3 次下单 429 → 之后冷却 60 秒,8 秒内不再下单

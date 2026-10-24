@@ -68,6 +68,9 @@ pub struct Params {
     pub bn_move_bp: f64,
     pub bn_quiet_ms: u64,
     pub inventory_cap_usd: f64,
+    /// 对齐做法(10-24 Luke 定,默认开):两边同股数;一边多出来就只挂另一边补齐,补齐价不让这一对超过 $1。
+    /// false = 旧做法(两边各挂各的,每张 ceil($1/价) 股)
+    pub aligned: bool,
     pub gross_cap_usd: f64,
     pub gross_per_min_usd: f64,
     pub capital_cap_usd: f64,
@@ -91,6 +94,7 @@ impl Default for Params {
             bn_move_bp: 0.2,
             bn_quiet_ms: 300,
             inventory_cap_usd: 6.0,
+            aligned: true,
             gross_cap_usd: 150.0,
             gross_per_min_usd: 0.0,
             capital_cap_usd: 1_000.0,
@@ -134,6 +138,8 @@ pub struct OrderRec {
     pub closed: bool,
     /// 下单回报到达的单调时钟
     pub acked_ns: Option<u64>,
+    /// 第一次记到成交的单调时钟(凑对按先后配)
+    pub first_fill_ns: Option<u64>,
 }
 
 /// 决策时的盘面快照(写进日志,和回放逐笔对比用)
@@ -463,14 +469,37 @@ impl Strategy {
 
     /// 成交(累计成交股数,来源任意;重复上报只按增量记账)。返回 (增量, 动作)
     pub fn on_fill(&mut self, now: Now, order_id: &str, cum_filled: f64, rl: &mut RateLimiter) -> (f64, Vec<Action>) {
+        self.on_fill_set(now, order_id, cum_filled, false, rl)
+    }
+
+    /// 按累计成交股数记账;allow_decrease = true 时累计变少(撮合后上链失败)会撤回记账。
+    /// 撤回后单子在平台上可能重新挂着:如果我们已当它成交完、槽位已空,就把它撤掉(同一侧不留两张单)
+    pub fn on_fill_set(&mut self, now: Now, order_id: &str, cum_filled: f64, allow_decrease: bool, rl: &mut RateLimiter) -> (f64, Vec<Action>) {
         let Some(&cid) = self.by_order_id.get(order_id) else { return (0.0, vec![]) };
         let rec = self.orders.get_mut(&cid).unwrap();
-        let cum = cum_filled.min(rec.shares as f64);
+        let cum = cum_filled.clamp(0.0, rec.shares as f64);
         let delta = cum - rec.filled;
+        if delta < -1e-9 && allow_decrease {
+            rec.filled = cum;
+            let (market_id, qside, price) = (rec.market_id, rec.qside, rec.price_cents);
+            let was_closed = rec.closed;
+            rec.closed = false;
+            self.ledger.revert_fill(market_id, qside.outcome(), -delta, price as f64 / 100.0);
+            self.ledger_dirty = true;
+            let mut acts = vec![];
+            if was_closed && !self.slot_holds(qside.idx(), cid) {
+                acts.extend(self.issue_cancel(now, cid, qside, order_id.to_string(), "撮合上链失败,单子可能重新挂着:撤".into(), rl));
+            }
+            acts.extend(self.decide(now, rl));
+            return (delta, acts);
+        }
         if delta <= 1e-9 {
             return (0.0, vec![]);
         }
         rec.filled = cum;
+        if rec.first_fill_ns.is_none() {
+            rec.first_fill_ns = Some(now.mono_ns);
+        }
         let (market_id, qside, price, shares) = (rec.market_id, rec.qside, rec.price_cents, rec.shares);
         if cum >= shares as f64 - 1e-9 {
             rec.closed = true;
@@ -651,6 +680,73 @@ impl Strategy {
         [d >= -1e-9, d <= 1e-9]
     }
 
+    /// 平台最低金额要求的最少股数
+    fn min_shares(&self, cents: u32) -> u64 {
+        let min_cents = (self.p.min_notional_usd * 100.0).round() as u64;
+        min_cents.div_ceil(cents.max(1) as u64).max(1)
+    }
+
+    /// 本轮两边股数差:按第一次成交先后把 Up、Down 一股股配成对,剩下没配上的那一边 = 多的一边。
+    /// 返回 (多的一边, 多出的股数, 多出部分的平均成本 0~1);两边相等返回 None
+    pub fn imbalance(&self) -> Option<(QSide, f64, f64)> {
+        let m = self.round.as_ref()?.market_id;
+        let mut lots: [Vec<(u64, f64, f64)>; 2] = [vec![], vec![]];
+        for o in self.orders.values().filter(|o| o.market_id == m && o.filled > 1e-12) {
+            lots[o.qside.idx()].push((o.first_fill_ns.unwrap_or(0), o.filled, o.price_cents as f64 / 100.0));
+        }
+        for l in lots.iter_mut() {
+            l.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)));
+        }
+        let (mut i, mut j) = (0, 0);
+        let (mut ru, mut rd) = (lots[0].first().map_or(0.0, |x| x.1), lots[1].first().map_or(0.0, |x| x.1));
+        while i < lots[0].len() && j < lots[1].len() {
+            let q = ru.min(rd);
+            ru -= q;
+            rd -= q;
+            if ru <= 1e-9 {
+                i += 1;
+                ru = lots[0].get(i).map_or(0.0, |x| x.1);
+            }
+            if rd <= 1e-9 {
+                j += 1;
+                rd = lots[1].get(j).map_or(0.0, |x| x.1);
+            }
+        }
+        let (side, k, first_rem) = if i < lots[0].len() {
+            (QSide::UpBid, i, ru)
+        } else if j < lots[1].len() {
+            (QSide::DownBid, j, rd)
+        } else {
+            return None;
+        };
+        let l = &lots[side.idx()];
+        let mut sh = first_rem;
+        let mut cost = first_rem * l[k].2;
+        for x in &l[k + 1..] {
+            sh += x.1;
+            cost += x.1 * x.2;
+        }
+        (sh > 1e-6).then(|| (side, sh, cost / sh))
+    }
+
+    /// 对齐做法下某一侧的出价:补齐的一侧不超过 1 − 多出部分平均成本(这一对不超过 $1)
+    fn quote_target(&self, side: QSide, imb: Option<(QSide, f64, f64)>) -> Option<u32> {
+        let t = self.target(side)?;
+        if !self.p.aligned {
+            return Some(t);
+        }
+        match imb {
+            Some((heavy, _, avg)) if heavy != side => {
+                let cap = ((1.0 - avg) * 100.0 + 1e-6).floor() as i64;
+                if cap < 1 {
+                    return None;
+                }
+                Some(t.min(cap as u32))
+            }
+            _ => Some(t),
+        }
+    }
+
     /// 连接异常:返回 (是否禁止新挂, 是否已断 > feed_down_ms)
     fn feed_health(&self, now: Now) -> (bool, Option<String>) {
         let mut bad = false;
@@ -762,6 +858,9 @@ impl Strategy {
         let cooldown = self.in_cooldown(now);
         let ms_left = self.ms_left(now);
         let inv_block = self.inventory_blocked();
+        let imb = if self.p.aligned { self.imbalance() } else { None };
+        // 两边都要挂时用同一个股数:两边各自最低金额要求的股数取大
+        let both_shares = QSide::ALL.iter().filter_map(|&s| self.quote_target(s, imb)).map(|c| self.min_shares(c)).max();
         let started = self.round.as_ref().is_some_and(|r| now.wall_ms >= r.start_ms);
         let end_window = ms_left.is_some_and(|l| l <= self.p.stop_before_end_ms);
 
@@ -781,15 +880,20 @@ impl Strategy {
                 Some("币安急动".into())
             } else if inv_block[side.idx()] {
                 Some(format!("本轮最坏亏损 ≥ ${}", self.p.inventory_cap_usd))
+            } else if let Some((_, sh, _)) = imb.filter(|x| x.0 == side) {
+                Some(format!("等另一边补齐 {sh:.3} 股"))
             } else {
                 None
             };
-            let target = self.target(side);
+            let target = self.quote_target(side, imb);
             if let Slot::Live { cid, order_id, price, placed_ns, want_cancel, .. } = self.slots[i].clone() {
                 let reason = if let Some(r) = &keep_reason {
                     Some(r.clone())
                 } else if let Some(r) = want_cancel {
                     Some(r)
+                } else if self.p.aligned && imb.is_some_and(|x| x.0 != side) && target.is_none_or(|t| price > t) {
+                    // 补齐那一腿:挂价高于补齐价上限(会让这一对超过 $1)立刻撤,不等 1 秒
+                    Some(format!("补齐价上限 {price}→{}", target.map_or("无".into(), |t| t.to_string())))
                 } else if target.is_some_and(|t| t != price) && now.mono_ns >= placed_ns + self.p.reprice_min_age_ms * 1_000_000 {
                     Some(format!("改价 {price}→{}", target.unwrap()))
                 } else {
@@ -817,8 +921,14 @@ impl Strategy {
                 continue;
             }
             let price = target.unwrap();
-            let min_cents = (self.p.min_notional_usd * 100.0).round() as u64;
-            let shares = min_cents.div_ceil(price as u64).max(1);
+            let shares = if !self.p.aligned {
+                self.min_shares(price)
+            } else if let Some((_, sh, _)) = imb {
+                // 补齐:补多出的股数(取整),但不少于平台最低金额要求
+                ((sh - 1e-6).ceil() as u64).max(self.min_shares(price))
+            } else {
+                both_shares.unwrap_or_else(|| self.min_shares(price)).max(self.min_shares(price))
+            };
             let gb = if now.mono_ns < self.collateral_wait_until {
                 Some("保证金不足,等上一轮自动领回".to_string())
             } else {
@@ -835,7 +945,10 @@ impl Strategy {
             let cid = self.next_cid;
             self.next_cid += 1;
             let market_id = self.round.as_ref().unwrap().market_id;
-            self.orders.insert(cid, OrderRec { cid, qside: side, market_id, price_cents: price, shares, order_id: None, hash: None, filled: 0.0, closed: false, acked_ns: None });
+            self.orders.insert(
+                cid,
+                OrderRec { cid, qside: side, market_id, price_cents: price, shares, order_id: None, hash: None, filled: 0.0, closed: false, acked_ns: None, first_fill_ns: None },
+            );
             self.slots[i] = Slot::Placing { cid, price, shares, sent_ns: now.mono_ns };
             let mut ctx = self.ctx(Some(side), now);
             ctx.queue_ahead = self.book.as_ref().map(|b| match side {
@@ -843,7 +956,12 @@ impl Strategy {
                 QSide::DownBid => b.ask_size_at(100 - price),
             });
             self.last_note[i] = None;
-            acts.push(Action::Place { cid, qside: side, market_id, price_cents: price, shares, reason: "挂最优价".into(), ctx });
+            let reason = match imb {
+                Some((h, sh, avg)) if self.p.aligned && h != side => format!("补齐 {sh:.3} 股(多出部分均价 {avg:.3})"),
+                _ if self.p.aligned => "两边同股数挂最优价".into(),
+                _ => "挂最优价".into(),
+            };
+            acts.push(Action::Place { cid, qside: side, market_id, price_cents: price, shares, reason, ctx });
         }
         acts
     }

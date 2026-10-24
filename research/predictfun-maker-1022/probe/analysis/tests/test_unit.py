@@ -63,6 +63,9 @@ def lines():
           {"wall_ms": 150000, "kind": "decision", "action": "cancel_all", "reason": "冷却", "known": ["D4"]}, {"wall_ms": 150020, "kind": "cancel_all_done", "ok": ["D4"], "failed": []}]
     # 单 5:前面 200 股,分两次成交(1 + 1)
     L += [place(100900, 5, "UpBid", 0.50, 2, 200.0), ack(100935, 5, "E5"), fill(120000, "E5", 5, 1.0, 1.0, "rest_list"), fill(121000, "E5", 5, 2.0, 1.0, "rest_detail")]
+    # 单 6:成交 2 股后上链失败扣回 → 不算成交
+    L += [place(101000, 6, "DownBid", 0.45, 2, 7.0), ack(101035, 6, "F6"), fill(101500, "F6", 6, 2.0, 2.0, "wallet_submitted"),
+          {"wall_ms": 101700, "kind": "fill_revert", "order_id": "F6", "source": "wallet_failed", "delta_shares": -2.0, "cum_shares": 0.0, "order": {"cid": 6}}]
     L += [{"wall_ms": 300000, "kind": "round_end", "round": {"market_id": MKT, "start_ms": 0, "end_ms": 300000}, "position": {"up_shares": 4.0, "down_shares": 1.0, "cost_usd": 2.45}}]
     L += [{"wall_ms": 400000, "kind": "settle", "market_id": MKT, "payout_up": 1.0, "payout_down": 0.0, "pnl": 1.55}]
     return L
@@ -90,7 +93,10 @@ class TestLoad(Base):
         self.assertTrue(o[4]["cancel_reason"].startswith("全撤"))
         self.assertEqual(o[5]["filled"], 2.0)
         self.assertEqual(len(o[5]["fills"]), 2)
-        self.assertEqual([r["cid"] for r in P.placed_orders(self.L)], [1, 2, 4, 5], "被拒的单不算挂出")
+        self.assertEqual([r["cid"] for r in P.placed_orders(self.L)], [1, 2, 4, 5, 6], "被拒的单不算挂出")
+        self.assertEqual(o[6]["filled"], 0.0, "上链失败扣回")
+        self.assertFalse(o[6]["fills"])
+        self.assertNotIn(6, [f["cid"] for f in self.L.fills])
 
     def test_reference_prices(self):
         L = self.L
@@ -157,18 +163,18 @@ class TestQueue(Base):
     def test_fixed_edges(self):
         rows, e = Q.order_rows(self.L, (1, 5, 30), edges=(10.0, 100.0))
         b = {r["cid"]: r["bucket"] for r in rows}
-        self.assertEqual(b, {1: "队中", 2: "队中", 4: "队首", 5: "队尾"})
+        self.assertEqual(b, {1: "队中", 2: "队中", 4: "队首", 5: "队尾", 6: "队首"})
         g = {(x["side"], x["bucket"]): x for x in Q.group(rows, (1, 5, 30))}
-        self.assertEqual(g[("全部", "队首")]["fill_rate"], 0.0)
+        self.assertEqual(g[("全部", "队首")]["fill_rate"], 0.0, "单 4 没成交,单 6 扣回后也没成交")
         self.assertEqual(g[("全部", "队中")]["fill_rate"], 1.0)
         self.assertEqual(g[("全部", "队尾")]["orders"], 1)
-        self.assertAlmostEqual(g[("全部", "全部")]["share_fill_rate"], 5 / 9)
+        self.assertAlmostEqual(g[("全部", "全部")]["share_fill_rate"], 5 / 11)
         self.assertAlmostEqual(g[("全部", "队中")]["pnl_settle"], (0.5 * 2 - 0.45 * 1) / 3)
         self.assertAlmostEqual(rows[0]["ahead_in_orders"], 40.0)
 
     def test_tercile_edges(self):
         rows, e = Q.order_rows(self.L, (1,))
-        self.assertEqual(sum(1 for r in rows if r["bucket"] != "未知"), 4)
+        self.assertEqual(sum(1 for r in rows if r["bucket"] != "未知"), 5)
         self.assertLessEqual(e[0], e[1])
 
 
@@ -182,7 +188,7 @@ class TestReplayCompare(Base):
     def test_export(self):
         _, rows = self.live()
         x = {r["order_id"]: r for r in rows}
-        self.assertEqual(set(x), {"A1", "B2", "D4", "E5"})
+        self.assertEqual(set(x), {"A1", "B2", "D4", "E5", "F6"})
         self.assertEqual(x["B2"]["book_side"], "ask")
         self.assertEqual(x["B2"]["up_level"], "0.55")
         self.assertEqual(x["B2"]["remove_ms"], "102018")
@@ -205,7 +211,7 @@ class TestReplayCompare(Base):
         self.assertEqual((a["live_filled_orders"], a["replay_filled_orders"]), ("3", "2"))
         self.assertAlmostEqual(float(a["fill_rate_ratio"]), 2 / 3, places=9)
         self.assertAlmostEqual(float(a["share_ratio"]), 3 / 5)
-        self.assertEqual((a["both"], a["live_only"], a["replay_only"], a["neither"]), ("2", "1", "0", "1"))
+        self.assertEqual((a["both"], a["live_only"], a["replay_only"], a["neither"]), ("2", "1", "0", "2"))
         self.assertAlmostEqual(float(a["time_diff_ms_median"]), 150.0)
         self.assertIn("回放低估成交", buf.getvalue())
         self.assertIn(("方向", "卖Up(买Down)"), s)

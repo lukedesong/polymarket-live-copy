@@ -9,6 +9,11 @@ const MKT: u64 = 3698227;
 const START_MS: i64 = 1_792_818_000_000;
 const END_MS: i64 = START_MS + 300_000;
 
+/// 旧做法(两边各挂各的)的参数:下面的老测试都用它
+fn indep() -> Params {
+    Params { aligned: false, ..Params::default() }
+}
+
 struct Sim {
     s: Strategy,
     rl: RateLimiter,
@@ -42,7 +47,7 @@ impl Sim {
         s
     }
     fn default() -> Self {
-        Self::new(Params::default(), Ledger::default())
+        Self::new(indep(), Ledger::default())
     }
     /// 推进时间(两条消息之间),期间 Predict 有心跳、币安有消息(价不变),保证连接健康
     fn advance(&mut self, ms: u64) {
@@ -261,7 +266,7 @@ fn daily_loss_halts_and_cancels_all() {
     let mut l = Ledger::default();
     l.realized_by_day.insert(predict_mm_probe::risk::day_key(START_MS, 0), -29.1);
     l.realized_total = -29.1;
-    let mut sim = Sim::new(Params::default(), l);
+    let mut sim = Sim::new(indep(), l);
     sim.line("bn", &bn(80880.0));
     let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
     sim.ack_all(&a);
@@ -287,13 +292,13 @@ fn total_loss_halts_and_halted_ledger_refuses_to_quote() {
     let mut l = Ledger::default();
     l.realized_by_day.insert("2026-10-01".into(), -100.0);
     l.realized_total = -100.0;
-    let mut sim = Sim::new(Params::default(), l);
+    let mut sim = Sim::new(indep(), l);
     let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
     assert!(places(&a).is_empty());
     assert!(sim.s.halted().unwrap().contains("累计亏损"));
     // 重启:账本带着停机标记 → 一开始就不挂
     let l2 = sim.s.ledger.clone();
-    let mut sim2 = Sim::new(Params::default(), l2);
+    let mut sim2 = Sim::new(indep(), l2);
     let a = sim2.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
     assert!(places(&a).is_empty());
 }
@@ -437,7 +442,7 @@ fn late_ack_cancel_retried_when_budget_returns() {
 #[test]
 fn gross_cap_blocks_new_orders_when_both_sides_fill() {
     // 合计上限 $5:两边交替成交,成本 + 在挂金额 + 新单 > $5 时不再挂(10-24 实盘两边各成交 ~$45 把余额押光)
-    let mut sim = Sim::new(Params { gross_cap_usd: 5.0, ..Params::default() }, Ledger::default());
+    let mut sim = Sim::new(Params { gross_cap_usd: 5.0, ..indep() }, Ledger::default());
     sim.line("bn", &bn(80880.0));
     let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
     assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2), (QSide::DownBid, 45, 3)], "{a:?}");
@@ -470,7 +475,7 @@ fn gross_cap_blocks_new_orders_when_both_sides_fill() {
 #[test]
 fn gross_per_minute_paces_quoting() {
     // 匀速 $2/分钟:开盘第 1 分钟只够挂 Up($1),Down($1.35)要等到第 2 分钟
-    let mut sim = Sim::new(Params { gross_per_min_usd: 2.0, ..Params::default() }, Ledger::default());
+    let mut sim = Sim::new(Params { gross_per_min_usd: 2.0, ..indep() }, Ledger::default());
     sim.line("bn", &bn(80880.0));
     let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
     assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2)], "{a:?}");
@@ -488,7 +493,7 @@ fn capital_cap_counts_unsettled_previous_round() {
     // 上一轮还没结算(成本 $79,两边各 80 股),未结算合计上限 $81:本轮只够挂 Up($1),Down($1.35)被拦
     let prev = RoundPos { market_id: MKT - 1, start_ms: START_MS - 300_000, end_ms: START_MS, up_shares: 80.0, down_shares: 80.0, cost_usd: 79.0, fills: 60 };
     let ledger = Ledger { open: vec![prev], ..Ledger::default() };
-    let mut sim = Sim::new(Params { capital_cap_usd: 81.0, ..Params::default() }, ledger);
+    let mut sim = Sim::new(Params { capital_cap_usd: 81.0, ..indep() }, ledger);
     sim.line("bn", &bn(80880.0));
     let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
     assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2)], "{a:?}");
@@ -597,4 +602,203 @@ fn balanced_book_at_cap_blocks_both_sides() {
     sim.s.on_fill(sim.now, &u, 2.0, &mut sim.rl);
     let (_, a) = sim.s.on_fill(sim.now, &d, 2.0, &mut sim.rl);
     assert!(a.iter().all(|x| !matches!(x, Action::Note { msg, .. } if msg.contains("最坏亏损"))), "{a:?}");
+}
+
+// ======================= 对齐做法(默认) =======================
+
+fn aligned() -> Sim {
+    Sim::new(Params::default(), Ledger::default())
+}
+
+fn place_of(a: &[Action], side: QSide) -> Option<(u64, u32, u64)> {
+    a.iter().find_map(|x| if let Action::Place { cid, qside, price_cents, shares, .. } = x { (*qside == side).then_some((*cid, *price_cents, *shares)) } else { None })
+}
+
+#[test]
+fn aligned_both_sides_same_shares() {
+    let mut sim = aligned();
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
+    // Up 0.50 最少 2 股,Down 0.45 最少 3 股 → 两边都 3 股
+    assert_eq!(places(&a), vec![(QSide::UpBid, 50, 3), (QSide::DownBid, 45, 3)], "{a:?}");
+}
+
+#[test]
+fn aligned_one_leg_fills_then_only_complete_other_leg_capped() {
+    let mut sim = aligned();
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
+    sim.advance(35);
+    sim.ack_all(&a);
+    let (up, _) = sim.live_order(QSide::UpBid).unwrap();
+    // Up 3 股 @0.50 成交 → 多 3 股 Up,均价 0.50:Up 不再挂,只挂 Down,Down 价 ≤ 1 − 0.50
+    let (_, a) = sim.s.on_fill(sim.now, &up, 3.0, &mut sim.rl);
+    assert!(place_of(&a, QSide::UpBid).is_none(), "{a:?}");
+    assert!(a.iter().any(|x| matches!(x, Action::Note { qside: Some(QSide::UpBid), msg, .. } if msg.contains("等另一边补齐"))), "{a:?}");
+    assert_eq!(sim.s.imbalance().map(|x| (x.0, x.1, x.2)), Some((QSide::UpBid, 3.0, 0.5)));
+    // 行情上涨:Down 最优价 1 − 0.45 = 0.55 > 上限 0.50 → 改挂到 0.50(满 1 秒后)
+    sim.advance(1_100);
+    let a = sim.line("pf", &pf(&[(0.4, 80.0)], &[(0.45, 30.0)]));
+    assert!(cancels(&a).iter().any(|c| c.0 == QSide::DownBid), "{a:?}");
+    let a = sim.ack_all(&a);
+    assert_eq!(place_of(&a, QSide::DownBid).map(|x| (x.1, x.2)), Some((50, 3)), "补齐价被封顶在 0.50,补 3 股: {a:?}");
+    assert!(place_of(&a, QSide::UpBid).is_none());
+    sim.advance(35);
+    sim.ack_all(&a);
+    // Down 3 股成交 → 两边各 3 股,重新两边同股数挂
+    let (dn, _) = sim.live_order(QSide::DownBid).unwrap();
+    let (_, a) = sim.s.on_fill(sim.now, &dn, 3.0, &mut sim.rl);
+    assert!(sim.s.imbalance().is_none());
+    let p = places(&a);
+    assert_eq!(p.len(), 2, "{a:?}");
+    assert_eq!(p[0].2, p[1].2, "两边同股数");
+    let r = sim.s.ledger.round(MKT).unwrap();
+    assert!((r.cost_usd - 3.0) < 1e-9, "这一对成本 = 3 × (0.50 + 0.50) = $3");
+}
+
+#[test]
+fn aligned_partial_fill_cancels_rest_of_heavy_leg() {
+    let mut sim = aligned();
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
+    sim.advance(35);
+    sim.ack_all(&a);
+    let (up, _) = sim.live_order(QSide::UpBid).unwrap();
+    let (_, a) = sim.s.on_fill(sim.now, &up, 1.2, &mut sim.rl);
+    // Up 部分成交 1.2 股:Up 剩下的 1.8 股要撤(否则可能再多出来)
+    assert!(cancels(&a).iter().any(|c| c.0 == QSide::UpBid && c.1.contains("补齐")), "{a:?}");
+    // Down 继续挂着补
+    assert!(sim.live_order(QSide::DownBid).is_some());
+}
+
+#[test]
+fn failed_settlement_reverts_fill_and_cancels_possibly_relisted_order() {
+    let mut sim = aligned();
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
+    sim.advance(35);
+    sim.ack_all(&a);
+    let (up, _) = sim.live_order(QSide::UpBid).unwrap();
+    sim.s.on_fill_set(sim.now, &up, 3.0, true, &mut sim.rl);
+    assert_eq!(sim.s.ledger.round(MKT).unwrap().up_shares, 3.0);
+    // 上链失败:扣回;这张单在平台上可能重新挂着 → 撤掉
+    let (d, a) = sim.s.on_fill_set(sim.now, &up, 0.0, true, &mut sim.rl);
+    assert_eq!(d, -3.0);
+    let r = sim.s.ledger.round(MKT).unwrap();
+    assert_eq!((r.up_shares, r.cost_usd), (0.0, 0.0));
+    assert!(sim.s.imbalance().is_none());
+    assert!(a.iter().any(|x| matches!(x, Action::Cancel { order_id, .. } if *order_id == up)), "{a:?}");
+    // 只增不减的来源(REST)不能把它扣回
+    let (d, _) = sim.s.on_fill(sim.now, &up, 0.0, &mut sim.rl);
+    assert_eq!(d, 0.0);
+}
+
+/// 随机行情 + 随机成交(含部分成交、上链失败扣回):任何时刻两边股数差不超过一张单;
+/// 按成交先后配成的每一对,成本不超过 $1
+#[test]
+fn aligned_invariants_under_random_markets() {
+    let mut rng = 0x2545F4914F6CDD1Du64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for _case in 0..200 {
+        let mut sim = aligned();
+        sim.line("bn", &bn(80880.0));
+        let mut mid = 30 + (next() * 40.0) as i64;
+        let mut max_order = 0u64;
+        let mut fills: Vec<(u64, QSide, f64, f64)> = vec![]; // (序号, 侧, 股, 价)
+        let mut seq = 0u64;
+        for _step in 0..60 {
+            mid = (mid + ((next() * 7.0) as i64 - 3)).clamp(3, 97);
+            let spread = 1 + (next() * 3.0) as i64;
+            let (b, a) = ((mid - 1).max(1), (mid - 1 + spread).min(99));
+            sim.advance(400 + (next() * 900.0) as u64);
+            let acts = sim.line("pf", &pf(&[(b as f64 / 100.0, 50.0)], &[(a as f64 / 100.0, 50.0)]));
+            for x in &acts {
+                if let Action::Place { shares, .. } = x {
+                    max_order = max_order.max(*shares);
+                }
+            }
+            sim.advance(35);
+            let more = sim.ack_all(&acts);
+            sim.ack_all(&more);
+            // 随机成交一侧(可能部分)
+            for side in QSide::ALL {
+                if next() < 0.35 {
+                    // 只成交真正挂着的单(撤单在路上被成交的情况另测)
+                    if let Some((oid, price)) = sim.live_order(side).filter(|(o, _)| !sim.s.is_cancelling(o)) {
+                        let o = sim.s.order_by_id(&oid).unwrap().clone();
+                        let q = if next() < 0.3 { (o.shares as f64) * next() } else { o.shares as f64 - o.filled };
+                        let cum = (o.filled + q).min(o.shares as f64);
+                        let (d, acts) = sim.s.on_fill_set(sim.now, &oid, cum, true, &mut sim.rl);
+                        if d > 0.0 {
+                            seq += 1;
+                            fills.push((seq, side, d, price as f64 / 100.0));
+                        }
+                        let more = sim.ack_all(&acts);
+                        sim.ack_all(&more);
+                    }
+                }
+            }
+            // 两边股数差 ≤ 一张单(本轮挂过的最大一张)
+            max_order = max_order.max(sim.s.orders.values().map(|o| o.shares).max().unwrap_or(0));
+            let r = sim.s.ledger.round(MKT).unwrap();
+            if (r.up_shares - r.down_shares).abs() > max_order as f64 + 1e-6 {
+                let mut os: Vec<_> = sim.s.orders.values().cloned().collect();
+                os.sort_by_key(|o| o.cid);
+                for o in &os {
+                    eprintln!(
+                        "cid {} {:?} 价 {} 股 {} 成交 {:.3} 关 {} 撤中 {}",
+                        o.cid,
+                        o.qside,
+                        o.price_cents,
+                        o.shares,
+                        o.filled,
+                        o.closed,
+                        o.order_id.as_deref().is_some_and(|x| sim.s.is_cancelling(x))
+                    );
+                }
+                panic!("股数差 {} > 一张单 {max_order};Up {} Down {}", (r.up_shares - r.down_shares).abs(), r.up_shares, r.down_shares);
+            }
+        }
+        // 按先后配对:每对成本 ≤ $1
+        let mut ups: Vec<(f64, f64)> = fills.iter().filter(|f| f.1 == QSide::UpBid).map(|f| (f.2, f.3)).collect();
+        let mut dns: Vec<(f64, f64)> = fills.iter().filter(|f| f.1 == QSide::DownBid).map(|f| (f.2, f.3)).collect();
+        let (mut i, mut j) = (0, 0);
+        while i < ups.len() && j < dns.len() {
+            let q = ups[i].0.min(dns[j].0);
+            assert!(ups[i].1 + dns[j].1 <= 1.0 + 1e-9, "配成的一对成本 {} + {} > $1", ups[i].1, dns[j].1);
+            ups[i].0 -= q;
+            dns[j].0 -= q;
+            if ups[i].0 <= 1e-9 {
+                i += 1;
+            }
+            if dns[j].0 <= 1e-9 {
+                j += 1;
+            }
+        }
+    }
+}
+
+/// 撤单在路上时被成交(10-24 实测 1.6%):多出的部分最多是被撤那张单剩下的股数;之后照常只挂另一边补齐
+#[test]
+fn aligned_fill_during_cancel_in_flight_is_bounded_and_completed() {
+    let mut sim = aligned();
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
+    sim.advance(35);
+    sim.ack_all(&a);
+    let (up, _) = sim.live_order(QSide::UpBid).unwrap();
+    let (_, a) = sim.s.on_fill(sim.now, &up, 1.0, &mut sim.rl);
+    assert!(sim.s.is_cancelling(&up), "部分成交后剩余在撤: {a:?}");
+    // 撤单还没确认,剩下的 2 股也成交了
+    let (d, a) = sim.s.on_fill(sim.now, &up, 3.0, &mut sim.rl);
+    assert_eq!(d, 2.0);
+    assert_eq!(sim.s.imbalance().map(|x| x.1), Some(3.0), "多出 3 股 = 整张单,没超过这张单本身");
+    assert!(place_of(&a, QSide::UpBid).is_none());
+    // Down 挂着的那张(3 股)正好补齐
+    assert!(sim.live_order(QSide::DownBid).is_some());
 }

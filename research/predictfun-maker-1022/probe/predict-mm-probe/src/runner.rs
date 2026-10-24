@@ -5,7 +5,7 @@ use crate::chain::{ctf_address, merge_call, redeem_call, Chain};
 use crate::config::{Cli, Creds};
 use crate::feeds::{binance_task, predict_task, FeedEv, PfCtrl};
 use crate::jsonlog::{mono_ns, now, Log};
-use crate::msgs::{parse_binance_book_ticker, parse_predict, wallet_event_hint, BookSnapshot, PredictMsg};
+use crate::msgs::{parse_binance_book_ticker, parse_predict, parse_wallet_fill, wallet_event_hint, BookSnapshot, FillEventKind, PredictMsg, Settlements};
 use crate::ratelimit::{Priority, RateLimiter};
 use crate::risk::{Ledger, Outcome};
 use crate::signing::{build_limit_order, cents_to_wei, exchange_address, random_salt, shares_to_wei, LimitOrderInput, OrderSigner, Side};
@@ -64,6 +64,8 @@ struct Runner {
     exit_started_ns: u64,
     last_reauth_ns: u64,
     wallet_topic: Option<String>,
+    /// order_id → 这张单的所有撮合
+    settlements: HashMap<String, Settlements>,
     seen_429_ns: u64,
     seen_401_ns: u64,
 }
@@ -290,6 +292,22 @@ impl Runner {
         });
     }
 
+    /// 钱包撮合事件:allow_decrease = 上链失败扣回
+    #[allow(clippy::too_many_arguments)]
+    fn record_fill_set(&mut self, t: Now, order_id: &str, cum: f64, allow_decrease: bool, source: &str, price: Option<f64>, extra: Value) {
+        let (delta, acts) = self.with_rl(|s, rl| s.on_fill_set(t, order_id, cum, allow_decrease, rl));
+        if delta.abs() > 1e-12 {
+            let o = self.strat.order_by_id(order_id).cloned();
+            self.log.ev_at(
+                t,
+                if delta > 0.0 { "fill" } else { "fill_revert" },
+                json!({"order_id": order_id, "source": source, "delta_shares": delta, "cum_shares": cum,
+                "order": o, "reported_price": price, "counterparty": null, "bn_mid": self.strat.bn_mid(), "up_mid": self.strat.up_mid(), "extra": extra}),
+            );
+        }
+        self.exec(acts);
+    }
+
     /// 记账 + 写成交日志
     #[allow(clippy::too_many_arguments)]
     fn record_fill(&mut self, t: Now, order_id: &str, cum: f64, source: &str, price: Option<f64>, counterparty: Option<String>, extra: Value) {
@@ -342,6 +360,29 @@ impl Runner {
     }
 
     fn on_wallet(&mut self, t: Now, d: Value) {
+        // 撮合类事件(已撮合 / 上链成功 / 上链失败):按 settlementId 逐笔记,累计 = 没失败的撮合之和。
+        // "已撮合"约 0.3 秒就推到,"上链成功"晚约 2 秒(10-24 实测):用"已撮合"记账,失败再扣回
+        if let Some(w) = parse_wallet_fill(&d) {
+            if self.strat.order_by_id(&w.order_id).is_none() {
+                self.log.ev_at(t, "wallet_event", json!({"type": format!("{:?}", w.kind), "order_id": w.order_id, "unknown_order": true}));
+                return;
+            }
+            let filled = self.strat.order_by_id(&w.order_id).map_or(0.0, |o| o.filled);
+            let (cum, target, allow_decrease) = self.settlements.entry(w.order_id.clone()).or_default().apply(&w, filled);
+            let src = match w.kind {
+                FillEventKind::Submitted => "wallet_submitted",
+                FillEventKind::Success => "wallet_success",
+                FillEventKind::Failed => "wallet_failed",
+            };
+            self.log.ev_at(
+                t,
+                "wallet_event",
+                json!({"type": src, "order_id": w.order_id, "settlement_id": w.settlement_id, "shares": w.shares,
+                "price": w.price, "platform_ts": w.platform_ts, "cum_after": cum}),
+            );
+            self.record_fill_set(t, &w.order_id, target, allow_decrease, src, w.price, json!({"settlement_id": w.settlement_id, "platform_ts": w.platform_ts}));
+            return;
+        }
         let h = wallet_event_hint(&d);
         self.log.ev_at(t, "wallet_event", json!({"hint": format!("{h:?}")}));
         let mut ids: Vec<String> = h.order_ids.iter().filter(|i| self.strat.order_by_id(i).is_some()).cloned().collect();
@@ -893,6 +934,7 @@ async fn run_inner(cli: Cli, creds: Creds, send: bool, log: Log) -> Result<i32> 
         exit_started_ns: 0,
         last_reauth_ns: 0,
         wallet_topic,
+        settlements: HashMap::new(),
         seen_429_ns: 0,
         seen_401_ns: 0,
         cli,

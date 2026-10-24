@@ -104,6 +104,17 @@ impl Ledger {
         self.open.retain(|r| !(now_ms >= r.end_ms && r.fills == 0 && r.up_shares == 0.0 && r.down_shares == 0.0));
     }
 
+    /// 撤回一笔已记的成交(撮合后上链失败)
+    pub fn revert_fill(&mut self, market_id: u64, outcome: Outcome, shares: f64, price: f64) {
+        if let Some(r) = self.open.iter_mut().find(|r| r.market_id == market_id) {
+            match outcome {
+                Outcome::Up => r.up_shares = (r.up_shares - shares).max(0.0),
+                Outcome::Down => r.down_shares = (r.down_shares - shares).max(0.0),
+            }
+            r.cost_usd = (r.cost_usd - shares * price).max(0.0);
+        }
+    }
+
     /// 结果出来:payout_up/payout_down = 每股兑付(1/0/0.5)。返回该轮已实现盈亏。
     pub fn resolve(&mut self, market_id: u64, payout_up: f64, payout_down: f64) -> Option<f64> {
         let i = self.open.iter().position(|r| r.market_id == market_id)?;
