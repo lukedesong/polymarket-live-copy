@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 东京机:编译探针 → 后台 dry-run(真实行情;不发任何写请求、不鉴权、不碰私钥)→ 跑完自动出分析。
+# 东京机:编译探针 → 后台 dry-run(真实行情;不发任何写请求、不鉴权、不碰私钥)→ 跑完自动出分析(analysis/)。
+# 供本机会话部署时可选使用;云端会话不连东京机。
 #
 # 在本机(有东京机 ssh 私钥、有本仓库的那台电脑)执行这一条命令:
 #   git fetch origin predict-probe && git archive origin/predict-probe research/predictfun-maker-1022/probe | ssh -i ~/.ssh/lightsail_eu_north_1.pem ubuntu@54.95.203.70 'rm -rf ~/probe-src && mkdir -p ~/probe-src && tar -x -C ~/probe-src && bash ~/probe-src/research/predictfun-maker-1022/probe/tokyo_dryrun.sh'
@@ -40,7 +41,7 @@ say "编译中(首次约 5~15 分钟)…"
 CARGO_PROFILE_RELEASE_LTO=false nice -n 10 cargo build --release -j 2 --quiet
 mkdir -p "$BIN_DIR" "$OUT"
 cp target/release/predict-mm-probe "$BIN_DIR/predict-mm-probe"
-cp "$SRC/analyze_probe.py" "$OUT/"   # 下次部署会删 ~/probe-src,分析脚本留一份在日志目录
+cp -r "$SRC/analysis" "$OUT/analysis"   # 下次部署会删 ~/probe-src,分析工具留一份在日志目录
 BIN="$BIN_DIR/predict-mm-probe"
 say "编译完成:$BIN"
 
@@ -55,7 +56,7 @@ fi
 (
   unset PREDICT_PRIVATE_KEY PREDICT_ACCOUNT_ADDRESS PREDICT_API_KEY
   [ -n "$KEY" ] && export PREDICT_API_KEY="$KEY"
-  nohup bash -c '"$0" --dry-run --log-dir "$1" --duration-s "$2" --quiet; echo "exit=$?" >> "$1/run.out"; python3 "$1/analyze_probe.py" "$1" --out "$1" > "$1/summary.txt" 2>&1' \
+  nohup bash -c '"$0" --dry-run --log-dir "$1" --duration-s "$2" --quiet; echo "exit=$?" >> "$1/run.out"; { python3 "$1/analysis/markouts.py" "$1" --out "$1/analysis_out"; python3 "$1/analysis/queue_position.py" "$1" --out "$1/analysis_out"; } > "$1/summary.txt" 2>&1' \
     "$BIN" "$OUT" "$DUR" >> "$OUT/run.out" 2>&1 &
   echo $! > "$OUT/pid"
 )

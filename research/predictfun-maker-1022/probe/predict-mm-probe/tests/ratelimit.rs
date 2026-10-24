@@ -98,3 +98,28 @@ fn next_cancel_slot() {
     while rl.try_acquire(t, Priority::Cancel) {}
     assert_eq!(rl.next_cancel_slot(t + 10 * MS), t + S);
 }
+
+#[test]
+fn starving_query_is_promoted_after_5s_but_never_eats_cancel_reserve() {
+    let cfg = RateLimitConfig::default();
+    let mut rl = RateLimiter::new(cfg.clone());
+    let t = 7 * S;
+    // 把每分钟预算用到只剩 60(> 新挂保留 40,< 查询保留 120)
+    let mut k = 0u64;
+    while rl.remaining(t + k * S).1 > 60 {
+        let now = t + k * S;
+        while rl.remaining(now).0 > 0 && rl.remaining(now).1 > 60 {
+            rl.try_acquire(now, Priority::Cancel);
+        }
+        k += 1;
+    }
+    let now = t + k * S + S;
+    assert!(!rl.try_acquire(now, aged_priority(Priority::Query, 4 * S)), "等 4 秒还不升级");
+    assert!(rl.try_acquire(now, aged_priority(Priority::Query, 5 * S)), "等满 5 秒按新挂同级放行");
+    assert_eq!(aged_priority(Priority::Cancel, 100 * S), Priority::Cancel);
+    // 升级后的查询也只能用到新挂保留额度为止
+    while rl.try_acquire(now, aged_priority(Priority::Query, 9 * S)) {}
+    let (rs, rm) = rl.remaining(now);
+    assert!(rs >= cfg.place_reserve_sec || rm >= cfg.place_reserve_min, "撤单保留还在");
+    assert!(rl.try_acquire(now, Priority::Cancel), "撤单仍能发");
+}

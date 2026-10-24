@@ -119,6 +119,7 @@ set -a; . ~/pflat/.env; set +a; ./target/release/predict-mm-probe --send --log-d
 8. **限额**:每个请求先从本地令牌桶取令牌,优先级 撤单 > 新挂 > 查询。新挂必须给撤单留出每秒 4 个、每分钟 40 个,查询留得更多。
    - 令牌桶用**滑动窗口计数**实现,保证任意 1 秒 ≤ 32、任意 60 秒 ≤ 400。普通令牌桶(容量 C、速率 r)在 60 秒里最多能放出 C + 60r 个,会超过平台的分钟限额,所以不用。
    - 响应头 `ratelimit` 显示剩余 ≤ 2 时,1 秒内只放撤单。
+   - 查询(结算结果、REST 查挂单兜底)排队超过 5 秒就升到和新挂同级,防止改价频繁时被饿死;撤单的保留额度不受影响。
 
 ## 5. 签名(与官方 SDK 逐字节一致)
 
@@ -190,6 +191,7 @@ cargo test --release --test e2e_mock long_run -- --ignored --nocapture   # 10 �
 | `tests/ratelimit.rs` | 令牌桶:每秒 32 / 每分钟 400、任意窗口不超限(3 分钟模拟)、撤单优先、429 后只放撤单 |
 | `tests/parse_samples.rs` | 用 `ref/ws_samples.tsv`(副本在 `tests/data/`)的真实消息做解析测试:币安现货 / 合约 bookTicker 与 trade、Predict 盘口(单边盘、settlementsPending、长小数)、心跳、订阅回包、钱包事件容错 |
 | `tests/e2e_mock.rs` | 端到端:本机起假的 Predict REST + WS、币安 WS、BNB RPC,跑编译好的可执行文件。<br>· dry-run 不发任何写请求<br>· --send 全流程:鉴权 → 启动全撤 → 挂单(请求体结构)→ 改价 → 钱包事件成交 → REST 核实 → 退出全撤后没有残留挂单<br>· 429 后不再下单<br>· owner 不符拒绝启动<br>· 日志和 stderr 里不出现任何凭证 |
+| `tests/fake_logs.rs` | 仿真场景模拟器:币安随机游走、Predict 盘口跟公允价走、逆向 / 随机成交、收盘结算;生成 `../analysis/tests/data/fake_run/` 的假日志与真值(`generate`,默认忽略),外加 15 秒冒烟测试 |
 | 各模块内单测 | 取整、日期、账本落盘、日志 gzip 与脱敏、市场 / 订单 / 结算回包解析 |
 
 重新生成固定向量(会换一把新的随机私钥):`cd testvec && npm ci && node gen_vectors.mjs --out ../tests/data/sign_vectors.json`。

@@ -184,11 +184,12 @@ impl Api {
     }
 
     pub async fn acquire(&self, prio: Priority) {
+        let t0 = mono_ns();
         loop {
             let wait = {
                 let mut rl = self.rl.lock().unwrap();
                 let t = mono_ns();
-                if rl.try_acquire(t, prio) {
+                if rl.try_acquire(t, crate::ratelimit::aged_priority(prio, t.saturating_sub(t0))) {
                     return;
                 }
                 if prio == Priority::Cancel {

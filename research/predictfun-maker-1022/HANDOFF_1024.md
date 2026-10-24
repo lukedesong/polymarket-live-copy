@@ -75,3 +75,37 @@
 3. claim / merge 只验证了 calldata 与 SDK 一致,没在真实链上跑过。EOA 需要有 BNB 付 gas。
 4. 实盘启动命令(Opus 审完后交给 Luke 执行的那一条):
    `set -a; . ~/pflat/.env; set +a; ./target/release/predict-mm-probe --send --log-dir ~/probe_logs --quiet`
+
+## 云端完成情况(二):探针日志分析工具(10-24,只写代码和测试,不联网)
+
+**位置**:`probe/analysis/`(Python,只用标准库)。读探针按小时滚动的 `probe_*.jsonl.gz` 日志。用法和口径见该目录 README.md。
+- `markouts.py`(第 1 项):每笔成交之后 1、5、30 秒以及结算时,我们的每股和总盈亏。
+  - 参考价两种都算:Predict 盘口中间价;币安公允价 Φ(ln(S/K)/(σ√τ)),其中 K = 本轮开盘时的币安中间价,σ = 近 5 分钟的 1 秒实际波动。
+  - 按 买Up / 卖Up(买Down)× 剩余时间(6 档)分组;给出按股数加权的每股盈亏,以及按笔数的均值和 t 值。
+- `queue_position.py`(第 2 项):挂单那一刻我们这个价位前面已有多少股(探针日志里的 `queue_ahead`)。
+  - 按三分位分成 队首 / 队中 / 队尾,也可用 `--edges` 改成固定股数切分。
+  - 每组统计成交率、成交股数比、首笔成交用时,以及成交后各时点的盈亏(两种参考价)。
+- `replay_compare.py`(第 3 项):
+  - `export`:导出每张单实际的挂撤时间线 [post_ms, remove_ms),作为回放器的输入。
+  - `compare`:逐单对比回放与实盘,输出成交率倍数、成交股数比、逐单四分类、成交时刻差和成交价差,并给出一句结论(例如"回放低估成交、晚 300ms")。按方向、排队分组、成交来源分开给。
+  - **按 mm_grid 规则重放这一步没做**:`model/mm_grid.py` 不在仓库任何分支里,读不到它的成交规则。`mm_grid_adapter.py` 只留了接口,没有凭猜测写规则。
+
+**测试**:`cd probe/analysis && python3 -m unittest discover -s tests`,共 20 个,全过。
+- 11 个手工构造、能手算结果的单测(σ 恰好等于 a、Φ(1/√199)、加权、分组、对比结论等)。
+- 9 个用端到端模拟器生成的约 7 分钟假日志,对照模拟器写下的真值核对:
+  - 逐单成交量与真值完全一致;
+  - K 误差 < 1e-4,σ 在真值 ±35% 以内,fair 和模拟器公允价平均差 < 0.04;
+  - 结算盈亏 = 兑付 − 价;
+  - 逆向成交按 fair 是亏的、随机成交是赚的;
+  - 排队队首被随机吃单的比例高于队尾;
+  - 假造一个悲观回放(只成交逆向单、晚 300ms),对比结论正确。
+- 假日志由 `predict-mm-probe/tests/fake_logs.rs` 新加的仿真模拟器生成(币安随机游走带跳动、Predict 盘口跟公允价走、逆向 / 随机两类成交、收盘结算)。数据放在 `probe/analysis/tests/data/fake_run/`(约 800KB)。
+
+**顺带修了探针的一个 bug(模拟器暴露出来的)**:
+- 问题:限额器对查询类请求保留额度太大,改价频繁时查询会被饿死。模拟器里收盘后 3 分钟都没查到结算结果,REST 查挂单兜底也会因此延迟。
+- 修法:查询排队超过 5 秒就升到和新挂同级,撤单的保留额度不变;加了单测。Rust 测试 50 个全过,clippy 零警告。
+- 另外:之前写的 `probe/tokyo_dryrun.sh` 留给本机会话部署时可选使用,已改成跑完自动调用这里的分析工具;被它取代的 `probe/analyze_probe.py` 已删除。
+
+**需要 Luke / 本机做的**
+1. 把 `model/mm_grid.py` 推到 `predict-probe` 分支,连同它依赖的 `pending_fills.py`,以及 bookx、mkh、fills_pending.parquet 的格式说明。之后云端在 `mm_grid_adapter.py` 里按它的成交规则实现重放,对比部分不用改。
+2. 也可以先在本机直接跑回放器,按 README 里 `replay_fills.tsv` 的格式写出结果,再用 `replay_compare.py compare` 对比。

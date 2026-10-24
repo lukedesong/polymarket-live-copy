@@ -125,6 +125,17 @@ impl RateLimiter {
     }
 }
 
+/// 查询等待超过这么久就升到"新挂"同级,防止改价频繁时查询(结算结果、查挂单兜底)被饿死;撤单的保留额度不受影响
+pub const QUERY_AGING_NS: u64 = 5_000_000_000;
+
+pub fn aged_priority(prio: Priority, waited_ns: u64) -> Priority {
+    if prio == Priority::Query && waited_ns >= QUERY_AGING_NS {
+        Priority::Place
+    } else {
+        prio
+    }
+}
+
 /// 从响应头 `ratelimit` 里容错解析剩余量。兼容 IETF 草案两种写法:
 /// `limit=40, remaining=12, reset=1` 与 `"default";r=12;t=1`。多条策略取最小值。
 pub fn parse_ratelimit_remaining(header: &str) -> Option<u64> {
