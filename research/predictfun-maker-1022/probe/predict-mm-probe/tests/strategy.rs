@@ -2,7 +2,7 @@
 //! 逐条过解析器喂给状态机,检查动作。不连网。
 use predict_mm_probe::msgs::{parse_binance_book_ticker, parse_predict, PredictMsg};
 use predict_mm_probe::ratelimit::{Priority, RateLimitConfig, RateLimiter};
-use predict_mm_probe::risk::{Ledger, Outcome};
+use predict_mm_probe::risk::{Ledger, Outcome, RoundPos};
 use predict_mm_probe::strategy::*;
 
 const MKT: u64 = 3698227;
@@ -429,4 +429,102 @@ fn late_ack_cancel_retried_when_budget_returns() {
     sim.ack_all(&r);
     sim.advance(1_000);
     assert!(!sim.tick().iter().any(|x| matches!(x, Action::Cancel { order_id, .. } if order_id == "late-9")));
+}
+
+#[test]
+fn gross_cap_blocks_new_orders_when_both_sides_fill() {
+    // 合计上限 $5:两边交替成交,成本 + 在挂金额 + 新单 > $5 时不再挂(10-24 实盘两边各成交 ~$45 把余额押光)
+    let mut sim = Sim::new(Params { gross_cap_usd: 5.0, ..Params::default() }, Ledger::default());
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
+    assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2), (QSide::DownBid, 45, 3)], "{a:?}");
+    sim.advance(35);
+    sim.ack_all(&a);
+    // Up 成交 2 股 → 成本 1.00,在挂 Down 1.35,新 Up 1.00 → 3.35 ≤ 5 照挂
+    let (oid, _) = sim.live_order(QSide::UpBid).unwrap();
+    sim.advance(500);
+    let (_, a) = sim.s.on_fill(sim.now, &oid, 2.0, &mut sim.rl);
+    assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2)], "{a:?}");
+    sim.advance(35);
+    sim.ack_all(&a);
+    // Down 成交 3 股 → 成本 2.35,在挂 Up 1.00,新 Down 1.35 → 4.70 ≤ 5 照挂
+    let (doid, _) = sim.live_order(QSide::DownBid).unwrap();
+    sim.advance(500);
+    let (_, a) = sim.s.on_fill(sim.now, &doid, 3.0, &mut sim.rl);
+    assert_eq!(places(&a), vec![(QSide::DownBid, 45, 3)], "{a:?}");
+    sim.advance(35);
+    sim.ack_all(&a);
+    // Up 再成交 → 成本 3.35,在挂 Down 1.35,新 Up 1.00 → 5.70 > 5 不挂
+    let (oid, _) = sim.live_order(QSide::UpBid).unwrap();
+    sim.advance(500);
+    let (_, a) = sim.s.on_fill(sim.now, &oid, 2.0, &mut sim.rl);
+    assert!(places(&a).is_empty(), "超合计上限不应再挂: {a:?}");
+    // 在挂的 Down 单不因合计上限被撤
+    assert!(sim.live_order(QSide::DownBid).is_some());
+    assert!(cancels(&a).is_empty(), "{a:?}");
+}
+
+#[test]
+fn gross_per_minute_paces_quoting() {
+    // 匀速 $2/分钟:开盘第 1 分钟只够挂 Up($1),Down($1.35)要等到第 2 分钟
+    let mut sim = Sim::new(Params { gross_per_min_usd: 2.0, ..Params::default() }, Ledger::default());
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
+    assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2)], "{a:?}");
+    sim.advance(35);
+    sim.ack_all(&a);
+    sim.advance(30_000);
+    assert!(places(&sim.tick()).is_empty());
+    sim.advance(30_000);
+    let a = sim.tick();
+    assert_eq!(places(&a), vec![(QSide::DownBid, 45, 3)], "{a:?}");
+}
+
+#[test]
+fn capital_cap_counts_unsettled_previous_round() {
+    // 上一轮还没结算(成本 $79,两边各 80 股),未结算合计上限 $81:本轮只够挂 Up($1),Down($1.35)被拦
+    let prev = RoundPos { market_id: MKT - 1, start_ms: START_MS - 300_000, end_ms: START_MS, up_shares: 80.0, down_shares: 80.0, cost_usd: 79.0, fills: 60 };
+    let ledger = Ledger { open: vec![prev], ..Ledger::default() };
+    let mut sim = Sim::new(Params { capital_cap_usd: 81.0, ..Params::default() }, ledger);
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
+    assert_eq!(places(&a), vec![(QSide::UpBid, 50, 2)], "{a:?}");
+    // 上一轮结算(平台自动领回)后放开
+    sim.s.on_resolution(MKT - 1, 1.0, 0.0);
+    sim.advance(100);
+    let a = sim.tick();
+    assert_eq!(places(&a), vec![(QSide::DownBid, 45, 3)], "{a:?}");
+}
+
+#[test]
+fn insufficient_collateral_pauses_without_cooldown() {
+    let mut sim = quoted();
+    let (oid, _) = sim.live_order(QSide::UpBid).unwrap();
+    sim.advance(500);
+    let (_, a) = sim.s.on_fill(sim.now, &oid, 2.0, &mut sim.rl);
+    let cid = a.iter().find_map(|x| if let Action::Place { cid, qside: QSide::UpBid, .. } = x { Some(*cid) } else { None }).expect("应补挂 Up");
+    sim.advance(35);
+    let a = sim.s.on_place_err(sim.now, cid, ErrorKind::PlaceRejected, r#"400 {"error":"create_order_insufficient_collateral_balance"}"#, &mut sim.rl);
+    assert!(!has_cancel_all(&a) && !has_halt(&a), "保证金不足不应全撤/停机: {a:?}");
+    assert!(!sim.s.in_cooldown(sim.now));
+    // Down 单照常挂着;5 秒内不补挂 Up
+    assert!(sim.live_order(QSide::DownBid).is_some());
+    sim.advance(2_000);
+    assert!(places(&sim.tick()).is_empty());
+    sim.advance(3_500);
+    assert_eq!(places(&sim.tick()), vec![(QSide::UpBid, 50, 2)]);
+}
+
+#[test]
+fn insufficient_collateral_over_60s_becomes_cooldown() {
+    let mut sim = quoted();
+    let msg = r#"400 {"error":"create_order_insufficient_collateral_balance"}"#;
+    let a = sim.s.on_place_err(sim.now, 9_999, ErrorKind::PlaceRejected, msg, &mut sim.rl);
+    assert!(!has_cancel_all(&a) && !sim.s.in_cooldown(sim.now));
+    sim.advance(30_000);
+    let a = sim.s.on_place_err(sim.now, 9_998, ErrorKind::PlaceRejected, msg, &mut sim.rl);
+    assert!(!has_cancel_all(&a) && !sim.s.in_cooldown(sim.now), "30 秒内仍只暂停");
+    sim.advance(31_000);
+    let a = sim.s.on_place_err(sim.now, 9_997, ErrorKind::PlaceRejected, msg, &mut sim.rl);
+    assert!(has_cancel_all(&a) || sim.s.in_cooldown(sim.now), "连续 60 秒以上保证金不足应转为冷却: {a:?}");
 }

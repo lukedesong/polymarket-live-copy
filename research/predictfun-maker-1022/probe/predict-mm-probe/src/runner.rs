@@ -42,6 +42,8 @@ struct Runner {
     strat: Strategy,
     signer: OrderSigner,
     chain: Option<Arc<Chain>>,
+    /// 只读余额用(--no-claim 时也有)
+    bal_chain: Option<Arc<Chain>>,
     state_path: std::path::PathBuf,
     /// market_id → 市场信息
     markets: HashMap<u64, MarketInfo>,
@@ -553,6 +555,17 @@ impl Runner {
             if self.strat.round().map(|r| r.market_id) != Some(id) && self.exiting.is_none() {
                 let ctx = RoundCtx { market_id: id, start_ms: cur_start * 1000, end_ms: cur_start * 1000 + ROUND_MS };
                 self.log.ev_at(t, "round_start", json!({"round": ctx}));
+                // 每轮开盘记一次存款地址 USDT 余额(核实平台自动领取的到账时刻与金额)
+                if let Some(c) = self.bal_chain.clone() {
+                    let log = self.log.clone();
+                    let mid = id;
+                    tokio::spawn(async move {
+                        match c.usdt_balance().await {
+                            Ok(b) => log.ev("balance", json!({"market_id": mid, "usdt": b})),
+                            Err(e) => log.ev("balance_err", json!({"market_id": mid, "err": e.to_string()})),
+                        }
+                    });
+                }
                 self.rounds.push(ctx.clone());
                 let acts = self.with_rl(|s, rl| s.set_round(t, ctx, rl));
                 self.exec(acts);
@@ -834,6 +847,7 @@ async fn run_inner(cli: Cli, creds: Creds, send: bool, log: Log) -> Result<i32> 
             bail!("启动时全撤失败 {} 张,不启动", failed.len());
         }
     }
+    let bal_chain = chain.clone();
     let chain = if cli.no_claim { None } else { chain };
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Ev>();
@@ -861,6 +875,7 @@ async fn run_inner(cli: Cli, creds: Creds, send: bool, log: Log) -> Result<i32> 
         rl,
         signer,
         chain,
+        bal_chain,
         state_path,
         markets: HashMap::new(),
         by_start: BTreeMap::new(),

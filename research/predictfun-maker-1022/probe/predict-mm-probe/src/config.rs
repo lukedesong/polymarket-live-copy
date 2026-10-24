@@ -62,6 +62,15 @@ pub struct Cli {
     pub bn_quiet_ms: u64,
     #[arg(long, env = "PROBE_INVENTORY_CAP_USD", default_value_t = 6.0)]
     pub inventory_cap_usd: f64,
+    /// 每轮两边合计投入上限(已成交成本 + 在挂单金额);只限净持仓会把余额全押进一轮(10-24 实盘)
+    #[arg(long, env = "PROBE_GROSS_CAP_USD", default_value_t = 150.0)]
+    pub gross_cap_usd: f64,
+    /// 按分钟匀速:开盘后第 k 分钟内合计投入 ≤ k × 此值;0 = 不限
+    #[arg(long, env = "PROBE_GROSS_PER_MIN_USD", default_value_t = 0.0)]
+    pub gross_per_min_usd: f64,
+    /// 所有未结算轮合计投入上限(下一轮开盘时上一轮的钱要 10~70 秒后才由平台自动领回);应 ≤ 账户余额
+    #[arg(long, env = "PROBE_CAPITAL_CAP_USD", default_value_t = 80.0)]
+    pub capital_cap_usd: f64,
     #[arg(long, env = "PROBE_MAX_DAILY_LOSS_USD", default_value_t = 30.0)]
     pub max_daily_loss_usd: f64,
     #[arg(long, env = "PROBE_MAX_TOTAL_LOSS_USD", default_value_t = 100.0)]
@@ -137,6 +146,9 @@ impl Cli {
             bn_move_bp: self.bn_move_bp,
             bn_quiet_ms: self.bn_quiet_ms,
             inventory_cap_usd: self.inventory_cap_usd,
+            gross_cap_usd: self.gross_cap_usd,
+            gross_per_min_usd: self.gross_per_min_usd,
+            capital_cap_usd: self.capital_cap_usd,
             max_daily_loss_usd: self.max_daily_loss_usd,
             max_total_loss_usd: self.max_total_loss_usd,
             feed_down_ms: self.feed_down_ms,
@@ -157,7 +169,9 @@ impl Cli {
         if !(0.0..1.0).contains(&self.rate_margin) || self.rate_per_sec == 0 || self.rate_per_min == 0 {
             bail!("限额参数不合法");
         }
-        if self.stop_before_end_s < 0 || self.min_notional_usd <= 0.0 || self.bn_move_bp <= 0.0 {
+        if self.stop_before_end_s < 0 || self.min_notional_usd <= 0.0 || self.bn_move_bp <= 0.0 || !(self.min_notional_usd.is_finite() && self.bn_move_bp.is_finite() && self.gross_cap_usd.is_finite() && self.gross_per_min_usd.is_finite() && self.capital_cap_usd.is_finite() && self.inventory_cap_usd.is_finite() && self.max_daily_loss_usd.is_finite() && self.max_total_loss_usd.is_finite())
+            || self.gross_cap_usd < 5.0 * self.min_notional_usd || self.capital_cap_usd < self.gross_cap_usd.min(5.0 * self.min_notional_usd) || self.gross_per_min_usd < 0.0
+            || (self.gross_per_min_usd > 0.0 && self.gross_per_min_usd < 5.0 * self.min_notional_usd) {
             bail!("策略参数不合法");
         }
         if self.send {
@@ -166,8 +180,8 @@ impl Cli {
                     bail!("--send 需要环境变量 {k}");
                 }
             }
-            if self.min_notional_usd > 5.0 || self.inventory_cap_usd > 30.0 || self.max_daily_loss_usd > 30.0 || self.max_total_loss_usd > 100.0 {
-                bail!("--send 下单量/库存/亏损上限超过探针的硬上限(单量 ≤ $5、库存 ≤ $30、日亏 ≤ $30、累计 ≤ $100)");
+            if self.min_notional_usd > 5.0 || self.inventory_cap_usd > 30.0 || self.max_daily_loss_usd > 30.0 || self.max_total_loss_usd > 100.0 || self.gross_cap_usd > 300.0 || self.capital_cap_usd > 500.0 {
+                bail!("--send 下单量/库存/亏损/合计投入上限超过探针的硬上限(单量 ≤ $5、库存 ≤ $30、日亏 ≤ $30、累计 ≤ $100、每轮合计 ≤ $300、未结算合计 ≤ $500)");
             }
             if self.rate_margin < 0.1 || self.rate_per_sec > 40 || self.rate_per_min > 500 {
                 bail!("--send 限额不能超过实测值(40/秒、500/分钟)且余量 ≥ 10%");

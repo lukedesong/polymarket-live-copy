@@ -68,6 +68,9 @@ pub struct Params {
     pub bn_move_bp: f64,
     pub bn_quiet_ms: u64,
     pub inventory_cap_usd: f64,
+    pub gross_cap_usd: f64,
+    pub gross_per_min_usd: f64,
+    pub capital_cap_usd: f64,
     pub max_daily_loss_usd: f64,
     pub max_total_loss_usd: f64,
     pub feed_down_ms: u64,
@@ -88,6 +91,9 @@ impl Default for Params {
             bn_move_bp: 0.2,
             bn_quiet_ms: 300,
             inventory_cap_usd: 6.0,
+            gross_cap_usd: 150.0,
+            gross_per_min_usd: 0.0,
+            capital_cap_usd: 1_000.0,
             max_daily_loss_usd: 30.0,
             max_total_loss_usd: 100.0,
             feed_down_ms: 3_000,
@@ -204,6 +210,10 @@ pub struct Strategy {
     book: Option<BookSnapshot>,
     bn: VecDeque<(u64, f64)>,
     bn_guard_until: [u64; 2],
+    /// 平台回"保证金不足"后暂停新挂到此刻(mono_ns);上一轮的钱由平台自动领回前会短暂不够,不算故障、不冷却
+    collateral_wait_until: u64,
+    /// 连续"保证金不足"的第一次时刻(mono_ns,0=没有);下单成功清零
+    collateral_first_reject: u64,
     slots: [Slot; 2],
     pub orders: HashMap<u64, OrderRec>,
     by_order_id: HashMap<String, u64>,
@@ -233,6 +243,8 @@ impl Strategy {
             book: None,
             bn: VecDeque::new(),
             bn_guard_until: [0; 2],
+            collateral_wait_until: 0,
+            collateral_first_reject: 0,
             slots: [Slot::Empty, Slot::Empty],
             orders: HashMap::new(),
             by_order_id: HashMap::new(),
@@ -374,6 +386,7 @@ impl Strategy {
     }
 
     pub fn on_place_ok(&mut self, now: Now, cid: u64, order_id: String, hash: Option<String>, rl: &mut RateLimiter) -> Vec<Action> {
+        self.collateral_first_reject = 0;
         let Some(rec) = self.orders.get_mut(&cid) else { return vec![] };
         rec.order_id = Some(order_id.clone());
         rec.hash = hash;
@@ -403,6 +416,18 @@ impl Strategy {
             if matches!(&self.slots[i], Slot::Placing { cid: c, .. } if *c == cid) {
                 self.slots[i] = Slot::Empty;
             }
+        }
+        if kind == ErrorKind::PlaceRejected && msg.contains("insufficient_collateral") {
+            if self.collateral_first_reject == 0 {
+                self.collateral_first_reject = now.mono_ns;
+            }
+            // 连续被拒不到 60 秒:多半是上一轮的钱还没被平台自动领回,暂停新挂 5 秒,不全撤、不计冷却次数;
+            // 超过 60 秒仍被拒 = 账本和链上对不上(孤儿单/漏记成交),按故障冷却(计入每小时冷却次数)
+            if now.mono_ns < self.collateral_first_reject + 60_000_000_000 {
+                self.collateral_wait_until = now.mono_ns + 5_000_000_000;
+                return vec![];
+            }
+            self.collateral_first_reject = 0;
         }
         self.on_error(now, kind, &format!("下单失败: {msg}"), rl)
     }
@@ -574,6 +599,46 @@ impl Strategy {
             queue_ahead: None,
             net_up_shares: self.round.as_ref().and_then(|r| self.ledger.round(r.market_id)).map_or(0.0, |r| r.net_up()),
         }
+    }
+
+    /// 本轮两边合计投入:已成交成本 + 本轮未关闭订单的未成交金额
+    fn gross_used(&self, market_id: u64) -> f64 {
+        let cost = self.ledger.round(market_id).map_or(0.0, |r| r.cost_usd);
+        let pending: f64 = self
+            .orders
+            .values()
+            .filter(|o| o.market_id == market_id && !o.closed)
+            .map(|o| (o.shares as f64 - o.filled).max(0.0) * o.price_cents as f64 / 100.0)
+            .sum();
+        cost + pending
+    }
+
+    /// 所有未结算轮的投入:账本里未结算轮的成本 + 全部未关闭订单的未成交金额
+    fn capital_used(&self) -> f64 {
+        let cost: f64 = self.ledger.open.iter().map(|r| r.cost_usd).sum();
+        let pending: f64 = self.orders.values().filter(|o| !o.closed).map(|o| (o.shares as f64 - o.filled).max(0.0) * o.price_cents as f64 / 100.0).sum();
+        cost + pending
+    }
+
+    /// 新挂一张 add 美元的单是否超出合计投入上限/匀速额度/未结算资金上限,超出返回原因
+    fn gross_blocked(&self, now: Now, add: f64) -> Option<String> {
+        let r = self.round.as_ref()?;
+        let cap_used = self.capital_used();
+        if cap_used + add > self.p.capital_cap_usd + 1e-9 {
+            return Some(format!("未结算合计投入 {:.2}+{:.2} > ${}", cap_used, add, self.p.capital_cap_usd));
+        }
+        let used = self.gross_used(r.market_id);
+        if used + add > self.p.gross_cap_usd + 1e-9 {
+            return Some(format!("两边合计投入 {:.2}+{:.2} > ${}", used, add, self.p.gross_cap_usd));
+        }
+        if self.p.gross_per_min_usd > 0.0 {
+            let k = ((now.wall_ms - r.start_ms).max(0) / 60_000 + 1) as f64;
+            let allow = k * self.p.gross_per_min_usd;
+            if used + add > allow + 1e-9 {
+                return Some(format!("匀速额度 {:.2}+{:.2} > {:.2}", used, add, allow));
+            }
+        }
+        None
     }
 
     /// 净持仓等值(美元)是否已到上限,到了则返回加仓侧
@@ -761,6 +826,15 @@ impl Strategy {
             let price = target.unwrap();
             let min_cents = (self.p.min_notional_usd * 100.0).round() as u64;
             let shares = min_cents.div_ceil(price as u64).max(1);
+            let gb = if now.mono_ns < self.collateral_wait_until {
+                Some("保证金不足,等上一轮自动领回".to_string())
+            } else {
+                self.gross_blocked(now, shares as f64 * price as f64 / 100.0)
+            };
+            if let Some(b) = gb {
+                acts.extend(self.note(side, b, now));
+                continue;
+            }
             if !rl.try_acquire(now.mono_ns, Priority::Place) {
                 acts.extend(self.note(side, "限额预算不足,暂缓新挂".into(), now));
                 continue;

@@ -17,6 +17,9 @@ sol! {
         function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets);
         function balanceOf(address account, uint256 id) external view returns (uint256);
     }
+    interface IERC20 {
+        function balanceOf(address account) external view returns (uint256);
+    }
     interface INegRiskAdapter {
         function mergePositions(bytes32 _conditionId, uint256 _amount);
         function redeemPositions(bytes32 _conditionId, uint256[] _amounts);
@@ -154,6 +157,15 @@ impl Chain {
             bail!("balanceOf 返回长度 {}", out.len());
         }
         Ok(U256::from_be_slice(&out[..32]))
+    }
+
+    /// 存款地址的 USDT 余额(18 位小数)
+    pub async fn usdt_balance(&self) -> Result<f64> {
+        let out = self.eth_call(addr::USDT, &IERC20::balanceOfCall { account: self.account }.abi_encode()).await?;
+        if out.len() < 32 {
+            bail!("USDT balanceOf 返回长度 {}", out.len());
+        }
+        Ok(U256::from_be_slice(&out[..32]).to_string().parse::<f64>().unwrap_or(f64::NAN) / 1e18)
     }
 
     /// 估算 → 签名 → 发送 → 等回执(最多 120 秒),全程持锁。返回 (估算 gas, 交易哈希, 回执 status)
