@@ -89,7 +89,7 @@ impl Default for Params {
         Self {
             stop_before_end_ms: 30_000,
             min_notional_usd: 1.0,
-            reprice_min_age_ms: 1_000,
+            reprice_min_age_ms: 0,
             bn_window_ms: 300,
             bn_move_bp: 0.2,
             bn_quiet_ms: 300,

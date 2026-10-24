@@ -52,7 +52,8 @@ pub struct Cli {
     pub stop_before_end_s: i64,
     #[arg(long, env = "PROBE_MIN_NOTIONAL_USD", default_value_t = 1.0)]
     pub min_notional_usd: f64,
-    #[arg(long, env = "PROBE_REPRICE_MIN_AGE_MS", default_value_t = 1000)]
+    /// 挂单满这么久才允许改价。默认 0 = 最优价一变就跟(10-24 Luke 定:排队按时间,等就往后排)
+    #[arg(long, env = "PROBE_REPRICE_MIN_AGE_MS", default_value_t = 0)]
     pub reprice_min_age_ms: u64,
     #[arg(long, env = "PROBE_BN_WINDOW_MS", default_value_t = 300)]
     pub bn_window_ms: u64,

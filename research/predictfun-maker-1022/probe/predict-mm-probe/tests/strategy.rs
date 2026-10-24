@@ -119,7 +119,11 @@ fn has_halt(a: &[Action]) -> bool {
 
 /// 开盘、盘口 0.50/0.55、两侧挂上并回报
 fn quoted() -> Sim {
-    let mut sim = Sim::default();
+    quoted_with(indep())
+}
+
+fn quoted_with(p: Params) -> Sim {
+    let mut sim = Sim::new(p, Ledger::default());
     sim.line("bn", &bn(80880.0));
     let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.4, 10.0)], &[(0.55, 30.0), (0.6, 5.0)]));
     let p = places(&a);
@@ -133,17 +137,13 @@ fn quoted() -> Sim {
 }
 
 #[test]
-fn reprice_after_best_moves_and_one_second() {
+fn reprice_immediately_when_best_moves() {
+    // 默认不等:排队按时间先后,晚一点就往后排(10-24 实盘:等 1 秒时前面的量约翻 3 倍)
     let mut sim = quoted();
-    // 有人抢到 0.51 买一;挂单才 0.3s,不改
     sim.advance(300);
     let a = sim.line("pf", &pf(&[(0.51, 5.0), (0.5, 82.0)], &[(0.55, 30.0)]));
-    assert!(cancels(&a).is_empty(), "{a:?}");
-    // 满 1s:撤旧(只撤 Up 买侧,Down 侧价没变)
-    sim.advance(700);
-    let a = sim.tick();
     let c = cancels(&a);
-    assert_eq!(c.len(), 1);
+    assert_eq!(c.len(), 1, "挂单才 0.3 秒,最优价一变就撤(只撤 Up 买侧):{a:?}");
     assert_eq!(c[0].0, QSide::UpBid);
     assert!(c[0].1.contains("改价 50→51"));
     assert!(places(&a).is_empty(), "撤单确认前不挂新:{a:?}");
@@ -151,16 +151,28 @@ fn reprice_after_best_moves_and_one_second() {
     sim.advance(18);
     let a = sim.ack_all(&a);
     assert_eq!(places(&a), vec![(QSide::UpBid, 51, 2)]);
-    // 卖一移动:Down 侧目标 = 1 − 卖一
+    // 卖一移动:Down 侧目标 = 1 − 卖一,新单刚挂上 35ms 也立刻跟
     sim.advance(35);
     sim.ack_all(&a);
-    sim.advance(1000);
     let a = sim.line("pf", &pf(&[(0.51, 5.0)], &[(0.53, 7.0)]));
     let c = cancels(&a);
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].0, QSide::DownBid);
     let a = sim.ack_all(&a);
     assert_eq!(places(&a), vec![(QSide::DownBid, 47, 3)]);
+}
+
+#[test]
+fn reprice_min_age_still_available_as_option() {
+    let mut sim = quoted_with(Params { reprice_min_age_ms: 1_000, ..indep() });
+    sim.advance(300);
+    let a = sim.line("pf", &pf(&[(0.51, 5.0), (0.5, 82.0)], &[(0.55, 30.0)]));
+    assert!(cancels(&a).is_empty(), "设了 1 秒:挂单才 0.3 秒不改 {a:?}");
+    sim.advance(700);
+    let a = sim.tick();
+    let c = cancels(&a);
+    assert_eq!(c.len(), 1);
+    assert!(c[0].1.contains("改价 50→51"));
 }
 
 #[test]

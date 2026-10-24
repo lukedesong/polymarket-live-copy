@@ -77,7 +77,7 @@ set -a; . ~/pflat/.env; set +a; ./target/release/predict-mm-probe --send --log-d
 | `--no-claim` | `PROBE_NO_CLAIM` | | 不做结算后的 merge / redeem |
 | `--stop-before-end-s` | `PROBE_STOP_BEFORE_END_S` | 30 | 剩余秒数 ≤ 此值全撤停挂 |
 | `--min-notional-usd` | `PROBE_MIN_NOTIONAL_USD` | 1.0 | 单量 = ceil(此值 / 价) 股 |
-| `--reprice-min-age-ms` | `PROBE_REPRICE_MIN_AGE_MS` | 1000 | 挂单存在满这么久才允许改价 |
+| `--reprice-min-age-ms` | `PROBE_REPRICE_MIN_AGE_MS` | 0 | 挂单存在满这么久才允许改价;0 = 最优价一变就跟(限速顶满时只推迟新挂,撤单有保留额度) |
 | `--bn-window-ms` | `PROBE_BN_WINDOW_MS` | 300 | 币安急动窗口 |
 | `--bn-move-bp` | `PROBE_BN_MOVE_BP` | 0.2 | 窗口内不利方向变动 ≥ 此值 → 撤该侧 |
 | `--bn-quiet-ms` | `PROBE_BN_QUIET_MS` | 300 | 连续这么久不再触发才算"回到正常" |
