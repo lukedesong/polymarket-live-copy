@@ -99,6 +99,11 @@ impl Ledger {
         }
     }
 
+    /// 已收盘且一股没成交的轮直接删掉(不影响盈亏,免得账本无限变长)
+    pub fn prune_empty(&mut self, now_ms: i64) {
+        self.open.retain(|r| !(now_ms >= r.end_ms && r.fills == 0 && r.up_shares == 0.0 && r.down_shares == 0.0));
+    }
+
     /// 结果出来:payout_up/payout_down = 每股兑付(1/0/0.5)。返回该轮已实现盈亏。
     pub fn resolve(&mut self, market_id: u64, payout_up: f64, payout_down: f64) -> Option<f64> {
         let i = self.open.iter().position(|r| r.market_id == market_id)?;
@@ -185,6 +190,18 @@ mod tests {
         assert!((l.resolve(1, 0.5, 0.5).unwrap() - 0.3).abs() < 1e-9);
         assert!(l.open.is_empty());
         assert!((l.realized_total - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prune_only_ended_empty_rounds() {
+        let mut l = Ledger::default();
+        l.round_mut(1, 0, 300_000);
+        l.round_mut(2, 0, 300_000);
+        l.apply_fill(2, Outcome::Down, 1.0, 0.4);
+        l.round_mut(3, 300_000, 600_000);
+        l.prune_empty(300_000);
+        let ids: Vec<u64> = l.open.iter().map(|r| r.market_id).collect();
+        assert_eq!(ids, vec![2, 3], "有成交的、还没收盘的都留着");
     }
 
     #[test]

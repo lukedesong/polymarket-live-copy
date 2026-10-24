@@ -136,10 +136,7 @@ pub struct OrderSigner {
 impl std::fmt::Debug for OrderSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // 绝不打印私钥
-        f.debug_struct("OrderSigner")
-            .field("signer", &self.key.address())
-            .field("predict_account", &self.predict_account.as_ref().map(|p| &p.1))
-            .finish()
+        f.debug_struct("OrderSigner").field("signer", &self.key.address()).field("predict_account", &self.predict_account.as_ref().map(|p| &p.1)).finish()
     }
 }
 
@@ -182,6 +179,11 @@ impl OrderSigner {
             Some((_, s)) => s.clone(),
             None => self.key.address().to_checksum(None),
         }
+    }
+
+    /// 对 32 字节哈希做原始 ECDSA 签名(链上交易用)
+    pub fn sign_hash(&self, h: &B256) -> Result<alloy_primitives::Signature> {
+        Ok(self.key.sign_hash_sync(h)?)
     }
 
     /// 仅测试用:导出私钥 hex,用于把同一把随机私钥交给 Node 生成参考向量
@@ -299,12 +301,7 @@ impl BuiltOrder {
             data: Data<'a>,
         }
         serde_json::to_string(&Body {
-            data: Data {
-                order: &self.order_json,
-                price_per_share: self.amounts.price_per_share.to_string(),
-                strategy: "LIMIT",
-                is_post_only: post_only.then_some(true),
-            },
+            data: Data { order: &self.order_json, price_per_share: self.amounts.price_per_share.to_string(), strategy: "LIMIT", is_post_only: post_only.then_some(true) },
         })
         .expect("序列化不会失败")
     }

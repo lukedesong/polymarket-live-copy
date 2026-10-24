@@ -3,6 +3,7 @@
 //! 1. 固定向量:tests/data/sign_vectors.json(testvec/gen_vectors.mjs 用随机测试私钥生成后提交)
 //! 2. 现场向量:若 testvec/node_modules 已安装,Rust 现场随机生成私钥和存款地址,调 node 生成向量后逐条比对
 use alloy_primitives::U256;
+use predict_mm_probe::chain;
 use predict_mm_probe::signing::*;
 use serde_json::Value;
 use std::path::Path;
@@ -54,6 +55,31 @@ fn check_vectors(v: &Value) -> usize {
         assert_eq!(a.taker_amount.to_string(), c["takerAmount"].as_str().unwrap(), "{c}");
         n += 1;
     }
+    // 结算 merge / redeem 的链上 calldata
+    let ch = &v["chain"];
+    let cond = alloy_primitives::B256::from_str(ch["conditionId"].as_str().unwrap()).unwrap();
+    let amount = u256(&ch["amount"]);
+    for c in ch["cases"].as_array().unwrap() {
+        let yb = c["isYieldBearing"].as_bool().unwrap();
+        let name = c["name"].as_str().unwrap();
+        let (target, inner) = match name {
+            "merge" => chain::merge_call(cond, amount, false, yb),
+            "redeem/1" => chain::redeem_call(cond, 1, amount, false, yb),
+            "redeem/2" => chain::redeem_call(cond, 2, amount, false, yb),
+            "negRiskMerge" => chain::merge_call(cond, amount, true, yb),
+            "negRiskRedeem/1" => chain::redeem_call(cond, 1, amount, true, yb),
+            "negRiskRedeem/2" => chain::redeem_call(cond, 2, amount, true, yb),
+            _ => panic!("{name}"),
+        };
+        assert_eq!(target.to_checksum(None), c["target"].as_str().unwrap(), "{name} yb={yb}");
+        assert_eq!(hex0x(&inner), c["inner"].as_str().unwrap(), "{name} yb={yb}");
+        assert_eq!(hex0x(&chain::kernel_execute_calldata(target, &inner)), c["kernelCalldata"].as_str().unwrap(), "{name} yb={yb}");
+        n += 1;
+    }
+    let account = alloy_primitives::Address::from_str(v["predictAccount"].as_str().unwrap()).unwrap();
+    assert_eq!(hex0x(&chain::balance_of_calldata(account, U256::from(123456789u64))), ch["balanceOfCalldata"].as_str().unwrap());
+    assert_eq!(hex0x(&chain::owner_calldata(account)), ch["ownerCalldata"].as_str().unwrap());
+
     let acc = OrderSigner::new(key, v["predictAccount"].as_str()).unwrap();
     for c in v["authCases"].as_array().unwrap() {
         assert_eq!(acc.sign_auth_message(c["message"].as_str().unwrap()).unwrap(), c["signature"].as_str().unwrap(), "鉴权签名 {c}");
@@ -74,8 +100,10 @@ fn committed_vectors_match_sdk() {
             for nr in [false, true] {
                 for yb in [false, true] {
                     for p in ["10000000000000000", "500000000000000000", "990000000000000000"] {
-                        assert!(cases.iter().any(|c| c["mode"] == mode && c["side"] == side && c["isNegRisk"] == nr && c["isYieldBearing"] == yb && c["priceWei"] == p),
-                            "缺组合 {mode} {side} {nr} {yb} {p}");
+                        assert!(
+                            cases.iter().any(|c| c["mode"] == mode && c["side"] == side && c["isNegRisk"] == nr && c["isYieldBearing"] == yb && c["priceWei"] == p),
+                            "缺组合 {mode} {side} {nr} {yb} {p}"
+                        );
                     }
                 }
             }

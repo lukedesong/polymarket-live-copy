@@ -10,10 +10,11 @@
 //   序列化:bigint 转字符串,expiration 转数字;请求体 {data:{order, pricePerShare, strategy:"LIMIT", isPostOnly:true}}
 import { createRequire } from "node:module";
 import { writeFileSync } from "node:fs";
-import { Wallet, parseUnits, getAddress, version as ETHERS_VERSION } from "ethers";
+import { Wallet, parseUnits, getAddress, Interface, ZeroHash, version as ETHERS_VERSION } from "ethers";
 const require = createRequire(import.meta.url);
 const { OrderBuilder, ChainId, Side, AddressesByChainId } = require("@predictdotfun/sdk");
 const { Logger } = require("@predictdotfun/sdk/dist/Logger.js");
+const abis = require("@predictdotfun/sdk/dist/abis");
 const SDK_VERSION = require("@predictdotfun/sdk/package.json").version;
 
 const arg = (name) => { const i = process.argv.indexOf(name); return i > 0 ? process.argv[i + 1] : undefined; };
@@ -107,11 +108,36 @@ for (const msg of [
   "x",
 ]) authCases.push({ message: msg, signature: await accBuilder.signPredictAccountMessage(msg) });
 
+// 结算后 claim / merge 的链上调用数据(predictAccount 模式:EOA 调存款地址上的 Kernel.execute(0x0, to‖value‖calldata))
+// 与 SDK redeemPositions / mergePositions 的编码路径相同:codec.encodeFunctionData → encodeExecutionCalldata → kernel execute
+const chainCases = [];
+const kernel = new Interface(abis.KernelAbi);
+const ct = new Interface(abis.ConditionalTokensAbi);
+const nra = new Interface(abis.NegRiskAdapterAbi);
+const addrs = AddressesByChainId[ChainId.BnbMainnet];
+const condId = "0x" + bigDec(64).slice(0, 64).padStart(64, "0").replace(/[^0-9a-f]/g, "a");
+for (const isYieldBearing of [false, true]) {
+  const ctKey = isYieldBearing ? "YIELD_BEARING_CONDITIONAL_TOKENS" : "CONDITIONAL_TOKENS";
+  const nrKey = isYieldBearing ? "YIELD_BEARING_NEG_RISK_ADAPTER" : "NEG_RISK_ADAPTER";
+  const push = (name, target, inner) => {
+    const exec = accBuilder.encodeExecutionCalldata(target, inner);
+    chainCases.push({ name, isYieldBearing, target, inner, kernelCalldata: kernel.encodeFunctionData("execute", [ZeroHash, exec]) });
+  };
+  const amount = 1234567890000000000n;
+  push("merge", addrs[ctKey], ct.encodeFunctionData("mergePositions", [addrs.USDT, ZeroHash, condId, [1n, 2n], amount]));
+  for (const indexSet of [1, 2]) push(`redeem/${indexSet}`, addrs[ctKey], ct.encodeFunctionData("redeemPositions", [addrs.USDT, ZeroHash, condId, [BigInt(indexSet)]]));
+  push("negRiskMerge", addrs[nrKey], nra.encodeFunctionData("mergePositions(bytes32,uint256)", [condId, amount]));
+  for (const indexSet of [1, 2]) push(`negRiskRedeem/${indexSet}`, addrs[nrKey], nra.encodeFunctionData("redeemPositions", [condId, indexSet === 1 ? [amount, 0n] : [0n, amount]]));
+}
+const balanceOfCalldata = ct.encodeFunctionData("balanceOf", [account, 123456789n]);
+const ownerCalldata = new Interface(abis.ECDSAValidatorAbi).encodeFunctionData("ecdsaValidatorStorage", [account]);
+
 const result = {
   comment: "由 testvec/gen_vectors.mjs 用官方 SDK 生成;私钥为随机生成的测试私钥,与任何真实账户无关",
   sdkVersion: SDK_VERSION, ethersVersion: ETHERS_VERSION, chainId: 56,
   privateKey: wallet.privateKey, signerAddress: wallet.address, predictAccount: account,
   cases, amountCases, authCases,
+  chain: { conditionId: condId, amount: "1234567890000000000", cases: chainCases, balanceOfCalldata, ownerCalldata },
 };
 const json = JSON.stringify(result, null, 1);
 if (out) writeFileSync(out, json + "\n"); else process.stdout.write(json + "\n");

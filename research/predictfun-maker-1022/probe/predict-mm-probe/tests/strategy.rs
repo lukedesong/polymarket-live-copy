@@ -27,21 +27,13 @@ fn pf(bids: &[(f64, f64)], asks: &[(f64, f64)]) -> String {
 
 fn bn(mid: f64) -> String {
     // 价差 0.01,mid 精确等于给定值
-    format!(
-        r#"{{"stream":"btcusdt@bookTicker","data":{{"u":1,"s":"BTCUSDT","b":"{:.3}","B":"1.0","a":"{:.3}","A":"1.0"}}}}"#,
-        mid - 0.005,
-        mid + 0.005
-    )
+    format!(r#"{{"stream":"btcusdt@bookTicker","data":{{"u":1,"s":"BTCUSDT","b":"{:.3}","B":"1.0","a":"{:.3}","A":"1.0"}}}}"#, mid - 0.005, mid + 0.005)
 }
 
 impl Sim {
     fn new(p: Params, ledger: Ledger) -> Self {
-        let mut s = Self {
-            s: Strategy::new(p, ledger),
-            rl: RateLimiter::new(RateLimitConfig::default()),
-            now: Now { mono_ns: 10_000_000_000, wall_ms: START_MS + 1_000 },
-            next_oid: 100,
-        };
+        let mut s =
+            Self { s: Strategy::new(p, ledger), rl: RateLimiter::new(RateLimitConfig::default()), now: Now { mono_ns: 10_000_000_000, wall_ms: START_MS + 1_000 }, next_oid: 100 };
         let now = s.now;
         s.s.on_feed_state(now, Feed::Binance, true, &mut s.rl);
         s.s.on_feed_state(now, Feed::Predict, true, &mut s.rl);

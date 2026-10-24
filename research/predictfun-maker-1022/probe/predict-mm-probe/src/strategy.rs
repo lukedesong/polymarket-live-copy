@@ -126,6 +126,8 @@ pub struct OrderRec {
     pub hash: Option<String>,
     pub filled: f64,
     pub closed: bool,
+    /// 下单回报到达的单调时钟
+    pub acked_ns: Option<u64>,
 }
 
 /// 决策时的盘面快照(写进日志,和回放逐笔对比用)
@@ -144,13 +146,36 @@ pub struct DecisionCtx {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "action")]
 pub enum Action {
-    Place { cid: u64, qside: QSide, market_id: u64, price_cents: u32, shares: u64, reason: String, ctx: DecisionCtx },
-    Cancel { cid: u64, qside: QSide, order_id: String, reason: String, ctx: DecisionCtx },
+    Place {
+        cid: u64,
+        qside: QSide,
+        market_id: u64,
+        price_cents: u32,
+        shares: u64,
+        reason: String,
+        ctx: DecisionCtx,
+    },
+    Cancel {
+        cid: u64,
+        qside: QSide,
+        order_id: String,
+        reason: String,
+        ctx: DecisionCtx,
+    },
     /// 撤掉账户所有挂单(执行层还会用 REST 列一遍挂单兜底);known = 状态机已知的挂单
-    CancelAll { reason: String, known: Vec<String> },
-    Halt { reason: String },
+    CancelAll {
+        reason: String,
+        known: Vec<String>,
+    },
+    Halt {
+        reason: String,
+    },
     /// 不发请求的决策(为什么不挂),同一侧原因变化时才记一次
-    Note { qside: Option<QSide>, msg: String, ctx: DecisionCtx },
+    Note {
+        qside: Option<QSide>,
+        msg: String,
+        ctx: DecisionCtx,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -238,6 +263,10 @@ impl Strategy {
         let mut v: Vec<String> = self.orders.values().filter(|o| !o.closed).filter_map(|o| o.order_id.clone()).collect();
         v.sort();
         v
+    }
+    /// 该单是否正在被我们撤(撤单请求已发、结果未回)
+    pub fn is_cancelling(&self, order_id: &str) -> bool {
+        self.slots.iter().any(|s| matches!(s, Slot::Cancelling { order_id: o, .. } if o == order_id))
     }
     pub fn live_slot_summary(&self) -> Vec<(QSide, &'static str)> {
         QSide::ALL
@@ -345,6 +374,7 @@ impl Strategy {
         let Some(rec) = self.orders.get_mut(&cid) else { return vec![] };
         rec.order_id = Some(order_id.clone());
         rec.hash = hash;
+        rec.acked_ns = Some(now.mono_ns);
         self.by_order_id.insert(order_id.clone(), cid);
         let qside = rec.qside;
         let (price, shares) = (rec.price_cents, rec.shares);
@@ -727,7 +757,7 @@ impl Strategy {
             let cid = self.next_cid;
             self.next_cid += 1;
             let market_id = self.round.as_ref().unwrap().market_id;
-            self.orders.insert(cid, OrderRec { cid, qside: side, market_id, price_cents: price, shares, order_id: None, hash: None, filled: 0.0, closed: false });
+            self.orders.insert(cid, OrderRec { cid, qside: side, market_id, price_cents: price, shares, order_id: None, hash: None, filled: 0.0, closed: false, acked_ns: None });
             self.slots[i] = Slot::Placing { cid, price, shares, sent_ns: now.mono_ns };
             let mut ctx = self.ctx(Some(side), now);
             ctx.queue_ahead = self.book.as_ref().map(|b| match side {

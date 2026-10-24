@@ -2638,6 +2638,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "serde",

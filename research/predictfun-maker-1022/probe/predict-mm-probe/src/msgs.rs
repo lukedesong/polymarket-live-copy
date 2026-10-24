@@ -117,7 +117,10 @@ pub enum PredictMsg {
     /// predictWalletEvents/<jwt> 的推送(格式未录,原样给出 data)
     Wallet(Value),
     /// 其它主题推送
-    Topic { topic: String, data: Value },
+    Topic {
+        topic: String,
+        data: Value,
+    },
     /// 订阅等请求的回包(无 topic)
     Response(Value),
 }
@@ -285,7 +288,7 @@ mod tests {
         assert_eq!(price_to_cents(0.5), Some(50));
         assert_eq!(price_to_cents(0.01), Some(1));
         assert_eq!(price_to_cents(0.99), Some(99));
-        assert_eq!(price_to_cents(0.29999999999999999), Some(30));
+        assert_eq!(price_to_cents(0.1 + 0.2), Some(30));
         assert_eq!(price_to_cents(1.0), None);
         assert_eq!(price_to_cents(0.0), None);
         assert_eq!(price_to_cents(0.505), None, "非整 tick 不接受");
