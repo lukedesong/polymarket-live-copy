@@ -10,6 +10,8 @@
 | `markouts.py` | 每笔成交之后 1、5、30 秒以及结算时，我们赚还是亏，各多少 |
 | `queue_position.py` | 挂单那一刻我们前面排了多少股；排在队首、队中、队尾时，成交率和成交后走向各是什么样 |
 | `replay_compare.py` | 同一批单子按实际挂撤时间交给回放器重放，回放的成交率、成交时刻、成交价比实盘偏多少、偏向哪一边 |
+| `speed_queue.py` | 下单、撤单、改价一圈各要多久；挂单时前面多少股；撤单在路上被成交的比例 |
+| `maker_rank.py` | 在做市商队伍里我们排第几、排在我们前面的是谁（链上成交 + 我们录的盘口）。唯一要联网的一个：`fetch` 从 BNB 链公共节点拉成交 |
 
 公共部分在 `probelog.py`：读日志、重建订单与成交、计算两种参考价。
 
@@ -117,6 +119,21 @@ python3 queue_position.py <日志 ...> [--out 目录] [--edges a,b] [--horizons 
 
 **拿到 mm_grid.py 之后要做的**：在 `mm_grid_adapter.py` 里实现 `replay_orders`，用 mm_grid 的排队和成交逻辑处理每张单的 [post_ms, remove_ms) 区间。另外需要它依赖的 `pending_fills.py`，以及输入数据（bookx、mkh、fills_pending.parquet）的格式说明。对比部分不用改。
 
+## 4. maker_rank.py：在做市商队伍里排第几
+
+```bash
+python3 maker_rank.py fetch  ~/probe_logs/live_xxx --out out/chain.json        # 拉这段时间交易所全部 OrderFilled(公共节点,几分钟)
+python3 maker_rank.py report ~/probe_logs/live_xxx --chain out/chain.json --out out/
+```
+
+- 平台先挂先成；一笔吃单在链上按撮合顺序逐个发出挂单方的成交，所以同一价位各单在链上第一次出现的先后 = 排队先后，并且能看到每张单的挂单地址。
+  买 Up@p 与卖 Down@(1−p) 是同一队。
+- 先挂先成用我们自己的单核对两项：同一笔吃单里我们后面还有人成交时我们必须已全成；我们自己同价位的几张单链上先后与挂单先后一致。
+- 区块时间比平台撮合晚约 0.4 秒，用我们自己的单（钱包"已撮合"推送里的平台时刻）实测，判断"别人的单在我们挂上之后还在队里"时扣掉。
+- 抢新价位：某价位在盘口从无到有后 1 秒内我们决定挂上去。给出：我们被接受时这一价位已有多少股（包括后来撤掉的）、链上排第几、排在前面的地址。
+  链上排名只在我们成交时才有，队越长越难成交，所以偏乐观；"被接受时前面已有多少股"没有这个偏差，比较速度时以它为主。
+- 输出 `rank_orders.tsv`、`rank_races.tsv`、`rank_rivals.tsv`。
+
 ## 测试
 
 ```bash
@@ -129,6 +146,7 @@ python3 -m unittest discover -s tests -v
   - 两种参考价：交替 ±a 的币安价格应得到 σ 恰好等于 a；fair 应等于 Φ(1/√199)；平局、收盘后、超出日志范围这几种情况。
   - 各时点盈亏与分组加权、来源过滤、排队分组（固定切点与三分位）。
   - 导出的时间线；带偏差的回放和完全一致的回放分别对比；缺 mm_grid.py 时给出清楚的报错。
+- **`tests/test_maker_rank.py`**：手工构造的链上成交与盘口：同一队的两种写法、吃单方那一行与别的市场不算、先挂先成核对、抢位排名、没成交时的下限、区块延迟。
 - **`tests/test_fake_run.py`**：用端到端模拟器生成的约 7 分钟假日志（`tests/data/fake_run/`），对照模拟器写下的真值 `mock_truth.json` 核对：
   - 日志里重建出的成交和模拟器里真实发生的逐单一致。
   - 工具算的 K 与 σ 和模拟器设定一致；工具的 fair 和模拟器内部的公允价相差很小。
