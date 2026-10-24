@@ -406,3 +406,27 @@ fn fills_are_booked_to_right_outcome() {
     assert!(sim.live_order(QSide::DownBid).is_some());
     let _ = Outcome::Up;
 }
+
+#[test]
+fn late_ack_cancel_retried_when_budget_returns() {
+    let mut sim = Sim::default();
+    sim.line("bn", &bn(80880.0));
+    let a = sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.55, 30.0)]));
+    let cid = a.iter().find_map(|x| if let Action::Place { cid, qside: QSide::UpBid, .. } = x { Some(*cid) } else { None }).unwrap();
+    // 回报一直不来 → 超时放弃该槽位,进冷却
+    sim.advance(5_001);
+    sim.tick();
+    assert!(sim.s.in_cooldown(sim.now));
+    // 把每秒撤单额度用光,再来迟到回报:这一刻撤不了
+    while sim.rl.try_acquire(sim.now.mono_ns, Priority::Cancel) {}
+    let r = sim.s.on_place_ok(sim.now, cid, "late-9".into(), None, &mut sim.rl);
+    assert!(cancels(&r).is_empty());
+    // 额度恢复后的下一个 tick 必须补撤
+    sim.advance(1_000);
+    let r = sim.tick();
+    assert!(r.iter().any(|x| matches!(x, Action::Cancel { order_id, .. } if order_id == "late-9")), "{r:?}");
+    // 撤单确认后不再重复
+    sim.ack_all(&r);
+    sim.advance(1_000);
+    assert!(!sim.tick().iter().any(|x| matches!(x, Action::Cancel { order_id, .. } if order_id == "late-9")));
+}

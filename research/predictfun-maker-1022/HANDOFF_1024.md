@@ -30,3 +30,48 @@
 - 老师规则书:teachers/RULEBOOK_dev.md(15 位;急动顺势吃单全市场扣费后 +2.1 分 t3.2,待回放按 150ms 延迟复核)。
 - 东京:ubuntu@54.95.203.70(key ~/.ssh/lightsail_eu_north_1.pem),录制器 pfrec5(临时单元,10-24 加了开机自启 pfrec5-boot;参数 14 天,约 11-06 06:45 UTC 正常退出需重启)。
 - memory:predict-mm-three-candidates-dead-1024、predict-ratelimit-measured-1024、feedback-luke-only-does-the-one-action。
+
+## 云端完成情况(10-24,云端会话;只写代码和测试,未接触任何真实凭证、未连真实账户、未下单、未部署)
+
+**位置**:`probe/predict-mm-probe/`(Cargo 工程,单个可执行文件 `predict-mm-probe`),分支 `predict-probe`。使用说明见该目录 README.md(编译、配置项、dry-run / --send 命令、日志格式、已知局限)。
+
+**做了什么**
+- 签名(`src/signing.rs`):逐字节复现 `@predictdotfun/sdk` 1.3.8(`ref/package.json` 的 `^1.3.8` 实际解析到 1.3.8)。
+  - 覆盖:金额取整(价格 3 位、股数 5 位有效数字)、EIP-712 domain 与类型、typed-data hash、请求体序列化。
+  - predictAccount 模式:maker = signer = 存款地址(原样字符串);签名 = Kernel 包装 + personal_sign,共 86 字节(0x01 ‖ 验证器 ‖ r s v)。
+  - 鉴权签名;claim / merge 的 Kernel.execute calldata。
+- 策略(`src/strategy.rs`):纯状态机,覆盖规格第 2 节全部规则(两侧挂最优价、改价、币安急动撤单、库存上限、剩 30 秒停挂、风控停机、冷却、限额)。
+- 限额(`src/ratelimit.rs`):40/秒、500/分钟,留 20% 余量;撤单 > 新挂 > 查询。用滑动窗口计数实现,保证任意窗口不超限(普通令牌桶会超过分钟限额)。
+- 风控账本(`src/risk.rs`):当日 / 累计 已实现 + 未实现盈亏;结果未出的轮按最坏结果估值;落盘,重启不清零;停机标记要人工 `--clear-halt`。
+- 运行时:
+  - 币安 bookTicker WS;Predict WS(盘口 + 钱包事件 + 心跳,外加 5 秒一次 ping 判活)。
+  - REST(鉴权、挂、撤、每 3 秒查挂单兜底、查单)。
+  - 日志:JSON Lines gzip 按小时滚动,每行带 mono_ns + wall_ms;凭证脱敏。
+  - 结算后 merge / redeem:每个动作最多一笔交易,失败只记日志。
+  - --send 启动时依次:链上核对存款地址 owner、鉴权、全撤;退出时全撤两遍。
+
+**测试结果**:`cargo test` 48 个全过,clippy 零警告。
+- 签名一致性:固定向量对比全部一致。
+  - 54 组订单:买/卖 × isNegRisk × isYieldBearing × 价 0.01/0.5/0.99,predictAccount 与 EOA 两种模式,另加小写地址抽查;每组对比金额、订单 JSON、请求体 JSON、typed-data hash、签名(含 v)。
+  - 38 组金额取整、3 组鉴权签名、12 组 merge / redeem calldata。
+  - 另有现场测试:Rust 随机生成私钥,调 node 跑官方 SDK 现场比对,也一致。
+- 策略单测 15 个:改价、币安急动、库存上限、剩 30 秒、开盘前、日亏 / 累计停机、429、下单错误 / 超时 / 迟到回报、断线 > 3 秒、币安静默、冷却过多停机、限额耗尽撤单仍可发、成交记账。
+- 限额 6 个;用 ws_samples.tsv 真实消息的解析测试 7 个;库内单测 14 个。
+- 端到端 4 个:本机模拟 Predict REST + WS、币安、RPC,跑完整可执行文件。
+  - dry-run 不发任何写请求。
+  - --send 全流程:鉴权 → 启动全撤 → 挂单 → 改价 → 钱包事件成交 → REST 核实 → 退出无残留挂单。
+  - 429 后停止下单;owner 不符拒绝启动。
+  - 日志和输出里不出现凭证。
+- 10 分钟长跑(对着本地模拟服务器,dry-run 与 --send 各一次):两次都正常退出、无崩溃。各自跨了 3 轮开盘、2 次收盘,至少 1 次结算。--send 那次:367 次下单、365 次撤单,心跳回复 571 次,退出后无残留挂单;最后 30 秒和开盘前都没有挂单。dry-run 那次:0 个写请求。复现命令:`cargo test --release --test e2e_mock long_run -- --ignored --nocapture`
+
+**未完成 / 需本机会话与 Luke 做**
+1. **真实行情 dry-run 10 分钟没做**:云端网络策略拦了 api.predict.fun、ws.predict.fun、stream.binance.com(代理 403 / 连接重置),只能用本地模拟服务器代替。按交接卡,东京机先空跑 ≥ 1 小时核对日志:
+   `cd probe/predict-mm-probe && cargo build --release && ./target/release/predict-mm-probe --log-dir ~/probe_logs --duration-s 3600`
+2. 以下字段都是按多种可能的名字容错解析的,需要用首次实盘日志核对,细节见 README 第 8 节:
+   - 钱包事件格式(未录过);
+   - `GET /v1/orders` 与 `/v1/orders/<hash>` 的成交量 / 状态字段;
+   - 结算结果字段(假定 `outcomes[].status` = WON / LOST;解析不到会按最坏结果估值,日亏停机会提早触发);
+   - Predict 心跳间隔。
+3. claim / merge 只验证了 calldata 与 SDK 一致,没在真实链上跑过。EOA 需要有 BNB 付 gas。
+4. 实盘启动命令(Opus 审完后交给 Luke 执行的那一条):
+   `set -a; . ~/pflat/.env; set +a; ./target/release/predict-mm-probe --send --log-dir ~/probe_logs --quiet`

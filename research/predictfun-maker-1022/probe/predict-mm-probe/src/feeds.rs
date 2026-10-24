@@ -13,8 +13,22 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug)]
 pub enum FeedEv {
-    Raw { feed: Feed, now: Now, raw: String },
-    State { feed: Feed, now: Now, up: bool, why: String },
+    Raw {
+        feed: Feed,
+        now: Now,
+        raw: String,
+    },
+    /// 收到 pong:连接活着(不记日志)
+    Alive {
+        feed: Feed,
+        now: Now,
+    },
+    State {
+        feed: Feed,
+        now: Now,
+        up: bool,
+        why: String,
+    },
 }
 
 #[derive(Debug)]
@@ -111,11 +125,17 @@ pub async fn predict_task(url: String, origin: Option<String>, mut ctrl: mpsc::U
                 if ok {
                     let _ = tx.send(FeedEv::State { feed: Feed::Predict, now: now(), up: true, why: "connected".into() });
                 }
+                // 每 5 秒发一次 WS ping;pong 也算存活,不完全依赖应用层心跳(心跳间隔未实测)
+                let mut ping = tokio::time::interval(Duration::from_secs(5));
+                ping.tick().await;
                 let why = loop {
                     if !ok {
                         break "subscribe send failed".to_string();
                     }
                     tokio::select! {
+                        _ = ping.tick() => {
+                            if w.send(Message::Ping(Vec::new().into())).await.is_err() { break "ping send failed".into(); }
+                        }
                         m = tokio::time::timeout(Duration::from_secs(60), r.next()) => match m {
                             Ok(Some(Ok(Message::Text(t)))) => {
                                 let t = t.to_string();
@@ -130,6 +150,7 @@ pub async fn predict_task(url: String, origin: Option<String>, mut ctrl: mpsc::U
                                 let _ = tx.send(FeedEv::Raw { feed: Feed::Predict, now: n, raw: t });
                             }
                             Ok(Some(Ok(Message::Ping(p)))) => { let _ = w.send(Message::Pong(p)).await; }
+                            Ok(Some(Ok(Message::Pong(_)))) => { let _ = tx.send(FeedEv::Alive { feed: Feed::Predict, now: now() }); }
                             Ok(Some(Ok(Message::Close(c)))) => break format!("close {c:?}"),
                             Ok(Some(Ok(_))) => {}
                             Ok(Some(Err(e))) => break format!("error {e}"),

@@ -216,6 +216,8 @@ pub struct Strategy {
     last_note: [Option<String>; 2],
     /// 账本有变化(成交、结算),需要落盘
     pub ledger_dirty: bool,
+    /// 不在槽位里、又必须撤的单(迟到回报),限额不够时留到下次重试
+    orphans: Vec<(u64, QSide, String, String)>,
 }
 
 impl Strategy {
@@ -242,6 +244,7 @@ impl Strategy {
             halted,
             last_note: [None, None],
             ledger_dirty: false,
+            orphans: vec![],
         }
     }
 
@@ -641,6 +644,8 @@ impl Strategy {
                 if let Slot::Live { want_cancel, .. } = &mut self.slots[i] {
                     *want_cancel = Some(reason);
                 }
+            } else if !self.orphans.iter().any(|o| o.2 == order_id) {
+                self.orphans.push((cid, qside, order_id, reason));
             }
             vec![]
         }
@@ -648,6 +653,12 @@ impl Strategy {
 
     fn decide(&mut self, now: Now, rl: &mut RateLimiter) -> Vec<Action> {
         let mut acts = vec![];
+        // 先重试孤儿单的撤单(撤单优先)
+        for (cid, qside, order_id, reason) in std::mem::take(&mut self.orphans) {
+            if self.orders.get(&cid).is_some_and(|o| !o.closed) {
+                acts.extend(self.issue_cancel(now, cid, qside, order_id, reason, rl));
+            }
+        }
         if self.halted.is_some() {
             // 停机后仍然要撤掉任何还活着的单(例如停机后才到的下单回报)
             for side in QSide::ALL {

@@ -51,6 +51,8 @@ struct Runner {
     pf_ctrl: mpsc::UnboundedSender<PfCtrl>,
     subscribed: BTreeSet<u64>,
     ws_book_seen: HashSet<u64>,
+    /// 各市场最新 WS 盘口(下一轮提前订阅,切轮时立刻喂给策略)
+    last_book: HashMap<u64, BookSnapshot>,
     rounds: Vec<RoundCtx>,
     ended: HashSet<u64>,
     rounds_done: u32,
@@ -320,6 +322,7 @@ impl Runner {
                 match parse_predict(&raw) {
                     Some(PredictMsg::Book(b)) => {
                         self.ws_book_seen.insert(b.market_id);
+                        self.last_book.insert(b.market_id, b.clone());
                         let acts = self.with_rl(|s, rl| s.on_book(t, b, rl));
                         self.exec(acts);
                     }
@@ -327,6 +330,7 @@ impl Runner {
                     _ => {}
                 }
             }
+            FeedEv::Alive { feed, now: t } => self.strat.feed_msg(t, feed),
             FeedEv::State { feed, now: t, up, why } => {
                 self.log.ev_at(t, "feed_state", json!({"feed": feed, "up": up, "why": why}));
                 let acts = self.with_rl(|s, rl| s.on_feed_state(t, feed, up, rl));
@@ -552,6 +556,12 @@ impl Runner {
                 self.rounds.push(ctx.clone());
                 let acts = self.with_rl(|s, rl| s.set_round(t, ctx, rl));
                 self.exec(acts);
+                if let Some(b) = self.last_book.get(&id).cloned() {
+                    let acts = self.with_rl(|s, rl| s.on_book(t, b, rl));
+                    self.exec(acts);
+                }
+                let keep = self.subscribed.clone();
+                self.last_book.retain(|m, _| keep.contains(m));
                 let (api, tx) = (self.api.clone(), self.ev_tx.clone());
                 tokio::spawn(async move {
                     if let Ok(b) = api.orderbook(id).await {
@@ -858,6 +868,7 @@ async fn run_inner(cli: Cli, creds: Creds, send: bool, log: Log) -> Result<i32> 
         pf_ctrl,
         subscribed: BTreeSet::new(),
         ws_book_seen: HashSet::new(),
+        last_book: HashMap::new(),
         rounds: vec![],
         ended: HashSet::new(),
         rounds_done: 0,
