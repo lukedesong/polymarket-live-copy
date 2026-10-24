@@ -25,7 +25,10 @@ BIN="${PROBE_BIN:-$H/probe/predict-mm-probe.current}"
 STATE="${PROBE_STATE:-$H/probe/state_live.json}"
 PRIOR="${PROBE_PRIOR_LOSS:-37.01}"
 OUT=$H/probe_live3_$(date -u +%m%d_%H%M)
-ACCOUNT=35fb7e1ac51a9c4504c1d6ffc64f3d45a420f651
+# 存款地址从 .env 读(只取这一项公开地址,别的变量不出子 shell);换账户只改 .env
+ACCOUNT=$( set -a; . "$H/pflat/.env" 2>/dev/null; printf '%s' "${PREDICT_ACCOUNT_ADDRESS:-}" )
+[[ "$ACCOUNT" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "~/pflat/.env 里的 PREDICT_ACCOUNT_ADDRESS 缺失或格式不对"; exit 1; }
+ACCOUNT=$(printf '%s' "${ACCOUNT#0x}" | tr 'A-F' 'a-f')
 RPC="${PROBE_RPC:-https://bsc-dataseed.bnbchain.org}"
 for v in "$HOURS" "$LOSS" "$ROUNDS" "$BAL_CAP"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "参数必须是非负整数:$v"; exit 1; }; done
 [[ "$PRIOR" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "PROBE_PRIOR_LOSS 必须是非负数:$PRIOR"; exit 1; }
@@ -69,7 +72,7 @@ if [ "$ROUNDS" -gt 0 ]; then
   MAXR=$ROUNDS; [ "$INTO" -gt 10 ] && MAXR=$(( ROUNDS + 1 ))   # 当前轮已开始:这半轮另算一轮,保证跑满 ROUNDS 个完整轮
 fi
 [ "$GROSS" -ge 10 ] || { say "余额 \$$BAL 太少(每轮合计 < \$10),不启动"; exit 1; }
-say "启动:链上余额 \$$BAL,按 \$$USE 计 → 未结算上限 \$$CAP、每轮两边合计 \$$GROSS、匀速 \$$PERMIN/分钟(0=不限);时间上限 ${HOURS} 小时、轮数上限 $MAXR(0=不限)、亏损上限 \$$LOSS"
+say "启动:存款地址 0x$ACCOUNT 链上余额 \$$BAL,按 \$$USE 计 → 未结算上限 \$$CAP、每轮两边合计 \$$GROSS、匀速 \$$PERMIN/分钟(0=不限);时间上限 ${HOURS} 小时、轮数上限 $MAXR(0=不限)、亏损上限 \$$LOSS"
 say "手动停止:ssh 到东京后执行 pkill -INT -f '^$H/probe/predict-mm-probe'"
 (
   set -a; . $H/pflat/.env; set +a

@@ -42,7 +42,7 @@ class T(unittest.TestCase):
         self.h = tempfile.mkdtemp()
         os.makedirs(os.path.join(self.h, "probe"))
         os.makedirs(os.path.join(self.h, "pflat"))
-        open(os.path.join(self.h, "pflat", ".env"), "w").write("PREDICT_API_KEY=k\nPREDICT_PRIVATE_KEY=0xabc\nPREDICT_ACCOUNT_ADDRESS=0xdef\n")
+        open(os.path.join(self.h, "pflat", ".env"), "w").write("PREDICT_API_KEY=k\nPREDICT_PRIVATE_KEY=0xabc\nPREDICT_ACCOUNT_ADDRESS=0x00000000000000000000000000000000000000Ab\n")
         self.bin = os.path.join(self.h, "probe", "predict-mm-probe.v4")
         # 假探针:记下参数和 PREDICT_* 变量个数,然后以自己的路径为 argv0 睡着(和真探针一样能被 pgrep 找到)
         open(self.bin, "w").write('#!/bin/bash\n[ "$1" = --version ] && { echo "predict-mm-probe 0.4.0"; exit 0; }\necho "$@" > "%s/args"\nenv | grep -c ^PREDICT_ > "%s/nenv"\nexec -a "$0" sleep 120\n' % (self.h, self.h))
@@ -84,7 +84,7 @@ class T(unittest.TestCase):
             self.assertEqual(a["--max-rounds"], "4", "当前轮已开始:这半轮另算一轮")
         self.assertEqual(open(os.path.join(self.h, "nenv")).read().strip(), "3", "实盘要带上 .env 的三个变量")
         live = os.path.realpath(os.path.join(self.h, "probe_live3"))
-        self.assertIn("启动:链上余额 $391.91,按 $391 计", open(os.path.join(live, "supervisor.log")).read())
+        self.assertIn("启动:存款地址 0x00000000000000000000000000000000000000ab 链上余额 $391.91,按 $391 计", open(os.path.join(live, "supervisor.log")).read())
         # 已在跑:拒绝,且不动 probe_live3 软链
         time.sleep(61)  # 目录名精确到分钟:换一分钟才会是新目录
         r2 = self.run_live(PROBE_ROUNDS="3")
@@ -116,6 +116,13 @@ class T(unittest.TestCase):
         self.args()
         self.assertAlmostEqual(json.load(open(self.state))["realized_total"], -50.0)
         self.assertIn("累计已实现 -50.00", r.stdout)
+
+    def test_bad_account_address(self):
+        open(os.path.join(self.h, "pflat", ".env"), "w").write("PREDICT_API_KEY=k\nPREDICT_PRIVATE_KEY=0xabc\nPREDICT_ACCOUNT_ADDRESS=0xdef\n")
+        r = self.run_live()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("PREDICT_ACCOUNT_ADDRESS", r.stdout)
+        self.assertNotIn("0xabc", r.stdout + r.stderr, "私钥不能出现在输出里")
 
     def test_missing_bin_or_bad_prior(self):
         self.assertNotEqual(self.run_live(PROBE_PRIOR_LOSS="-3").returncode, 0)
