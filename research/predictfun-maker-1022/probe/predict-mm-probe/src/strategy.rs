@@ -604,12 +604,8 @@ impl Strategy {
     /// 本轮两边合计投入:已成交成本 + 本轮未关闭订单的未成交金额
     fn gross_used(&self, market_id: u64) -> f64 {
         let cost = self.ledger.round(market_id).map_or(0.0, |r| r.cost_usd);
-        let pending: f64 = self
-            .orders
-            .values()
-            .filter(|o| o.market_id == market_id && !o.closed)
-            .map(|o| (o.shares as f64 - o.filled).max(0.0) * o.price_cents as f64 / 100.0)
-            .sum();
+        let pending: f64 =
+            self.orders.values().filter(|o| o.market_id == market_id && !o.closed).map(|o| (o.shares as f64 - o.filled).max(0.0) * o.price_cents as f64 / 100.0).sum();
         cost + pending
     }
 
@@ -641,21 +637,18 @@ impl Strategy {
         None
     }
 
-    /// 净持仓等值(美元)是否已到上限,到了则返回加仓侧
-    fn inventory_blocked(&self) -> Option<QSide> {
-        let r = self.round.as_ref().and_then(|r| self.ledger.round(r.market_id))?;
-        let net = r.net_up();
-        let mid = self.up_mid();
-        if net > 1e-9 {
-            // 拿不到中间价按每股 $1 计(保守)
-            let v = net * mid.unwrap_or(1.0);
-            (v >= self.p.inventory_cap_usd - 1e-9).then_some(QSide::UpBid)
-        } else if net < -1e-9 {
-            let v = -net * mid.map_or(1.0, |m| 1.0 - m);
-            (v >= self.p.inventory_cap_usd - 1e-9).then_some(QSide::DownBid)
-        } else {
-            None
+    /// 库存上限(10-24 改):本轮最坏亏损 = 已投入成本 − min(Up 股数, Down 股数)(押错边时整轮亏多少)≥ 上限 →
+    /// 股数多的那一侧不再加仓(两边股数相等时两侧都不挂:加哪边都会让最坏亏损变大)。
+    /// 旧版按"净股数 × 中间价"算:价格一路跌时,早先高价买进的股票按现价只值几分钱,上限挡不住继续接货
+    /// (10-24 13:35 那一轮买进 442.9 股 Up / 125.6 股 Down,Down 赢,一轮亏 $20.8)。返回 [挡 UpBid, 挡 DownBid]
+    fn inventory_blocked(&self) -> [bool; 2] {
+        let Some(r) = self.round.as_ref().and_then(|r| self.ledger.round(r.market_id)) else { return [false, false] };
+        let worst = r.cost_usd - r.up_shares.min(r.down_shares);
+        if worst < self.p.inventory_cap_usd - 1e-9 {
+            return [false, false];
         }
+        let d = r.up_shares - r.down_shares;
+        [d >= -1e-9, d <= 1e-9]
     }
 
     /// 连接异常:返回 (是否禁止新挂, 是否已断 > feed_down_ms)
@@ -786,8 +779,8 @@ impl Strategy {
                 Some(format!("剩余 ≤ {}s", self.p.stop_before_end_ms / 1000))
             } else if guard {
                 Some("币安急动".into())
-            } else if inv_block == Some(side) {
-                Some(format!("净持仓 ≥ ${}", self.p.inventory_cap_usd))
+            } else if inv_block[side.idx()] {
+                Some(format!("本轮最坏亏损 ≥ ${}", self.p.inventory_cap_usd))
             } else {
                 None
             };

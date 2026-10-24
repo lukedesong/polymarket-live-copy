@@ -66,6 +66,9 @@ impl Sim {
             _ => unreachable!(),
         }
     }
+    fn tick_actions(&mut self) -> Vec<Action> {
+        self.tick()
+    }
     fn tick(&mut self) -> Vec<Action> {
         self.s.feed_msg(self.now, Feed::Binance);
         self.s.on_tick(self.now, &mut self.rl)
@@ -195,7 +198,7 @@ fn binance_jump_cancels_adverse_side_then_requotes() {
 #[test]
 fn inventory_cap_blocks_adding_side() {
     let mut sim = quoted();
-    // Up 买单连续成交;每张 2 股 @0.50。中间价 0.525
+    // Up 买单连续成交;每张 2 股 @0.50 = $1。最坏亏损(Down 赢)= 成本 − min(Up, Down) = 成本
     for k in 0..6 {
         let (oid, _) = sim.live_order(QSide::UpBid).expect("应有 Up 买单");
         sim.advance(500);
@@ -205,9 +208,9 @@ fn inventory_cap_blocks_adding_side() {
         let (d2, _) = sim.s.on_fill(sim.now, &oid, 2.0, &mut sim.rl);
         assert_eq!(d2, 0.0);
         let p = places(&a);
-        let net = 2.0 * (k + 1) as f64;
-        if net * 0.525 >= 6.0 {
-            assert!(p.iter().all(|x| x.0 != QSide::UpBid), "净 {net} 股 ≥ $6 不应再挂 Up 买: {a:?}");
+        let worst = (k + 1) as f64;
+        if worst >= 6.0 {
+            assert!(p.iter().all(|x| x.0 != QSide::UpBid), "最坏亏损 ${worst} ≥ $6 不应再挂 Up 买: {a:?}");
         } else {
             assert_eq!(p, vec![(QSide::UpBid, 50, 2)], "k={k} {a:?}");
             sim.advance(35);
@@ -219,7 +222,7 @@ fn inventory_cap_blocks_adding_side() {
     assert!((r.cost_usd - 6.0).abs() < 1e-9);
     // Down 买侧(减仓侧)照常挂着
     assert!(sim.live_order(QSide::DownBid).is_some());
-    // Down 成交 3 股 → 净 9 股 × 0.525 < 6 → 恢复 Up 买
+    // Down 成交 3 股 @0.45 → 成本 7.35 − min(12, 3) = 4.35 < 6 → 恢复 Up 买
     let (doid, _) = sim.live_order(QSide::DownBid).unwrap();
     let (_, a) = sim.s.on_fill(sim.now, &doid, 3.0, &mut sim.rl);
     assert!(places(&a).iter().any(|x| x.0 == QSide::UpBid), "{a:?}");
@@ -527,4 +530,71 @@ fn insufficient_collateral_over_60s_becomes_cooldown() {
     sim.advance(31_000);
     let a = sim.s.on_place_err(sim.now, 9_997, ErrorKind::PlaceRejected, msg, &mut sim.rl);
     assert!(has_cancel_all(&a) || sim.s.in_cooldown(sim.now), "连续 60 秒以上保证金不足应转为冷却: {a:?}");
+}
+
+/// 10-24 13:35 那一轮的毛病:价格一路下跌时一直接 Up。旧上限按"净股数 × 中间价"算,
+/// 早先高价买的股票按现价只值几分钱,挡不住;新上限按最坏亏损(成本 − min(Up, Down))算,花满 $6 就停
+#[test]
+fn falling_price_cannot_accumulate_beyond_worst_case_cap() {
+    let mut sim = Sim::default();
+    sim.line("bn", &bn(80880.0));
+    let mut spent = 0.0;
+    let mut last: Vec<Action>;
+    // 把动作里的挂/撤全部回报,直到没有新动作
+    fn settle(sim: &mut Sim, mut a: Vec<Action>) -> Vec<Action> {
+        let mut all = a.clone();
+        for _ in 0..5 {
+            sim.advance(20);
+            a = sim.ack_all(&a);
+            if a.is_empty() {
+                break;
+            }
+            all.extend(a.clone());
+        }
+        all
+    }
+    let mut fills = 0;
+    for bid in [0.50, 0.40, 0.30, 0.20, 0.10, 0.05, 0.04, 0.03] {
+        sim.advance(1_100);
+        let a = sim.line("pf", &pf(&[(bid, 50.0)], &[(bid + 0.02, 50.0)]));
+        last = settle(&mut sim, a);
+        sim.advance(1_100);
+        let t = sim.tick_actions();
+        last.extend(settle(&mut sim, t));
+        let Some((oid, price)) = sim.live_order(QSide::UpBid) else { continue };
+        if price != (bid * 100.0_f64).round() as u32 {
+            continue;
+        }
+        let shares = sim.s.order_by_id(&oid).unwrap().shares as f64;
+        let (d, a) = sim.s.on_fill(sim.now, &oid, shares, &mut sim.rl);
+        assert_eq!(d, shares);
+        fills += 1;
+        spent += shares * bid;
+        last = settle(&mut sim, a);
+        let r = sim.s.ledger.round(MKT).unwrap();
+        // 旧口径(净股数 × 中间价)在价格跌下去以后一直小于 $6,挡不住继续买
+        if bid <= 0.05 {
+            assert!(r.net_up() * (bid + 0.01) < 6.0, "这里旧上限还挡不住:{}", r.net_up() * (bid + 0.01));
+        }
+    }
+    let r = sim.s.ledger.round(MKT).unwrap();
+    assert!(fills >= 6, "成交 {fills} 次");
+    assert!((r.cost_usd - spent).abs() < 1e-9);
+    assert!(r.cost_usd >= 6.0 && r.cost_usd < 7.5, "最坏亏损停在 $6 + 最后一张单以内,实际成本 {}", r.cost_usd);
+    assert!(sim.live_order(QSide::UpBid).is_none(), "到上限后不再挂 Up 买(已挂的也撤)");
+    sim.advance(2_000);
+    let a = sim.line("pf", &pf(&[(0.02, 50.0)], &[(0.04, 50.0)]));
+    assert!(!places(&a).iter().any(|x| x.0 == QSide::UpBid), "{a:?}");
+    let _ = last;
+}
+
+#[test]
+fn balanced_book_at_cap_blocks_both_sides() {
+    let mut sim = quoted();
+    let (u, _) = sim.live_order(QSide::UpBid).unwrap();
+    let (d, _) = sim.live_order(QSide::DownBid).unwrap();
+    // 先各成交 2 股:Up 2 股 @0.50 + Down 2 股 @0.45 → 成本 1.9,min = 2 → 最坏亏损为负,不挡
+    sim.s.on_fill(sim.now, &u, 2.0, &mut sim.rl);
+    let (_, a) = sim.s.on_fill(sim.now, &d, 2.0, &mut sim.rl);
+    assert!(a.iter().all(|x| !matches!(x, Action::Note { msg, .. } if msg.contains("最坏亏损"))), "{a:?}");
 }

@@ -169,9 +169,22 @@ impl Cli {
         if !(0.0..1.0).contains(&self.rate_margin) || self.rate_per_sec == 0 || self.rate_per_min == 0 {
             bail!("限额参数不合法");
         }
-        if self.stop_before_end_s < 0 || self.min_notional_usd <= 0.0 || self.bn_move_bp <= 0.0 || !(self.min_notional_usd.is_finite() && self.bn_move_bp.is_finite() && self.gross_cap_usd.is_finite() && self.gross_per_min_usd.is_finite() && self.capital_cap_usd.is_finite() && self.inventory_cap_usd.is_finite() && self.max_daily_loss_usd.is_finite() && self.max_total_loss_usd.is_finite())
-            || self.gross_cap_usd < 5.0 * self.min_notional_usd || self.capital_cap_usd < self.gross_cap_usd.min(5.0 * self.min_notional_usd) || self.gross_per_min_usd < 0.0
-            || (self.gross_per_min_usd > 0.0 && self.gross_per_min_usd < 5.0 * self.min_notional_usd) {
+        if self.stop_before_end_s < 0
+            || self.min_notional_usd <= 0.0
+            || self.bn_move_bp <= 0.0
+            || !(self.min_notional_usd.is_finite()
+                && self.bn_move_bp.is_finite()
+                && self.gross_cap_usd.is_finite()
+                && self.gross_per_min_usd.is_finite()
+                && self.capital_cap_usd.is_finite()
+                && self.inventory_cap_usd.is_finite()
+                && self.max_daily_loss_usd.is_finite()
+                && self.max_total_loss_usd.is_finite())
+            || self.gross_cap_usd < 5.0 * self.min_notional_usd
+            || self.capital_cap_usd < self.gross_cap_usd.min(5.0 * self.min_notional_usd)
+            || self.gross_per_min_usd < 0.0
+            || (self.gross_per_min_usd > 0.0 && self.gross_per_min_usd < 5.0 * self.min_notional_usd)
+        {
             bail!("策略参数不合法");
         }
         if self.send {
@@ -180,7 +193,13 @@ impl Cli {
                     bail!("--send 需要环境变量 {k}");
                 }
             }
-            if self.min_notional_usd > 5.0 || self.inventory_cap_usd > 30.0 || self.max_daily_loss_usd > 100.0 || self.max_total_loss_usd > 100.0 || self.gross_cap_usd > 300.0 || self.capital_cap_usd > 500.0 {
+            if self.min_notional_usd > 5.0
+                || self.inventory_cap_usd > 30.0
+                || self.max_daily_loss_usd > 100.0
+                || self.max_total_loss_usd > 100.0
+                || self.gross_cap_usd > 300.0
+                || self.capital_cap_usd > 500.0
+            {
                 bail!("--send 下单量/库存/亏损/合计投入上限超过探针的硬上限(单量 ≤ $5、库存 ≤ $30、日亏 ≤ $100、累计 ≤ $100、每轮合计 ≤ $300、未结算合计 ≤ $500)");
             }
             if self.rate_margin < 0.1 || self.rate_per_sec > 40 || self.rate_per_min > 500 {
