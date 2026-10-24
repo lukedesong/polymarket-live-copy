@@ -6,6 +6,7 @@ pub mod feeds;
 pub mod jsonlog;
 pub mod msgs;
 pub mod ratelimit;
+pub mod replay;
 pub mod risk;
 pub mod runner;
 pub mod signing;

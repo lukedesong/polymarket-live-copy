@@ -150,6 +150,23 @@ python3 fill_model.py validate ~/probe_logs/live_xxx --chain out/chain.json --ou
   口径是在这三轮上选的,要在下一次实盘的新数据上预先写下预测再核对。
 - 输出 `fill_model_orders.tsv`(逐单:前面的量、存活时长、真实与三种口径的成交股数和首笔时刻)。
 
+## 6. 回测:backtest_data.py + Rust `replay`
+
+```bash
+python3 backtest_data.py <录制器小时文件 .log.gz ...> --out bt/ [--chain-json 已下载的链上数据]   # 每小时一次
+python3 backtest_data.py index --out bt/                                                     # 写每轮结果与清单
+cd ../predict-mm-probe && cargo build --release
+target/release/replay --data ../analysis/bt [--from 开盘秒 --to 开盘秒 --exclude …] [策略参数] [--out 每轮.tsv]
+```
+
+- 数据:录制器里 BTC 5 分钟盘口的推送、币安现货报价、平台成交记录(只用来把链上 token 对到 市场 / 涨跌)、同一时段链上挂单方成交。
+  收盘价 = 元数据里的收盘价,没有就用下一轮开盘价(10-24 三轮核对一致)。区块固定 450ms 一块。
+- 引擎(`src/replay.rs`)把事件按时间喂给**实盘同一份策略代码**,模拟挂单生效 22ms / 回报 42ms、撤单生效 11ms / 确认 29ms、
+  "已撮合"推送 270ms、只挂单被拒;排队与成交同 `fill_model.py`(默认 opt 口径)。连续的轮一起跑(上一轮没结算的钱照样占额度)。
+- 引擎核对(未审):用当时实盘的 v3 代码与参数回放 10-24 三轮,第一轮成交 146 笔 / Up 396 Down 133 / 盈亏 −18.61
+  (实盘 130 笔 / 443 / 126 / −20.82),第二轮 146 笔 / 155 / 163(实盘 134 / 145 / 181);第三轮实盘中途停机,不可比。
+- 链上历史日志:公共节点 publicnode 查历史区块要个人 token(10-24 起),需要一个节点服务商的 key(环境变量 `BSC_RPC`)。
+
 ## 测试
 
 ```bash

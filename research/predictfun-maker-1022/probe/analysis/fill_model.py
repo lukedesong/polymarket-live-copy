@@ -68,6 +68,48 @@ def simulate(shares, t0, t1, ahead0, events, mode):
     return out
 
 
+def pending_rows(paths, markets=None):
+    """盘口推送里 settlementsPending 的新增 → 成交事件(和 maker_rows 同样的字段,没有挂单 hash)。
+    asks 侧 Up 价 p 增加 = 卖一侧被吃 = 队 DownBid(1−p);bids 侧 = 队 UpBid p。股数 = 金额 ÷ Up 价。
+    同一次推送同价两侧等量 = 同一笔记了两次,只留一条(旧回放器 pending_fills.py 的口径)"""
+    out = []
+    prev = {}
+    for l in P.iter_lines(paths):
+        if l.get("kind") != "pf":
+            continue
+        try:
+            d = MR.json.loads(l.get("raw", ""))
+        except ValueError:
+            continue
+        topic = d.get("topic") or ""
+        if not topic.startswith("predictOrderbook/"):
+            continue
+        data = d.get("data") or {}
+        m = int(data.get("marketId") or topic.split("/", 1)[1])
+        if markets is not None and m not in markets:
+            continue
+        sp = data.get("settlementsPending") or {}
+        cur = {}
+        for sd in ("asks", "bids"):
+            for x in sp.get(sd) or []:
+                k = (sd, int(round(float(x[0]) * 100)))
+                cur[k] = cur.get(k, 0.0) + float(x[1])
+        seen = set()
+        for (sd, c), v in cur.items():
+            inc = v - prev.get(m, {}).get((sd, c), 0.0)
+            if inc <= 1e-6 or c <= 0:
+                continue
+            key = (c, round(inc, 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            qside, level = ("DownBid", 100 - c) if sd == "asks" else ("UpBid", c)
+            out.append({"market_id": m, "qside": qside, "level": level, "shares": inc / (c / 100.0), "t": l["wall_ms"], "hash": None, "maker": None})
+        prev[m] = cur
+    out.sort(key=lambda r: r["t"])
+    return out
+
+
 def order_window(o, by_side):
     """虚拟单的存活区间:挂上(回报)→ 撤单生效;整单成交没撤的,存活到这一侧下一次换价(策略本来会在那时撤)"""
     t0 = o["ack_ms"]
@@ -77,7 +119,7 @@ def order_window(o, by_side):
     return t0, (min(nxt) if nxt else (o.get("round_end") or t0 + 300_000))
 
 
-def validate(paths, chain_path, out, lag_ms=None):
+def validate(paths, chain_path, out, lag_ms=None, source="chain"):
     L = P.load(paths)
     tokens = {}
     for m, l in L.markets.items():
@@ -90,6 +132,7 @@ def validate(paths, chain_path, out, lag_ms=None):
     lag = lag_ms if lag_ms is not None else (MR.chain_lag(rows, matched) or MR.DEFAULT_LAG_MS)
     for x in rows:
         x["t"] = (x["ms"] or 0) - lag
+    pend = pending_rows(paths, set(L.markets)) if source == "pending" else None
     orders = [o for o in L.orders.values() if o["ack_ok"] and o["hash"] and o["decide_ms"] is not None and o["ack_ms"] is not None]
     for o in orders:
         rd = L.rounds.get(o["market_id"]) or {}
@@ -118,7 +161,19 @@ def validate(paths, chain_path, out, lag_ms=None):
             if t < vis0 or t >= vis1:
                 return 0.0
             return max(0.0, o["shares"] - sum(q for (tt, q) in rf if tt + VISIBLE_MS <= t))
-        ev = [(x["t"], "fill", x["shares"]) for x in by_level.get((o["market_id"], o["qside"], lv), []) if x["hash"] != h]
+        if pend is None:
+            ev = [(x["t"], "fill", x["shares"]) for x in by_level.get((o["market_id"], o["qside"], lv), []) if x["hash"] != h]
+        else:
+            # 推送里的成交量含被测单自己:按它每笔真实成交,从之后 1.5 秒内最近的一条同价位成交里扣掉
+            pl = [[x["t"], x["shares"]] for x in pend if x["market_id"] == o["market_id"] and x["qside"] == o["qside"] and x["level"] == lv]
+            for tt, q in rf:
+                for e in sorted((e for e in pl if tt - 500 <= e[0] <= tt + 1500 and e[1] > 1e-9), key=lambda e: abs(e[0] - tt)):
+                    k = min(q, e[1])
+                    e[1] -= k
+                    q -= k
+                    if q <= 1e-9:
+                        break
+            ev = [(t, "fill", q) for t, q in pl if q > 1e-9]
         ev += [(s[0], "book", max(0.0, MR.level_size(s, o["qside"], lv) - own_rem(s[0]))) for s in series if t0 - 5000 <= s[0] <= t1]
         ev.sort(key=lambda e: (e[0], 0 if e[1] == "book" else 1))
         snap = MR.snap_at(series, t0)
@@ -135,7 +190,7 @@ def validate(paths, chain_path, out, lag_ms=None):
     cols = list(out_rows[0].keys()) if out_rows else []
     P.write_tsv(os.path.join(out, "fill_model_orders.tsv"), cols, out_rows)
     summary = summarize(out_rows)
-    print("校准:实盘真挂过的单 %d 张(把它自己的链上成交拿掉再预测);区块时间 − 撮合 = %d 毫秒" % (len(out_rows), lag))
+    print("校准(成交来源 %s):实盘真挂过的单 %d 张(把它自己的成交拿掉再预测);区块时间 − 撮合 = %d 毫秒" % (source, len(out_rows), lag))
     print("实盘:有成交 %d 张(%.1f%%),成交 %.1f 股 / 挂 %d 股" % (summary["real_n"], 100 * summary["real_rate"], summary["real_sh"], summary["total_sh"]))
     for m in MODES:
         s = summary[m]
@@ -169,8 +224,9 @@ def main(argv=None):
     v.add_argument("--chain", required=True)
     v.add_argument("--out", default="analysis_out")
     v.add_argument("--lag-ms", type=int, default=None)
+    v.add_argument("--source", choices=["chain", "pending"], default="chain", help="成交来源:链上挂单成交,或盘口推送里的待结算增量")
     a = ap.parse_args(argv)
-    validate(a.paths, a.chain, a.out, a.lag_ms)
+    validate(a.paths, a.chain, a.out, a.lag_ms, a.source)
     return 0
 
 
