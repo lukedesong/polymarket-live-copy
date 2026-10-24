@@ -114,7 +114,14 @@ e2e `e2e_send_against_mock` 有过一次没能重现的失败(断言"挂单决�
    ```bash
    ssh -i ~/.ssh/lightsail_eu_north_1.pem ubuntu@54.95.203.70 "curl -fsSL https://raw.githubusercontent.com/lukedesong/polymarket-live-copy/<提交号>/research/predictfun-maker-1022/probe/gateway/setup.sh | GW_REF=<提交号> bash"
    ```
-3. 装 v5:云端编好的静态版本 sha256 `e95e00f57b532d6cebb18d3b2264dcef7c9c90e8ce7c36439840f27804e1c460`(已登记)。本机重新编也行,
+3. 装 v5:云端编好的静态版本 sha256 `e95e00f57b532d6cebb18d3b2264dcef7c9c90e8ce7c36439840f27804e1c460`(已登记)。
+   **云端已把这个文件直接发给 Luke(文件名 `predict-mm-probe.v5`,11MB)**,Luke 存到本机后:
+   ```bash
+   sha256sum predict-mm-probe.v5      # 必须等于上面的值,不等就不要用
+   scp -i ~/.ssh/lightsail_eu_north_1.pem predict-mm-probe.v5 ubuntu@54.95.203.70:/home/ubuntu/probe/predict-mm-probe.v5
+   ssh -i ~/.ssh/lightsail_eu_north_1.pem ubuntu@54.95.203.70 'cd ~/probe && sha256sum predict-mm-probe.v5 && chmod 755 predict-mm-probe.v5 && ./predict-mm-probe.v5 --version && ln -sfn ~/probe/predict-mm-probe.v5 ~/probe/predict-mm-probe.current'
+   ```
+   本机重新编也行,
    编法见 `probe/bin/README.md`(zig 当 musl 编译器;**静态版本编出来的 sha256 不一定和上面一样**,不一样就把新的登记进 SHA256SUMS、推到 predict-probe,再装)。
    `python3 gateway/tokyo_client.py deploy <程序文件> --name v5`,或 ssh 直接放到 `~/probe/predict-mm-probe.v5` 并把 `~/probe/predict-mm-probe.current` 指过去。
 4. 空跑 10 分钟(不带凭证):`tokyo_client.py dryrun --secs 600`,看能连上、能决策。
