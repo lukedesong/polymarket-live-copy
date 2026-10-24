@@ -3,7 +3,8 @@
 
 每个请求都要带请求头 `Authorization: Bearer <口令>`(口令在 ~/.tokyo_gw/token,chmod 600)。
   GET  /status                         探针 / 录制器进程、本次运行 supervisor.log 末尾、成交数、最近 halt/exit/balance、磁盘、负载
-  POST /start   {"hours":24,"loss":30}   调 ~/probe/tokyo_live.sh 启动实盘(hours 1~48,loss 1~30);已有探针在跑就拒绝
+  POST /start   {"hours":24,"loss":30,"rounds":0}   调 ~/probe/tokyo_live.sh 启动实盘(hours 1~48,loss 1~100,rounds 0~300,0 = 不限);
+                                       已有探针在跑就拒绝。loss > 30 需要探针程序的硬上限也已放开(否则探针自己拒绝启动)
   POST /stop                           pkill -INT 探针(探针先全撤再退出)
   POST /dryrun  {"secs":600}             空跑(不带任何凭证,--dry-run);已有探针在跑就拒绝
   GET  /files?root=probe|recorder      列出可下载的文件(探针日志目录 / 录制器 data 目录)
@@ -117,7 +118,7 @@ def status():
     parts = {
         "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "probe_processes": sh("pgrep -af %s | cut -c1-160" % json.dumps(PROBE_PATTERN)),
-        "recorder_processes": sh("pgrep -af pfrec5 | cut -c1-120"),
+        "recorder_processes": sh("pgrep -af pfrec5 | grep -v pgrep | cut -c1-120"),
         "live_dir": os.path.realpath(live) if os.path.exists(live) else None,
         "supervisor_tail": sh("tail -8 %s/supervisor.log" % live) if os.path.exists(live) else None,
         "fills": sh("zcat %s/probe_*.jsonl.gz 2>/dev/null | grep -c '\"kind\":\"fill\"'" % live, 60) if os.path.exists(live) else None,
@@ -129,15 +130,16 @@ def status():
 
 
 def start_live(body):
-    hours, loss = body.get("hours", 24), body.get("loss", 30)
-    if not (isinstance(hours, int) and 1 <= hours <= 48 and isinstance(loss, int) and 1 <= loss <= 30):
-        return 400, {"error": "hours 必须是 1~48 的整数,loss 必须是 1~30 的整数"}
+    hours, loss, rounds = body.get("hours", 24), body.get("loss", 30), body.get("rounds", 0)
+    ok = all(isinstance(v, int) and not isinstance(v, bool) for v in (hours, loss, rounds))
+    if not (ok and 1 <= hours <= 48 and 1 <= loss <= 100 and 0 <= rounds <= 300):
+        return 400, {"error": "hours 1~48、loss 1~100、rounds 0~300,都必须是整数"}
     if probe_pids():
         return 409, {"error": "已有探针在跑,不启动", "processes": status()["probe_processes"]}
     if not os.path.exists(LIVE_SCRIPT):
         return 500, {"error": "找不到 %s" % LIVE_SCRIPT}
     env = {k: v for k, v in os.environ.items() if not k.startswith("PREDICT_")}
-    env.update(PROBE_HOURS=str(hours), PROBE_LOSS=str(loss))
+    env.update(PROBE_HOURS=str(hours), PROBE_LOSS=str(loss), PROBE_ROUNDS=str(rounds))
     log = os.path.join(GW_DIR, "start_%s.log" % time.strftime("%m%d_%H%M%S"))
     with open(log, "w") as f:
         r = subprocess.run(["bash", LIVE_SCRIPT], env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=120)

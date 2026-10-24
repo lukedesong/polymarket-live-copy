@@ -180,8 +180,8 @@ impl Cli {
                     bail!("--send 需要环境变量 {k}");
                 }
             }
-            if self.min_notional_usd > 5.0 || self.inventory_cap_usd > 30.0 || self.max_daily_loss_usd > 30.0 || self.max_total_loss_usd > 100.0 || self.gross_cap_usd > 300.0 || self.capital_cap_usd > 500.0 {
-                bail!("--send 下单量/库存/亏损/合计投入上限超过探针的硬上限(单量 ≤ $5、库存 ≤ $30、日亏 ≤ $30、累计 ≤ $100、每轮合计 ≤ $300、未结算合计 ≤ $500)");
+            if self.min_notional_usd > 5.0 || self.inventory_cap_usd > 30.0 || self.max_daily_loss_usd > 100.0 || self.max_total_loss_usd > 100.0 || self.gross_cap_usd > 300.0 || self.capital_cap_usd > 500.0 {
+                bail!("--send 下单量/库存/亏损/合计投入上限超过探针的硬上限(单量 ≤ $5、库存 ≤ $30、日亏 ≤ $100、累计 ≤ $100、每轮合计 ≤ $300、未结算合计 ≤ $500)");
             }
             if self.rate_margin < 0.1 || self.rate_per_sec > 40 || self.rate_per_min > 500 {
                 bail!("--send 限额不能超过实测值(40/秒、500/分钟)且余量 ≥ 10%");

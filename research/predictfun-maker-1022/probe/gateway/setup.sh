@@ -23,6 +23,18 @@ python3 -m py_compile "$D/tokyo_gateway.py.new"
 mv "$D/tokyo_gateway.py.new" "$D/tokyo_gateway.py"
 echo "$REF" > "$D/ref"
 
+# 同一提交的 tokyo_live.sh(启动脚本);有探针在跑时不替换,旧版留 .prev
+NEW_LIVE="$(mktemp)"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/research/predictfun-maker-1022/probe/tokyo_live.sh" -o "$NEW_LIVE"
+bash -n "$NEW_LIVE"
+if pgrep -f "^$HOME/probe/predict-mm-probe" >/dev/null; then
+  echo "有探针在跑:tokyo_live.sh 这次不替换"
+elif ! cmp -s "$NEW_LIVE" "$HOME/probe/tokyo_live.sh"; then
+  [ -f "$HOME/probe/tokyo_live.sh" ] && cp "$HOME/probe/tokyo_live.sh" "$HOME/probe/tokyo_live.sh.prev"
+  install -m 755 "$NEW_LIVE" "$HOME/probe/tokyo_live.sh" && echo "已更新 ~/probe/tokyo_live.sh(旧版在 tokyo_live.sh.prev)"
+fi
+rm -f "$NEW_LIVE"
+
 if ! command -v cloudflared >/dev/null 2>&1; then
   echo "安装 cloudflared…"
   ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"

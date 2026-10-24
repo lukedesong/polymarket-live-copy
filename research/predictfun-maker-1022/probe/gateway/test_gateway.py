@@ -41,7 +41,7 @@ def setup_home():
     open(fake, "w").write('#!/bin/bash\nenv | grep -c ^PREDICT_ > "%s/probe_env_count" || true\nexec -a "$0" sleep 300\n' % HOME)
     os.chmod(fake, 0o755)
     open(os.path.join(HOME, "probe", "tokyo_live.sh"), "w").write(
-        '#!/bin/bash\necho "hours=$PROBE_HOURS loss=$PROBE_LOSS"\n( exec setsid nohup %s --send >/dev/null 2>&1 < /dev/null ) &\nsleep 1\n' % fake)
+        '#!/bin/bash\necho "hours=$PROBE_HOURS loss=$PROBE_LOSS rounds=$PROBE_ROUNDS"\n( exec setsid nohup %s --send >/dev/null 2>&1 < /dev/null ) &\nsleep 1\n' % fake)
     rec = os.path.join(TMP, "rec")
     os.makedirs(os.path.join(rec, "data"))
     open(os.path.join(rec, "data", "2026102420_064500.log.gz"), "wb").write(b"rec")
@@ -85,6 +85,7 @@ class T(unittest.TestCase):
         self.assertEqual(st, 200)
         s = json.loads(b)
         self.assertIn("pfrec5_fake", s["recorder_processes"])
+        self.assertNotIn("pgrep", s["recorder_processes"], "不列出查询命令自己")
         log = open(os.path.join(HOME, ".tokyo_gw", "access.log")).read()
         self.assertNotIn(TOKEN, log)
 
@@ -112,16 +113,16 @@ class T(unittest.TestCase):
         self.assertEqual(os.path.getsize(dst), 256 * 400)
 
     def test_4_param_validation(self):
-        for body in ({"hours": 24, "loss": 31}, {"hours": 0, "loss": 30}, {"hours": "24", "loss": 30}, {"hours": 49}):
+        for body in ({"hours": 24, "loss": 101}, {"hours": 0, "loss": 30}, {"hours": "24", "loss": 30}, {"hours": 49}, {"rounds": 301}, {"rounds": -1}, {"loss": True}):
             self.assertEqual(self.req("POST", "/start", body)[0], 400, body)
         self.assertEqual(self.req("POST", "/dryrun", {"secs": 5})[0], 400)
         self.assertEqual(self.req("POST", "/nope", {})[0], 404)
 
     def test_5_start_stop_dryrun(self):
-        st, b = self.req("POST", "/start", {"hours": 2, "loss": 20})
+        st, b = self.req("POST", "/start", {"hours": 2, "loss": 85, "rounds": 3})
         r = json.loads(b)
         self.assertEqual(st, 200, r)
-        self.assertIn("hours=2 loss=20", r["output"])
+        self.assertIn("hours=2 loss=85 rounds=3", r["output"])
         self.assertTrue(G.probe_pids())
         self.assertEqual(self.req("POST", "/start", {"hours": 2, "loss": 20})[0], 409, "已在跑不能再启动")
         self.assertEqual(self.req("POST", "/dryrun", {"secs": 60})[0], 409)

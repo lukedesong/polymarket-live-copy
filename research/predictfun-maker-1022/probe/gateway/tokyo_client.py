@@ -3,7 +3,7 @@
 没有则读 ~/.tokyo_gw/url 与 ~/.tokyo_gw/token。口令不打印。
 
     python3 tokyo_client.py status
-    python3 tokyo_client.py start --hours 24 --loss 30     # 启动实盘:必须先得到 Luke 在对话里的明确同意
+    python3 tokyo_client.py start --hours 1 --loss 30 --rounds 3   # 启动实盘:必须先得到 Luke 在对话里的明确同意
     python3 tokyo_client.py stop
     python3 tokyo_client.py dryrun --secs 600
     python3 tokyo_client.py ls [probe|recorder]
@@ -79,6 +79,7 @@ def main(argv=None):
     s = sub.add_parser("start")
     s.add_argument("--hours", type=int, default=24)
     s.add_argument("--loss", type=int, default=30)
+    s.add_argument("--rounds", type=int, default=0)
     sub.add_parser("stop")
     d = sub.add_parser("dryrun")
     d.add_argument("--secs", type=int, default=600)
@@ -91,7 +92,7 @@ def main(argv=None):
     if a.cmd == "status":
         r = call("GET", "/status")
     elif a.cmd == "start":
-        r = call("POST", "/start", {"hours": a.hours, "loss": a.loss})
+        r = call("POST", "/start", {"hours": a.hours, "loss": a.loss, "rounds": a.rounds})
     elif a.cmd == "stop":
         r = call("POST", "/stop")
     elif a.cmd == "dryrun":
