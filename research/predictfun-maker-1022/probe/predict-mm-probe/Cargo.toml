@@ -1,0 +1,35 @@
+[package]
+name = "predict-mm-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Predict.fun BTC 5m 实盘探针:校准回放器成交模型(不是为了赚钱)"
+publish = false
+
+[[bin]]
+name = "predict-mm-probe"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+alloy-primitives = { version = "1.7", features = ["serde"] }
+alloy-sol-types = { version = "1.7", features = ["eip712-serde"] }
+alloy-signer = "2.5"
+alloy-signer-local = "2.5"
+alloy-consensus = "2.5"
+alloy-eips = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
