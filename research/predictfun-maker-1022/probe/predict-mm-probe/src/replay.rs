@@ -20,6 +20,8 @@ pub enum CancelMode {
     Mixed,
     /// 全记在前面(10-24 校准:张数比 1.03、股数比 1.00)
     Opt,
+    /// 按撤单那一刻前后的量按比例分摊(先挂先成 + 新单只排队尾推出,无参数;10-24 校准股数比 0.88,偏保守)
+    Prop,
 }
 
 #[derive(Debug, Clone)]
@@ -352,6 +354,12 @@ impl Engine {
                         CancelMode::Opt => {
                             let ca = o.ahead.min(c);
                             o.ahead -= ca;
+                            o.behind = (o.behind - (c - ca)).max(0.0);
+                        }
+                        CancelMode::Prop => {
+                            let tot = o.ahead + o.behind;
+                            let ca = if tot > 1e-12 { c * o.ahead / tot } else { 0.0 };
+                            o.ahead = (o.ahead - ca).max(0.0);
                             o.behind = (o.behind - (c - ca)).max(0.0);
                         }
                     }

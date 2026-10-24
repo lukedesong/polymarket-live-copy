@@ -47,7 +47,7 @@ struct Args {
     /// 撮合 → 策略收到成交(新版"已撮合" 270;旧版"上链成功"约 2300)
     #[arg(long, default_value_t = 270)]
     fill_notify_ms: i64,
-    /// 撤单记在前面还是后面:opt | mixed | pess
+    /// 撤单记在前面还是后面:opt | mixed | pess | prop
     #[arg(long, default_value = "opt")]
     cancel_mode: String,
 }
@@ -113,6 +113,7 @@ fn main() -> anyhow::Result<()> {
         cancel_mode: match a.cancel_mode.as_str() {
             "pess" => CancelMode::Pess,
             "mixed" => CancelMode::Mixed,
+            "prop" => CancelMode::Prop,
             _ => CancelMode::Opt,
         },
         ..ReplayCfg::default()

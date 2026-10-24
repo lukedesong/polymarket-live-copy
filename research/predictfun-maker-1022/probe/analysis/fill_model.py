@@ -11,6 +11,7 @@
       pess  全算在后面(前面的量只因成交减少)
       mixed 先算在后面,后面撤完了剩下的一半算在前面(旧回放器 mm_grid 的 mixed 口径)
       opt   全算在前面
+      prop  按撤单那一刻前后的量按比例分摊(前面占 ahead/(ahead+behind));从"先挂先成 + 新单只排队尾"推出,无参数
 校准:对实盘每张真挂过的单,把它自己的链上成交拿掉(回放里没有我们),按上面的规则预测它会不会成交、何时成交,
 再和链上真实结果逐单比对。盘口里有我们自己这张单的量,按它真实的剩余股数扣掉。
 输出 fill_model_orders.tsv(逐单)与屏幕汇总。
@@ -23,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import maker_rank as MR  # noqa: E402
 import probelog as P  # noqa: E402
 
-MODES = ("pess", "mixed", "opt")
+MODES = ("pess", "mixed", "opt", "prop")
 CANCEL_EFFECT_MS = 15   # 撤单决定到生效(10-24 实盘:撤单发出到平台生效约 11ms,往返 29ms)
 VISIBLE_MS = 70         # 我们的单出现在 / 消失于盘口推送的延迟(实测推送延迟约 66ms)
 
@@ -59,6 +60,11 @@ def simulate(shares, t0, t1, ahead0, events, mode):
                     cb = min(behind, c)
                     behind -= cb
                     ahead = max(0.0, ahead - 0.5 * (c - cb))
+                elif mode == "prop":
+                    tot = ahead + behind
+                    ca = c * ahead / tot if tot > 1e-12 else 0.0
+                    ahead = max(0.0, ahead - ca)
+                    behind = max(0.0, behind - (c - ca))
                 else:
                     ca = min(ahead, c)
                     ahead -= ca
