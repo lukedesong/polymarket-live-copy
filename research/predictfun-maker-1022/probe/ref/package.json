@@ -1,0 +1,18 @@
+{
+  "name": "pflat",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@predictdotfun/sdk": "^1.3.8",
+    "dotenv": "^18.0.8",
+    "ethers": "^6.17.0",
+    "ws": "^8.22.0"
+  }
+}
