@@ -1,6 +1,6 @@
 [package]
 name = "predict-mm-probe"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 description = "Predict.fun BTC 5m 实盘探针:校准回放器成交模型(不是为了赚钱)"
 publish = false

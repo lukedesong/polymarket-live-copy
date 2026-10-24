@@ -138,6 +138,63 @@ class T(unittest.TestCase):
         self.req("POST", "/stop", {})
         self.assertFalse(G.probe_pids())
 
+    def test_7_deploy(self):
+        import hashlib
+        import http.server
+        src = os.path.join(TMP, "newbin")
+        open(src, "w").write('#!/bin/bash\necho "predict-mm-probe 0.4.0"\n' + "#" * 5000 + "\n")
+        sha = hashlib.sha256(open(src, "rb").read()).hexdigest()
+        sums = {"txt": "%s  predict-mm-probe.v4\n%s  predict-mm-probe.v5\n" % (sha, "0" * 64)}
+
+        class S(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                b = sums["txt"].encode()
+                self.send_response(200)
+                self.send_header("content-length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+        srv = http.server.HTTPServer(("127.0.0.1", 0), S)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        G.SUMS_URL = "http://127.0.0.1:%d/SHA256SUMS" % srv.server_address[1]
+        try:
+            self.assertEqual(self.req("POST", "/deploy/install", {"name": "../x"})[0], 400)
+            self.assertEqual(self.req("POST", "/deploy/install", {"name": "v4"})[0], 404, "还没上传")
+            # 分段上传,中途 offset 不对 → 409 并告诉已收到多少
+            with redirect_stdout(io.StringIO()):
+                st, r = C.deploy(src, "v4", chunk=1000)
+            self.assertEqual(st, 200, r)
+            self.assertEqual(r["sha256"], sha)
+            self.assertEqual(r["version"], "predict-mm-probe 0.4.0")
+            cur = os.path.join(HOME, "probe", "predict-mm-probe.current")
+            self.assertEqual(os.path.realpath(cur), os.path.join(HOME, "probe", "predict-mm-probe.v4"))
+            self.assertEqual(json.loads(self.req("GET", "/status")[1])["probe_bin_current"]["sha256"], sha)
+            h = {"Authorization": "Bearer " + TOKEN}
+            rq = urllib.request.Request(self.url + "/deploy/upload?name=v5&offset=7", data=b"abc", method="POST", headers=h)
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(rq, timeout=10)
+            self.assertEqual(e.exception.code, 409)
+            # 校验码不符(v5 登记的是全 0):拒绝,current 不变
+            with redirect_stdout(io.StringIO()):
+                st, r = C.deploy(src, "v5", chunk=100000)
+            self.assertEqual(st, 400, r)
+            self.assertFalse(os.path.exists(os.path.join(HOME, "probe", "predict-mm-probe.v5")))
+            self.assertEqual(os.path.realpath(cur), os.path.join(HOME, "probe", "predict-mm-probe.v4"))
+            # v4 已装:内容不同的再上传不覆盖
+            open(src, "a").write("#x\n")
+            sha2 = hashlib.sha256(open(src, "rb").read()).hexdigest()
+            sums["txt"] = "%s  predict-mm-probe.v4\n" % sha2
+            with redirect_stdout(io.StringIO()):
+                st, r = C.deploy(src, "v4", chunk=100000)
+            self.assertEqual(st, 409, r)
+            # 空跑用 current
+            st, b = self.req("POST", "/dryrun", {"secs": 60})
+            self.assertEqual(st, 200)
+        finally:
+            srv.shutdown()
+
     def test_6_client_cli(self):
         buf = io.StringIO()
         with redirect_stdout(buf):

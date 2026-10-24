@@ -7,6 +7,10 @@
                                        已有探针在跑就拒绝。loss > 30 需要探针程序的硬上限也已放开(否则探针自己拒绝启动)
   POST /stop                           pkill -INT 探针(探针先全撤再退出)
   POST /dryrun  {"secs":600}             空跑(不带任何凭证,--dry-run);已有探针在跑就拒绝
+  POST /deploy/upload?name=v4&offset=N  上传探针程序(请求体 = 文件的一段,按顺序续传)到 ~/probe/incoming/
+  POST /deploy/install {"name":"v4"}    校验后安装为 ~/probe/predict-mm-probe.v4,并把 ~/probe/predict-mm-probe.current 指过去。
+                                       校验:sha256 必须出现在仓库 predict-probe 分支的 probe/bin/SHA256SUMS 里(只有能改仓库的人能换程序,
+                                       光有网关口令不够);--version 能跑(不带任何凭证)。正在跑的探针不受影响
   GET  /files?root=probe|recorder      列出可下载的文件(探针日志目录 / 录制器 data 目录)
   GET  /file?path=<相对 HOME 的路径>[&offset=&length=]   下载;只允许上面两类目录里、文件名匹配白名单的文件
 凭证文件(~/pflat/.env 等)、录制器进程本身一律不碰。访问记录写 ~/.tokyo_gw/access.log(不含口令)。
@@ -26,11 +30,17 @@ import urllib.parse
 HOME = os.environ.get("GW_HOME") or os.path.expanduser("~")
 GW_DIR = os.path.join(HOME, ".tokyo_gw")
 PORT = int(os.environ.get("GW_PORT", "8787"))
-PROBE_BIN = os.path.join(HOME, "probe", "predict-mm-probe.v3")
+PROBE_BIN_OLD = os.path.join(HOME, "probe", "predict-mm-probe.v3")
+PROBE_CURRENT = os.path.join(HOME, "probe", "predict-mm-probe.current")
+INCOMING = os.path.join(HOME, "probe", "incoming")
+SUMS_URL = os.environ.get("GW_SUMS_URL") or \
+    "https://raw.githubusercontent.com/lukedesong/polymarket-live-copy/predict-probe/research/predictfun-maker-1022/probe/bin/SHA256SUMS"
+BIN_NAME_RE = re.compile(r"^v\d{1,3}$")
+MAX_BIN = 64 * 1024 * 1024
 PROBE_PATTERN = "^" + os.path.join(HOME, "probe", "predict-mm-probe")
 LIVE_SCRIPT = os.path.join(HOME, "probe", "tokyo_live.sh")
 PROBE_ROOT_GLOBS = ["probe_live*", "probe_logs*", "probe_gw_dry_*"]
-PROBE_FILE_RE = re.compile(r"^(probe_\d{10}_\d{6}\.jsonl\.gz|state(-dry)?\.json|supervisor\.log|probe\.out|run\.out|summary\.txt)$")
+PROBE_FILE_RE = re.compile(r"^(probe_\d{10}_\d{6}\.jsonl\.gz|state(-dry|_at_start)?\.json|supervisor\.log|probe\.out|run\.out|summary\.txt)$")
 REC_FILE_RE = re.compile(r"^\d{10}_\d{6}\.log\.gz$")
 MAX_CHUNK = 64 * 1024 * 1024
 
@@ -113,6 +123,107 @@ def list_files(root):
     return rows
 
 
+def probe_bin():
+    return PROBE_CURRENT if os.path.exists(PROBE_CURRENT) else PROBE_BIN_OLD
+
+
+def sha256_file(p):
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def current_bin():
+    if not os.path.exists(PROBE_CURRENT):
+        return None
+    p = os.path.realpath(PROBE_CURRENT)
+    return {"path": os.path.relpath(p, HOME), "sha256": sha256_file(p)}
+
+
+def deploy_upload(name, offset, rfile, n):
+    if not BIN_NAME_RE.match(name or ""):
+        return 400, {"error": "name 只能是 v 加 1~3 位数字"}
+    if n <= 0 or n > 32 * 1024 * 1024:
+        return 400, {"error": "每段 1 字节 ~ 32MB"}
+    os.makedirs(INCOMING, exist_ok=True)
+    part = os.path.join(INCOMING, "predict-mm-probe.%s.part" % name)
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    if offset == 0:
+        have = 0
+    elif offset != have:
+        rfile.read(n)
+        return 409, {"error": "offset 必须等于已收到的字节数", "have": have}
+    if have + n > MAX_BIN:
+        rfile.read(n)
+        return 400, {"error": "文件超过 64MB"}
+    with open(part, "r+b" if offset else "wb") as f:
+        f.seek(have)
+        f.truncate()
+        left = n
+        while left > 0:
+            b = rfile.read(min(1 << 20, left))
+            if not b:
+                break
+            f.write(b)
+            left -= len(b)
+    return 200, {"have": os.path.getsize(part)}
+
+
+def fetch_sums():
+    import urllib.request
+    req = urllib.request.Request(SUMS_URL + "?t=%d" % time.time(), headers={"user-agent": "tokyo-gw"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        txt = r.read(100000).decode()
+    sums = {}
+    for line in txt.splitlines():
+        m = re.match(r"^([0-9a-f]{64})\s+\*?(predict-mm-probe\.v\d{1,3})\s*$", line.strip())
+        if m:
+            sums[m.group(2)] = m.group(1)
+    return sums
+
+
+def deploy_install(body):
+    name = body.get("name")
+    if not isinstance(name, str) or not BIN_NAME_RE.match(name):
+        return 400, {"error": "name 只能是 v 加 1~3 位数字"}
+    part = os.path.join(INCOMING, "predict-mm-probe.%s.part" % name)
+    dest = os.path.join(HOME, "probe", "predict-mm-probe.%s" % name)
+    src = part if os.path.exists(part) else (dest if os.path.exists(dest) else None)
+    if not src:
+        return 404, {"error": "还没上传"}
+    got = sha256_file(src)
+    try:
+        want = fetch_sums().get("predict-mm-probe.%s" % name)
+    except Exception as e:  # noqa: BLE001
+        return 502, {"error": "取仓库里的校验码失败: %s" % e}
+    if want != got:
+        return 400, {"error": "sha256 与仓库 predict-probe 分支 probe/bin/SHA256SUMS 不符(GitHub 原始文件有几分钟缓存,刚推送可稍后再试)",
+                     "got": got, "want": want}
+    if src == part:
+        if os.path.exists(dest) and sha256_file(dest) != got:
+            return 409, {"error": "%s 已存在且内容不同,不覆盖" % os.path.relpath(dest, HOME)}
+        os.chmod(part, 0o755)
+    try:
+        r = subprocess.run([src, "--version"], env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=10)
+        ver = (r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 400, {"error": "程序跑不起来: %s" % e}
+    if r.returncode != 0 or not ver.startswith("predict-mm-probe "):
+        return 400, {"error": "--version 输出不对", "out": (r.stdout + r.stderr)[-500:]}
+    if src == part:
+        os.replace(part, dest)
+    tmp = PROBE_CURRENT + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(dest, tmp)
+    os.replace(tmp, PROBE_CURRENT)
+    return 200, {"installed": os.path.relpath(dest, HOME), "sha256": got, "version": ver, "current": current_bin(),
+                 "probe_running": bool(probe_pids())}
+
+
 def status():
     live = os.path.join(HOME, "probe_live3")
     parts = {
@@ -123,6 +234,7 @@ def status():
         "supervisor_tail": sh("tail -8 %s/supervisor.log" % live) if os.path.exists(live) else None,
         "fills": sh("zcat %s/probe_*.jsonl.gz 2>/dev/null | grep -c '\"kind\":\"fill\"'" % live, 60) if os.path.exists(live) else None,
         "last_events": sh("zcat %s/probe_*.jsonl.gz 2>/dev/null | grep -E '\"kind\":\"(halt|exit|balance|fatal)\"' | tail -3 | cut -c1-300" % live, 60) if os.path.exists(live) else None,
+        "probe_bin_current": current_bin(),
         "disk_free_gb": round(shutil.disk_usage(HOME).free / 1e9, 1),
         "load": os.getloadavg(),
     }
@@ -171,7 +283,7 @@ def dryrun(body):
     os.makedirs(out)
     env = {k: v for k, v in os.environ.items() if not k.startswith("PREDICT_")}  # 空跑不带任何凭证
     with open(os.path.join(out, "run.out"), "w") as f:
-        subprocess.Popen([PROBE_BIN, "--dry-run", "--quiet", "--log-dir", out, "--duration-s", str(secs)], env=env, stdout=f, stderr=subprocess.STDOUT,
+        subprocess.Popen([probe_bin(), "--dry-run", "--quiet", "--log-dir", out, "--duration-s", str(secs)], env=env, stdout=f, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, start_new_session=True)
     time.sleep(3)
     return 200, {"log_dir": os.path.relpath(out, HOME), "processes": status()["probe_processes"]}
@@ -257,6 +369,14 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return
+        u = urllib.parse.urlparse(self.path)
+        if u.path == "/deploy/upload":
+            q = dict(urllib.parse.parse_qsl(u.query))
+            try:
+                off, n = int(q.get("offset", "0")), int(self.headers.get("content-length") or 0)
+            except ValueError:
+                return self._json(400, {"error": "offset 必须是整数"})
+            return self._json(*deploy_upload(q.get("name"), off, self.rfile, n))
         body = self._body()
         if body is None or not isinstance(body, dict):
             return self._json(400, {"error": "请求体必须是 JSON 对象"})
@@ -267,6 +387,8 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._json(*stop_probe())
         if path == "/dryrun":
             return self._json(*dryrun(body))
+        if path == "/deploy/install":
+            return self._json(*deploy_install(body))
         return self._json(404, {"error": "未知路径"})
 
 

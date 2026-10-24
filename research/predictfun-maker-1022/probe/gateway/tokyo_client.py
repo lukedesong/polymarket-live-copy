@@ -8,6 +8,7 @@
     python3 tokyo_client.py dryrun --secs 600
     python3 tokyo_client.py ls [probe|recorder]
     python3 tokyo_client.py get <相对 HOME 的路径 ...> --out 目录      # 分块下载,已下载完整的跳过
+    python3 tokyo_client.py deploy <本地程序文件> --name v4            # 上传(断点续传)+ 安装;sha256 必须已登记在仓库 probe/bin/SHA256SUMS
 """
 import argparse
 import json
@@ -72,6 +73,30 @@ def get_file(rel, out_dir):
     return dst, off
 
 
+def deploy(path, name, chunk=8 * 1024 * 1024):
+    size = os.path.getsize(path)
+    off = 0
+    with open(path, "rb") as f:
+        while off < size:
+            f.seek(off)
+            b = f.read(chunk)
+            url, tok = conf()
+            q = urllib.parse.urlencode({"name": name, "offset": off})
+            req = urllib.request.Request(url + "/deploy/upload?" + q, data=b, method="POST",
+                                         headers={"Authorization": "Bearer " + tok, "content-type": "application/octet-stream"})
+            try:
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    off = json.loads(r.read())["have"]
+            except urllib.error.HTTPError as e:
+                d = json.loads(e.read() or b"{}")
+                if e.code == 409 and "have" in d:  # 续传:按网关已收到的字节数接着传
+                    off = d["have"] if d["have"] <= size else 0
+                    continue
+                raise SystemExit("上传失败:%s %s" % (e.code, d))
+            print("已上传 %d / %d 字节" % (off, size))
+    return call("POST", "/deploy/install", {"name": name})
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -88,6 +113,9 @@ def main(argv=None):
     g = sub.add_parser("get")
     g.add_argument("paths", nargs="+")
     g.add_argument("--out", default="tokyo_files")
+    dp = sub.add_parser("deploy")
+    dp.add_argument("file")
+    dp.add_argument("--name", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "status":
         r = call("GET", "/status")
@@ -97,6 +125,8 @@ def main(argv=None):
         r = call("POST", "/stop")
     elif a.cmd == "dryrun":
         r = call("POST", "/dryrun", {"secs": a.secs})
+    elif a.cmd == "deploy":
+        r = deploy(a.file, a.name)
     elif a.cmd == "ls":
         r = call("GET", "/files?root=" + urllib.parse.quote(a.root))
     else:

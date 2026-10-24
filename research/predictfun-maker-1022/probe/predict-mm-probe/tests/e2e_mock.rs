@@ -444,7 +444,15 @@ async fn e2e_send_against_mock() {
     let resps = kinds(&r.logs, "resp");
     assert!(resps.iter().filter(|x| x["tag"] == "place").all(|x| x["status"] == 200 && x["ratelimit"].is_string() && x["rtt_ms"].as_f64().is_some()));
     // 决策日志带盘口与币安价
-    assert!(kinds(&r.logs, "decision").iter().any(|d| d["action"] == "place" && d["ctx"]["bn_mid"].as_f64().is_some() && d["ctx"]["queue_ahead"].as_f64().is_some()));
+    let placed: Vec<Value> = kinds(&r.logs, "decision").into_iter().filter(|d| d["action"] == "place").map(|d| d["ctx"].clone()).collect();
+    assert!(
+        placed.iter().any(|c| c["bn_mid"].as_f64().is_some() && c["queue_ahead"].as_f64().is_some()),
+        "挂单决策的上下文: {placed:?};日志里各类行数: {:?}",
+        r.logs.iter().fold(std::collections::BTreeMap::<String, usize>::new(), |mut m, l| {
+            *m.entry(l["kind"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+            m
+        })
+    );
     // 凭证绝不出现在日志 / 输出里
     for secret in [API_KEY, JWT, signer.private_key_hex_for_tests().trim_start_matches("0x")] {
         assert!(!r.all_logs.contains(secret), "日志泄露凭证");
@@ -534,4 +542,32 @@ async fn long_run_dry() {
 #[ignore]
 async fn long_run_send() {
     long_run(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_stale_round_in_ledger_gets_resolved_at_start() {
+    // 账本跨次运行:上一次已收盘、没查到结果的轮,启动时去查,查到就结掉(不再按最坏结果占额度)
+    let s: S = Arc::new(Mutex::new(State::default()));
+    let now = predict_mm_probe::jsonlog::wall_ms();
+    let start_s = (now / 1000 - 3600) / 300 * 300;
+    let id = market_id(start_s);
+    s.lock().unwrap().market_start.insert(id, start_s);
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state_live.json");
+    std::fs::write(
+        &state,
+        json!({"open": [{"market_id": id, "start_ms": start_s * 1000, "end_ms": start_s * 1000 + 300_000, "up_shares": 10.0, "down_shares": 4.0, "cost_usd": 7.0, "fills": 3}],
+               "realized_by_day": {"2026-10-24": -37.01}, "realized_total": -37.01, "settled": [], "halted": "当日亏损 30.14 ≥ 30.00", "day_offset_hours": 0})
+        .to_string(),
+    )
+    .unwrap();
+    let signer = OrderSigner::random(None).unwrap();
+    let r = run_probe(&s, false, &["--state-file", state.to_str().unwrap(), "--max-daily-loss-usd", "100", "--max-total-loss-usd", "100"], 6, &signer, "").await;
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let settle = kinds(&r.logs, "settle");
+    let st = settle.iter().find(|x| x["market_id"] == id).unwrap_or_else(|| panic!("没结掉上次那一轮: {settle:?}"));
+    assert!((st["pnl"].as_f64().unwrap() - 3.0).abs() < 1e-9, "Up 赢:10 − 7 = 3,{st:?}");
+    let ledger = &kinds(&r.logs, "exit")[0]["ledger"];
+    assert!(ledger["open"].as_array().unwrap().iter().all(|r| r["market_id"] != id));
+    assert!((ledger["realized_total"].as_f64().unwrap() - (-34.01)).abs() < 1e-9, "{ledger:?}");
 }

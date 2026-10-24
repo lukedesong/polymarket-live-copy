@@ -43,13 +43,15 @@ class T(unittest.TestCase):
         os.makedirs(os.path.join(self.h, "probe"))
         os.makedirs(os.path.join(self.h, "pflat"))
         open(os.path.join(self.h, "pflat", ".env"), "w").write("PREDICT_API_KEY=k\nPREDICT_PRIVATE_KEY=0xabc\nPREDICT_ACCOUNT_ADDRESS=0xdef\n")
-        self.bin = os.path.join(self.h, "probe", "predict-mm-probe.v3")
+        self.bin = os.path.join(self.h, "probe", "predict-mm-probe.v4")
         # 假探针:记下参数和 PREDICT_* 变量个数,然后以自己的路径为 argv0 睡着(和真探针一样能被 pgrep 找到)
-        open(self.bin, "w").write('#!/bin/bash\necho "$@" > "%s/args"\nenv | grep -c ^PREDICT_ > "%s/nenv"\nexec -a "$0" sleep 120\n' % (self.h, self.h))
+        open(self.bin, "w").write('#!/bin/bash\n[ "$1" = --version ] && { echo "predict-mm-probe 0.4.0"; exit 0; }\necho "$@" > "%s/args"\nenv | grep -c ^PREDICT_ > "%s/nenv"\nexec -a "$0" sleep 120\n' % (self.h, self.h))
         os.chmod(self.bin, 0o755)
+        os.symlink(self.bin, os.path.join(self.h, "probe", "predict-mm-probe.current"))
+        self.state = os.path.join(self.h, "probe", "state_live.json")
 
     def tearDown(self):
-        subprocess.run(["pkill", "-f", "^" + self.bin])
+        subprocess.run(["pkill", "-f", "^" + os.path.join(self.h, "probe", "predict-mm-probe")])
 
     def run_live(self, **env):
         e = dict(os.environ, PROBE_HOME_DIR=self.h, PROBE_RPC="http://127.0.0.1:%d" % self.srv.server_address[1], **env)
@@ -88,6 +90,39 @@ class T(unittest.TestCase):
         r2 = self.run_live(PROBE_ROUNDS="3")
         self.assertNotEqual(r2.returncode, 0)
         self.assertEqual(os.path.realpath(os.path.join(self.h, "probe_live3")), live, "被拒的启动不能改软链")
+
+    def test_cumulative_ledger(self):
+        RPC.balance = 391.91
+        r = self.run_live(PROBE_LOSS="100", PROBE_ROUNDS="3")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        a = self.args()
+        self.assertEqual(a["--state-file"], self.state, "账本固定一个文件,跨次累计")
+        self.assertIn("--clear-halt", open(os.path.join(self.h, "args")).read())
+        d = json.load(open(self.state))
+        self.assertAlmostEqual(d["realized_total"], -37.01, msg="第一次:记入之前已亏的 37.01")
+        live = os.path.realpath(os.path.join(self.h, "probe_live3"))
+        self.assertTrue(os.path.exists(os.path.join(live, "state_at_start.json")))
+        log = open(os.path.join(live, "supervisor.log")).read()
+        self.assertIn("记入之前已亏 $37.01", log)
+        self.assertIn("predict-mm-probe.v4 sha256", log)
+        # 第二次:账本已在,不重置
+        subprocess.run(["pkill", "-f", "^" + os.path.join(self.h, "probe", "predict-mm-probe")])
+        time.sleep(0.5)
+        d["realized_total"] = -50.0
+        json.dump(d, open(self.state, "w"))
+        os.remove(os.path.join(self.h, "args"))
+        r = self.run_live(PROBE_LOSS="100", PROBE_PRIOR_LOSS="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.args()
+        self.assertAlmostEqual(json.load(open(self.state))["realized_total"], -50.0)
+        self.assertIn("累计已实现 -50.00", r.stdout)
+
+    def test_missing_bin_or_bad_prior(self):
+        self.assertNotEqual(self.run_live(PROBE_PRIOR_LOSS="-3").returncode, 0)
+        os.remove(os.path.join(self.h, "probe", "predict-mm-probe.current"))
+        r = self.run_live()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("找不到探针程序", r.stdout)
 
     def test_balance_cap_option(self):
         RPC.balance = 391.91

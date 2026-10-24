@@ -649,6 +649,27 @@ impl Runner {
     }
 
     /// 结算:先 merge(两边都有就合并),等出结果后 redeem 赢的一边。每个链上动作最多发一次交易。
+    fn spawn_stale_resolutions(&self, now_ms: i64) {
+        for r in self.strat.ledger.open.iter().filter(|r| r.end_ms <= now_ms) {
+            let (api, tx, log, market_id) = (self.api.clone(), self.ev_tx.clone(), self.log.clone(), r.market_id);
+            log.ev("info", json!({"msg": "账本里有上次没结算的轮,查结果", "market_id": market_id, "position": r}));
+            tokio::spawn(async move {
+                for i in 0..120 {
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    if let Ok(d) = api.market(market_id).await {
+                        if let Some((pu, pd)) = parse_resolution(&d) {
+                            let _ = tx.send(Ev::Resolved { market_id, payout_up: pu, payout_down: pd });
+                            return;
+                        }
+                    }
+                }
+                log.ev("warn", json!({"market_id": market_id, "msg": "2 小时内没查到上次那一轮的结算结果;账本继续按最坏结果估值"}));
+            });
+        }
+    }
+
     fn spawn_settlement(&self, market_id: u64, pos: Option<crate::risk::RoundPos>) {
         let Some(info) = self.markets.get(&market_id).cloned() else { return };
         let (api, tx, log, chain, send) = (self.api.clone(), self.ev_tx.clone(), self.log.clone(), self.chain.clone(), self.send);
@@ -941,6 +962,8 @@ async fn run_inner(cli: Cli, creds: Creds, send: bool, log: Log) -> Result<i32> 
     };
     let acts = r.with_rl(|s, rl| s.set_ready(now(), rl));
     r.exec(acts);
+    // 账本是跨次运行的:上一次已收盘、还没查到结果的轮,现在查(否则一直按最坏结果占着亏损和资金额度)
+    r.spawn_stale_resolutions(now().wall_ms);
 
     let deadline = (r.cli.duration_s > 0).then(|| tokio::time::Instant::now() + Duration::from_secs(r.cli.duration_s));
     let mut tick = tokio::time::interval(Duration::from_millis(50));

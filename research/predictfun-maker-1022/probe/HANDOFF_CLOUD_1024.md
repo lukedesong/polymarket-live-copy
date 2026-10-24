@@ -30,6 +30,8 @@
 - ⛔ **录制器 `pfrec5.py`**(PID 会变,`pgrep -af pfrec5`):一直录 Predict 盘口,Luke 明确不允许停,也不准重启或改它。开机自启单元 `pfrec5-boot`。参数 14 天,约 11-06 06:45 UTC 正常退出,到时需要重启。
 - ⛔ **凭证 `~/pflat/.env`**(PREDICT_API_KEY / PREDICT_PRIVATE_KEY / PREDICT_ACCOUNT_ADDRESS,chmod 600):永远不 cat、不打印、不复制出机器、不写进日志或命令行。探针由启动脚本从这里读。
 - 探针程序:`~/probe/predict-mm-probe.v3`(sha256 前 16 位 5a75bb9ec088990a)。旧版 `predict-mm-probe`、`predict-mm-probe.v1` 不再用。
+  - 10-24 晚起:v4(静态链接)经网关 `/deploy/install` 安装,`~/probe/predict-mm-probe.current` 指向当前版本,`tokyo_live.sh` 与空跑默认用它。
+    校验码登记在 `probe/bin/SHA256SUMS`。亏损上限改为跨次累计,账本 `~/probe/state_live.json`(首次记入之前已亏 $37.01)。
 - 启动脚本:`~/probe/tokyo_live.sh`(本分支 `probe/tokyo_live.sh` 同一份)。
 - 日志:
   - 本次运行:`~/probe_live3` → 软链到 `~/probe_live3_<月日_时分>/`,里面有 `probe_*.jsonl.gz`、`state.json`、`supervisor.log`、`probe.out`。
