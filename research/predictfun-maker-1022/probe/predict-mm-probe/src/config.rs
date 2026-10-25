@@ -168,6 +168,7 @@ impl Cli {
             cooldown_ms: self.cooldown_s * 1000,
             ack_timeout_ms: self.ack_timeout_ms,
             max_cooldowns_per_hour: self.max_cooldowns_per_hour,
+            ..Params::default()
         }
     }
 

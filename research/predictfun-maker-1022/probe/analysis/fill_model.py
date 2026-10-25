@@ -32,7 +32,7 @@ VISIBLE_MS = 70         # 我们的单出现在 / 消失于盘口推送的延迟
 def simulate(shares, t0, t1, ahead0, events, mode):
     """events:按时间排好的 [(t, "fill", q) | (t, "book", 该档量(已扣掉被测单自己))]。返回 [(t, q)] 我们的成交"""
     ahead, behind, rem = ahead0, 0.0, float(shares)
-    prev, fsince, out = None, 0.0, []
+    prev, fsince, fsince_t, out = None, 0.0, 0, []
     for t, kind, x in events:
         if t < t0 or t > t1 or rem <= 1e-9:
             if kind == "book" and t < t0:
@@ -40,6 +40,7 @@ def simulate(shares, t0, t1, ahead0, events, mode):
             continue
         if kind == "fill":
             fsince += x
+            fsince_t = t
             take = min(x, ahead)
             ahead -= take
             rest = x - take
@@ -53,7 +54,8 @@ def simulate(shares, t0, t1, ahead0, events, mode):
             if d > 0:
                 behind += d
             elif d < 0:
-                c = max(0.0, -d - fsince)  # 撤单量 = 减少量 − 这段时间的成交
+                c = max(0.0, -d - fsince)  # 撤单量 = 减少量 − 还没在盘口体现的成交
+                fsince = max(0.0, fsince + d)  # 成交可能比盘口早一帧或几帧:抵掉的部分扣除,剩余留到后面的减少
                 if mode == "pess":
                     behind = max(0.0, behind - c)
                 elif mode == "mixed":
@@ -70,7 +72,9 @@ def simulate(shares, t0, t1, ahead0, events, mode):
                     ahead -= ca
                     behind = max(0.0, behind - (c - ca))
             ahead = min(ahead, max(0.0, x))  # 前面的量不会超过盘口上这一档的量
-        prev, fsince = x, 0.0
+        prev = x
+        if fsince > 0 and t - fsince_t > 2000:  # 2 秒内盘口没体现的成交作废
+            fsince = 0.0
     return out
 
 

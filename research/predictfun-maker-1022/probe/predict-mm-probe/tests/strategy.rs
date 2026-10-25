@@ -814,3 +814,97 @@ fn aligned_fill_during_cancel_in_flight_is_bounded_and_completed() {
     // Down 挂着的那张(3 股)正好补齐
     assert!(sim.live_order(QSide::DownBid).is_some());
 }
+
+// ---------- v7(DESIGN_v7_1025.md)----------
+fn v7p() -> Params {
+    Params { aligned: false, v7: true, ..Params::default() }
+}
+
+/// v7 场景:开盘价 K=80000,现货在 80000±5 来回 70 秒(σ 有效),永续同价;盘口 Up 0.50/0.52。期间产生的挂单都回报成功
+fn v7_ready() -> (Sim, Vec<Action>) {
+    let mut sim = Sim::new(v7p(), Ledger::default());
+    sim.s.set_strike(MKT, 80000.0);
+    let now = sim.now;
+    sim.s.on_perp(now, 80000.0, &mut sim.rl);
+    let mut all = vec![];
+    let a = sim.line("pf", &pf(&[(0.5, 80.0), (0.49, 50.0)], &[(0.52, 30.0), (0.53, 20.0)]));
+    all.extend(a.clone());
+    sim.ack_all(&a);
+    for k in 0..70 {
+        sim.advance(1_000);
+        let m = if k % 2 == 0 { 80005.0 } else { 79995.0 };
+        let mut a = sim.line("bn", &bn(m));
+        let now = sim.now;
+        a.extend(sim.s.on_perp(now, m, &mut sim.rl));
+        sim.advance(35);
+        sim.ack_all(&a);
+        all.extend(a);
+    }
+    (sim, all)
+}
+
+#[test]
+fn v7_norm_cdf() {
+    assert!((norm_cdf(0.0) - 0.5).abs() < 1e-7);
+    assert!((norm_cdf(1.0) - 0.841344746).abs() < 1e-6);
+    assert!((norm_cdf(-1.96) - 0.0249979).abs() < 1e-6);
+}
+
+#[test]
+fn v7_quotes_below_safe_line_after_500ms_and_holds() {
+    let (mut sim, all) = v7_ready();
+    // 第一次挂单发生在 σ 有效(≥60 秒)且安全满 500ms 之后
+    let first = all.iter().filter(|x| matches!(x, Action::Place { .. })).count();
+    assert!(first >= 2, "两侧都应挂上: {all:?}");
+    let now = sim.now;
+    let (oid, up) = sim.live_order(QSide::UpBid).expect("Up 在挂");
+    let (_, dn) = sim.live_order(QSide::DownBid).expect("Down 在挂");
+    assert!((45..50).contains(&up), "up={up}");
+    assert!((43..48).contains(&dn), "dn={dn}");
+    let sl = sim.s.v7_safe_line(QSide::UpBid, now).unwrap();
+    assert!((up as f64) <= sl + 1e-9, "挂着的单仍在安全线以内: {up} vs {sl}");
+    // 小幅波动(现货 ±1)不撤、不改价
+    sim.advance(200);
+    let a = sim.line("bn", &bn(80001.0));
+    assert!(cancels(&a).is_empty(), "安全范围内不应撤: {a:?}");
+    assert_eq!(sim.live_order(QSide::UpBid).map(|x| x.0), Some(oid));
+}
+
+#[test]
+fn v7_perp_drop_cancels_up_immediately() {
+    let (mut sim, _) = v7_ready();
+    assert!(sim.live_order(QSide::UpBid).is_some());
+    // 永续先跌 5bp(现货还没动):Up 公允价立刻变保守 → 这张单不再安全 → 立刻撤
+    let now = sim.now;
+    let a = sim.s.on_perp(now, 80000.0 * (1.0 - 5e-4), &mut sim.rl);
+    let c = cancels(&a);
+    assert!(c.iter().any(|x| x.0 == QSide::UpBid && x.1.contains("不再安全")), "{a:?}");
+    // Down 一侧对永续下跌是有利的,不撤
+    assert!(c.iter().all(|x| x.0 != QSide::DownBid), "{a:?}");
+}
+
+#[test]
+fn v7_filled_side_stops_until_other_side_fills() {
+    let (mut sim, _) = v7_ready();
+    let (oid, _) = sim.live_order(QSide::UpBid).unwrap();
+    let sh = sim.s.order_by_id(&oid).unwrap().shares as f64;
+    sim.advance(300);
+    let (_, a) = sim.s.on_fill(sim.now, &oid, sh, &mut sim.rl);
+    // Up 有没配上的成交 → 不再挂 Up(一张小单上限)
+    assert!(places(&a).iter().all(|x| x.0 != QSide::UpBid), "{a:?}");
+    sim.advance(1_000);
+    let a = sim.tick();
+    assert!(places(&a).iter().all(|x| x.0 != QSide::UpBid), "{a:?}");
+    assert!(sim.live_order(QSide::DownBid).is_some(), "另一边照常挂着");
+}
+
+#[test]
+fn v7_no_quote_without_strike_or_sigma() {
+    let mut sim = Sim::new(v7p(), Ledger::default());
+    sim.line("pf", &pf(&[(0.5, 80.0)], &[(0.52, 30.0)]));
+    sim.line("bn", &bn(80000.0));
+    let now = sim.now;
+    assert!(sim.s.v7_quote(QSide::UpBid, now).is_none(), "没有开盘价/σ 不挂");
+    sim.advance(600);
+    assert!(places(&sim.tick()).is_empty());
+}

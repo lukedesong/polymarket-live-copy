@@ -29,7 +29,7 @@ fn round(payout_up: f64) -> RoundData {
     ev.push(DataEv::Fill(S0 + 10_000, MKT, QSide::UpBid, 50, 79.0));
     ev.push(DataEv::Fill(S0 + 10_500, MKT, QSide::UpBid, 50, 5.0));
     ev.sort_by_key(|e| e.t());
-    RoundData { market_id: MKT, start_ms: S0, end_ms: S0 + 300_000, payout_up: Some(payout_up), events: ev }
+    RoundData { market_id: MKT, start_ms: S0, end_ms: S0 + 300_000, payout_up: Some(payout_up), strike: None, events: ev }
 }
 
 #[test]
@@ -93,4 +93,28 @@ fn post_only_cross_is_rejected() {
     let rs = Engine::new(p, ReplayCfg::default()).run(vec![r]);
     assert!(rs[0].rejects >= 1, "{:?}", rs[0]);
     assert_eq!(rs[0].up_shares, 0.0);
+}
+
+#[test]
+fn fill_then_book_decrease_is_not_double_counted() {
+    // 成交(撮合时刻)先到、随后的盘口推送显示同一档减少同样的量:减少量应全部记为成交,不再当撤单让我们前进。
+    // 前面 80 股;成交 40 → 前面剩 40;再成交 41 → 我们只拿到 1 股(重复计数的话前面会被清零,拿到 2 股)
+    let p = Params { aligned: false, ..Params::default() };
+    let mut ev = vec![];
+    let mut t = S0 - 90_000;
+    while t < S0 + 300_000 {
+        let lvl = if t <= S0 + 10_000 { 80.0 } else if t <= S0 + 20_000 { 40.0 } else { 40.0 };
+        ev.push(DataEv::Book(t, book(&[(0.50, lvl)], &[(0.55, 30.0)])));
+        ev.push(DataEv::Binance(t, 80_000.0));
+        t += 100;
+    }
+    ev.push(DataEv::Fill(S0 + 10_000 - 1, MKT, QSide::UpBid, 50, 40.0));
+    ev.push(DataEv::Fill(S0 + 20_000, MKT, QSide::UpBid, 50, 41.0));
+    ev.sort_by_key(|e| e.t());
+    for mode in [CancelMode::Opt, CancelMode::Prop] {
+        let r = RoundData { market_id: MKT, start_ms: S0, end_ms: S0 + 300_000, payout_up: Some(1.0), strike: None, events: ev.clone() };
+        let cfg = ReplayCfg { cancel_mode: mode, ..ReplayCfg::default() };
+        let rs = Engine::new(p.clone(), cfg).run(vec![r]);
+        assert!((rs[0].up_shares - 1.0).abs() < 1e-9, "{mode:?}: {:?}", rs[0]);
+    }
 }

@@ -82,6 +82,14 @@ pub struct Params {
     pub cooldown_ms: u64,
     pub ack_timeout_ms: u64,
     pub max_cooldowns_per_hour: usize,
+    /// v7(10-25 Luke 打法,DESIGN_v7_1025.md):按公允价减安全边际挂深档、只在这张单不再安全时撤、永续最早估算公允价
+    pub v7: bool,
+    pub v7_z: f64,
+    pub v7_tr_ms: f64,
+    pub v7_max_margin: f64,
+    pub v7_max_depth_cents: u32,
+    pub v7_repost_ms: u64,
+    pub v7_min_sigma_secs: usize,
 }
 
 impl Default for Params {
@@ -106,6 +114,13 @@ impl Default for Params {
             cooldown_ms: 60_000,
             ack_timeout_ms: 5_000,
             max_cooldowns_per_hour: 5,
+            v7: false,
+            v7_z: 3.0,
+            v7_tr_ms: 40.0,
+            v7_max_margin: 0.25,
+            v7_max_depth_cents: 5,
+            v7_repost_ms: 500,
+            v7_min_sigma_secs: 60,
         }
     }
 }
@@ -234,6 +249,16 @@ pub struct Strategy {
     pub ledger_dirty: bool,
     /// 不在槽位里、又必须撤的单(迟到回报),限额不够时留到下次重试
     orphans: Vec<(u64, QSide, String, String)>,
+    /// v7:本轮开盘价 K(market_id, 价)
+    strike: Option<(u64, f64)>,
+    /// v7:币安现货中间价按秒(秒, 该秒最后一个中间价),最多 301 秒
+    spot_secs: VecDeque<(i64, f64)>,
+    spot_mid: Option<f64>,
+    perp_mid: Option<f64>,
+    /// v7:基差 = 现货/永续 中间价之比的指数平滑(时间常数 2 秒,在每次现货更新时更新);永续价 × 基差 = 永续换算的现货价
+    basis: Option<(i64, f64)>,
+    /// v7:每侧"按规则可挂且安全"连续成立的起点(mono_ns,0 = 不成立)
+    safe_since: [u64; 2],
 }
 
 impl Strategy {
@@ -263,6 +288,12 @@ impl Strategy {
             last_note: [None, None],
             ledger_dirty: false,
             orphans: vec![],
+            strike: None,
+            spot_secs: VecDeque::new(),
+            spot_mid: None,
+            perp_mid: None,
+            basis: None,
+            safe_since: [0, 0],
         }
     }
 
@@ -340,8 +371,43 @@ impl Strategy {
         self.decide(now, rl)
     }
 
+    /// v7:本轮开盘价(平台 startPrice)
+    pub fn set_strike(&mut self, market_id: u64, k: f64) {
+        self.strike = Some((market_id, k));
+    }
+
+    /// v7:币安永续中间价
+    pub fn on_perp(&mut self, now: Now, mid: f64, rl: &mut RateLimiter) -> Vec<Action> {
+        self.feed_msg(now, Feed::Binance);
+        self.perp_mid = Some(mid);
+        if !self.p.v7 {
+            return vec![];
+        }
+        self.decide(now, rl)
+    }
+
     pub fn on_binance(&mut self, now: Now, mid: f64, rl: &mut RateLimiter) -> Vec<Action> {
         self.feed_msg(now, Feed::Binance);
+        // v7 用:按秒记现货中间价;现货变动时记下当时的永续价
+        let sec = now.wall_ms.div_euclid(1000);
+        match self.spot_secs.back_mut() {
+            Some(x) if x.0 == sec => x.1 = mid,
+            _ => self.spot_secs.push_back((sec, mid)),
+        }
+        while self.spot_secs.front().is_some_and(|x| x.0 < sec - 300) {
+            self.spot_secs.pop_front();
+        }
+        self.spot_mid = Some(mid);
+        if let Some(p) = self.perp_mid.filter(|p| *p > 0.0) {
+            let ratio = mid / p;
+            self.basis = Some(match self.basis {
+                Some((t0, b)) => {
+                    let a = 1.0 - (-((now.wall_ms - t0).max(0) as f64) / 2000.0).exp();
+                    (now.wall_ms, b + a * (ratio - b))
+                }
+                None => (now.wall_ms, ratio),
+            });
+        }
         let w = self.p.bn_window_ms * 1_000_000;
         self.bn.push_back((now.mono_ns, mid));
         while let Some(&(t, _)) = self.bn.front() {
@@ -747,6 +813,88 @@ impl Strategy {
         }
     }
 
+    /// v7:币安现货每秒对数收益的标准差(零均值;秒间有空档时按 √间隔 折算);样本秒数不足返回 None
+    fn v7_sigma(&self) -> Option<f64> {
+        if self.spot_secs.len() < self.p.v7_min_sigma_secs.max(2) {
+            return None;
+        }
+        let mut ss = 0.0;
+        let mut n = 0usize;
+        for w in self.spot_secs.iter().collect::<Vec<_>>().windows(2) {
+            let dt = (w[1].0 - w[0].0) as f64;
+            if dt <= 0.0 || w[0].1 <= 0.0 {
+                continue;
+            }
+            let r = (w[1].1 / w[0].1).ln() / dt.sqrt();
+            ss += r * r;
+            n += 1;
+        }
+        (n >= 2).then(|| (ss / n as f64).sqrt()).filter(|x| *x > 0.0)
+    }
+
+    /// v7 安全线(分):锚 − 边际。锚 = min(公允价, 盘口中间价)(按这一侧算);边际 = z·φ(d)·√(T_r/τ)。
+    /// 公允价 = Φ(ln(S/K)/(σ√τ));S 取现货与"永续外推现货"中对这一侧更不利的。缺数据/边际超上限返回 None
+    pub fn v7_safe_line(&self, side: QSide, now: Now) -> Option<f64> {
+        let r = self.round.as_ref()?;
+        let (km, k) = self.strike?;
+        if km != r.market_id || k <= 0.0 {
+            return None;
+        }
+        let spot = self.spot_mid?;
+        let s_perp = match (self.perp_mid, self.basis) {
+            (Some(p), Some((_, b))) => p * b,
+            _ => spot,
+        };
+        let tau = (r.end_ms - now.wall_ms) as f64 / 1000.0;
+        if tau <= 0.0 {
+            return None;
+        }
+        let sig = self.v7_sigma()?;
+        let s = match side {
+            QSide::UpBid => spot.min(s_perp),
+            QSide::DownBid => spot.max(s_perp),
+        };
+        let d = (s / k).ln() / (sig * tau.sqrt());
+        let fair_up = norm_cdf(d);
+        let fair = match side {
+            QSide::UpBid => fair_up,
+            QSide::DownBid => 1.0 - fair_up,
+        };
+        let b = self.book.as_ref()?;
+        let (bb, ba) = (b.best_bid_cents()? as f64 / 100.0, b.best_ask_cents()? as f64 / 100.0);
+        let mid_up = (bb + ba) / 2.0;
+        let mid = match side {
+            QSide::UpBid => mid_up,
+            QSide::DownBid => 1.0 - mid_up,
+        };
+        let anchor = fair.min(mid);
+        let phi = (-0.5 * d * d).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let m = self.p.v7_z * phi * (self.p.v7_tr_ms / 1000.0 / tau).sqrt();
+        if !m.is_finite() || m > self.p.v7_max_margin {
+            return None;
+        }
+        Some((anchor - m) * 100.0)
+    }
+
+    /// v7 挂单价(分):floor(安全线) − 1;须 ≥ 1、低于对手最优价(只挂单)、不比本侧最优价低超过 max_depth
+    pub fn v7_quote(&self, side: QSide, now: Now) -> Option<u32> {
+        let safe = self.v7_safe_line(side, now)?;
+        let px = (safe + 1e-9).floor() as i64 - 1;
+        if px < 1 {
+            return None;
+        }
+        let best = self.target(side)? as i64;
+        let b = self.book.as_ref()?;
+        let opp = match side {
+            QSide::UpBid => b.best_ask_cents()? as i64,
+            QSide::DownBid => 100 - b.best_bid_cents()? as i64,
+        };
+        if px >= opp || px < best - self.p.v7_max_depth_cents as i64 {
+            return None;
+        }
+        Some(px as u32)
+    }
+
     /// 连接异常:返回 (是否禁止新挂, 是否已断 > feed_down_ms)
     fn feed_health(&self, now: Now) -> (bool, Option<String>) {
         let mut bad = false;
@@ -858,7 +1006,7 @@ impl Strategy {
         let cooldown = self.in_cooldown(now);
         let ms_left = self.ms_left(now);
         let inv_block = self.inventory_blocked();
-        let imb = if self.p.aligned { self.imbalance() } else { None };
+        let imb = if self.p.aligned || self.p.v7 { self.imbalance() } else { None };
         // 两边都要挂时用同一个股数:两边各自最低金额要求的股数取大
         let both_shares = QSide::ALL.iter().filter_map(|&s| self.quote_target(s, imb)).map(|c| self.min_shares(c)).max();
         let started = self.round.as_ref().is_some_and(|r| now.wall_ms >= r.start_ms);
@@ -867,7 +1015,7 @@ impl Strategy {
         // 先撤
         for side in QSide::ALL {
             let i = side.idx();
-            let guard = now.mono_ns < self.bn_guard_until[i];
+            let guard = !self.p.v7 && now.mono_ns < self.bn_guard_until[i];
             let keep_reason: Option<String> = if !self.ready {
                 Some("未就绪".into())
             } else if cooldown {
@@ -885,12 +1033,36 @@ impl Strategy {
             } else {
                 None
             };
-            let target = self.quote_target(side, imb);
+            let target = if self.p.v7 { self.v7_quote(side, now) } else { self.quote_target(side, imb) };
+            if self.p.v7 {
+                if target.is_some() {
+                    if self.safe_since[i] == 0 {
+                        self.safe_since[i] = now.mono_ns.max(1);
+                    }
+                } else {
+                    self.safe_since[i] = 0;
+                }
+            }
             if let Slot::Live { cid, order_id, price, placed_ns, want_cancel, .. } = self.slots[i].clone() {
+                let v7_reason = if self.p.v7 {
+                    let safe = self.v7_safe_line(side, now);
+                    let best = self.target(side);
+                    if safe.is_none_or(|sl| price as f64 > sl + 1e-9) {
+                        Some(format!("v7 不再安全 价{price} 安全线{}", safe.map_or("无".into(), |x| format!("{x:.2}"))))
+                    } else if best.is_some_and(|b| (b as i64) - (price as i64) > self.p.v7_max_depth_cents as i64) {
+                        Some(format!("v7 离最优价超过 {} 分", self.p.v7_max_depth_cents))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let reason = if let Some(r) = &keep_reason {
                     Some(r.clone())
                 } else if let Some(r) = want_cancel {
                     Some(r)
+                } else if self.p.v7 {
+                    v7_reason
                 } else if self.p.aligned && imb.is_some_and(|x| x.0 != side) && target.is_none_or(|t| price > t) {
                     // 补齐那一腿:挂价高于补齐价上限(会让这一对超过 $1)立刻撤,不等 1 秒
                     Some(format!("补齐价上限 {price}→{}", target.map_or("无".into(), |t| t.to_string())))
@@ -916,12 +1088,15 @@ impl Strategy {
                     None
                 }
             });
+            let block = block.or_else(|| {
+                (self.p.v7 && now.mono_ns < self.safe_since[i] + self.p.v7_repost_ms * 1_000_000).then(|| "v7 安全未满 500ms".to_string())
+            });
             if let Some(b) = block {
                 acts.extend(self.note(side, b, now));
                 continue;
             }
             let price = target.unwrap();
-            let shares = if !self.p.aligned {
+            let shares = if self.p.v7 || !self.p.aligned {
                 self.min_shares(price)
             } else if let Some((_, sh, _)) = imb {
                 // 补齐:补多出的股数(取整),但不少于平台最低金额要求
@@ -957,6 +1132,7 @@ impl Strategy {
             });
             self.last_note[i] = None;
             let reason = match imb {
+                _ if self.p.v7 => format!("v7 深档 安全线{:.2}", self.v7_safe_line(side, now).unwrap_or(f64::NAN)),
                 Some((h, sh, avg)) if self.p.aligned && h != side => format!("补齐 {sh:.3} 股(多出部分均价 {avg:.3})"),
                 _ if self.p.aligned => "两边同股数挂最优价".into(),
                 _ => "挂最优价".into(),
@@ -965,4 +1141,13 @@ impl Strategy {
         }
         acts
     }
+}
+
+/// 标准正态分布函数(Abramowitz–Stegun 7.1.26 的 erf 近似,误差 < 1.5e-7)
+pub fn norm_cdf(x: f64) -> f64 {
+    let z = x / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.3275911 * z.abs());
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * (-z * z).exp();
+    let erf = if z >= 0.0 { y } else { -y };
+    0.5 * (1.0 + erf)
 }

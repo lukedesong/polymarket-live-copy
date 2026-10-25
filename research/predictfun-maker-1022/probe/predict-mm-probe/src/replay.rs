@@ -68,6 +68,8 @@ impl Default for ReplayCfg {
 pub enum DataEv {
     Book(i64, BookSnapshot),
     Binance(i64, f64),
+    /// 币安永续中间价(v7 用)
+    Perp(i64, f64),
     /// 链上挂单方成交:撮合时刻、市场、队、档位(分)、股数
     Fill(i64, u64, QSide, u32, f64),
 }
@@ -75,7 +77,7 @@ pub enum DataEv {
 impl DataEv {
     pub fn t(&self) -> i64 {
         match self {
-            DataEv::Book(t, _) | DataEv::Binance(t, _) | DataEv::Fill(t, ..) => *t,
+            DataEv::Book(t, _) | DataEv::Binance(t, _) | DataEv::Perp(t, _) | DataEv::Fill(t, ..) => *t,
         }
     }
 }
@@ -87,6 +89,8 @@ pub struct RoundData {
     pub end_ms: i64,
     /// 结果:Up 每股兑付 1 / 0 / 0.5(平局);None = 不知道(不结算,只记持仓)
     pub payout_up: Option<f64>,
+    /// 本轮开盘价(平台 startPrice;v7 公允价用)
+    pub strike: Option<f64>,
     pub events: Vec<DataEv>,
 }
 
@@ -122,9 +126,13 @@ struct VOrder {
     live: bool,
     live_at: i64,
     ahead: f64,
+    /// 挂上那一刻前面的量(诊断用)
+    ahead0: f64,
     behind: f64,
     prev: Option<f64>,
     fsince: f64,
+    /// 最近一次计入 fsince 的成交时刻;盘口 2 秒内没体现这笔成交的减少就作废
+    fsince_t: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -301,6 +309,9 @@ impl Engine {
         let k = self.cur_round.map_or(0, |k| k + 1);
         self.cur_round = Some(k);
         let (m, s, e) = (self.rounds[k].market_id, self.rounds[k].start_ms, self.rounds[k].end_ms);
+        if let Some(kp) = self.rounds[k].strike {
+            self.strat.set_strike(m, kp);
+        }
         let now = self.now();
         let acts = self.with_rl(|st, rl| st.set_round(now, RoundCtx { market_id: m, start_ms: s, end_ms: e }, rl));
         self.exec(acts);
@@ -330,20 +341,30 @@ impl Engine {
                 let acts = self.with_rl(|s, rl| s.on_binance(now, mid, rl));
                 self.exec(acts);
             }
+            DataEv::Perp(_, mid) => {
+                let acts = self.with_rl(|s, rl| s.on_perp(now, mid, rl));
+                self.exec(acts);
+            }
             DataEv::Fill(t, m, qside, level, q) => self.on_chain_fill(t, m, qside, level, q),
         }
     }
 
     fn update_queues_on_book(&mut self, b: &BookSnapshot) {
         let mode = self.cfg.cancel_mode;
+        let now_ms = self.now_ms;
         for o in self.orders.values_mut().filter(|o| o.live && o.market_id == b.market_id && o.rem > 1e-9) {
+            if o.fsince > 0.0 && now_ms - o.fsince_t > 2_000 {
+                o.fsince = 0.0;
+            }
             let x = level_size(b, o.qside, o.level);
             if let Some(prev) = o.prev {
                 let d = x - prev;
                 if d > 0.0 {
                     o.behind += d;
                 } else if d < 0.0 {
+                    // 已知成交先抵掉减少量(成交可能比盘口早一帧或几帧到),剩下的才是撤单
                     let c = (-d - o.fsince).max(0.0);
+                    o.fsince = (o.fsince + d).max(0.0);
                     match mode {
                         CancelMode::Pess => o.behind = (o.behind - c).max(0.0),
                         CancelMode::Mixed => {
@@ -367,7 +388,6 @@ impl Engine {
                 o.ahead = o.ahead.min(x.max(0.0));
             }
             o.prev = Some(x);
-            o.fsince = 0.0;
         }
     }
 
@@ -380,6 +400,7 @@ impl Engine {
         for (_, oid) in ids {
             let o = self.orders.get_mut(&oid).unwrap();
             o.fsince += q;
+            o.fsince_t = t;
             if left <= 1e-9 {
                 continue;
             }
@@ -393,6 +414,15 @@ impl Engine {
                 left -= f;
                 let price = o.level as f64 / 100.0;
                 self.our_fills.entry(m).or_default().push((t, qside, price, f));
+                // 诊断用:REPLAY_FILLS_OUT 设了就逐笔写出(时刻、市场、方向、价、股数、成交时 Up 买一/卖一 分)
+                if let Ok(path) = std::env::var("REPLAY_FILLS_OUT") {
+                    use std::io::Write as _;
+                    let (bb, ba) = self.books.get(&m).map_or((None, None), |b| (b.best_bid_cents(), b.best_ask_cents()));
+                    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                        let side = if qside == QSide::UpBid { "UpBid" } else { "DownBid" };
+                        let _ = writeln!(fh, "{t}\t{m}\t{side}\t{price}\t{f}\t{}\t{}\t{:.2}\t{}", bb.map_or(String::new(), |x| x.to_string()), ba.map_or(String::new(), |x| x.to_string()), o.ahead0, t - o.live_at);
+                    }
+                }
                 notify.push((oid.clone(), (o.filled * 1e9).round() as u64));
             }
         }
@@ -422,6 +452,7 @@ impl Engine {
                 o.live_at = self.now_ms;
                 let x = book.as_ref().map_or(0.0, |b| level_size(b, qside, level));
                 o.ahead = x;
+                o.ahead0 = x;
                 o.prev = Some(x);
             }
             Sched::PlaceAck(oid) => {
@@ -480,9 +511,11 @@ impl Engine {
                             live: false,
                             live_at: 0,
                             ahead: 0.0,
+                            ahead0: 0.0,
                             behind: 0.0,
                             prev: None,
                             fsince: 0.0,
+                            fsince_t: 0,
                         },
                     );
                     if let Some(i) = self.round_idx(market_id) {

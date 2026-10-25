@@ -26,7 +26,10 @@ struct Args {
     exclude: Vec<i64>,
     #[arg(long)]
     out: Option<PathBuf>,
-    /// aligned | independent
+    /// 币安永续 bookTicker 文件(tsv.gz:本机收到 ns、买一、卖一);v7 用
+    #[arg(long)]
+    perp: Option<PathBuf>,
+    /// aligned | independent | v7
     #[arg(long, default_value = "aligned")]
     mode: String,
     #[arg(long, default_value_t = 0)]
@@ -52,7 +55,21 @@ struct Args {
     cancel_mode: String,
 }
 
-fn load_round(dir: &std::path::Path, r: &Value) -> Option<RoundData> {
+fn load_perp(path: &std::path::Path) -> anyhow::Result<Vec<(i64, f64)>> {
+    let f = std::fs::File::open(path)?;
+    let mut v = vec![];
+    for line in BufReader::new(GzDecoder::new(f)).lines() {
+        let line = line?;
+        let mut it = line.split('\t');
+        let (Some(ns), Some(b), Some(a)) = (it.next(), it.next(), it.next()) else { continue };
+        let (Ok(ns), Ok(b), Ok(a)) = (ns.parse::<i64>(), b.parse::<f64>(), a.parse::<f64>()) else { continue };
+        v.push((ns / 1_000_000, (b + a) / 2.0));
+    }
+    v.sort_by_key(|x| x.0);
+    Ok(v)
+}
+
+fn load_round(dir: &std::path::Path, r: &Value, perp: &[(i64, f64)]) -> Option<RoundData> {
     let mut events = vec![];
     for p in r["parts"].as_array()? {
         let f = std::fs::File::open(dir.join(p.as_str()?)).ok()?;
@@ -82,13 +99,25 @@ fn load_round(dir: &std::path::Path, r: &Value) -> Option<RoundData> {
             }
         }
     }
-    events.sort_by_key(|e| e.t());
     let s = r["start_s"].as_i64()?;
-    Some(RoundData { market_id: r["market_id"].as_u64()?, start_ms: s * 1000, end_ms: (s + 300) * 1000, payout_up: r["payout_up"].as_f64(), events })
+    // 永续:本轮 [开盘, 收盘) 内的(每条只进一轮,避免重复)
+    let (t0, t1) = (s * 1000, (s + 300) * 1000);
+    let i0 = perp.partition_point(|x| x.0 < t0);
+    let i1 = perp.partition_point(|x| x.0 < t1);
+    events.extend(perp[i0..i1].iter().map(|&(t, m)| DataEv::Perp(t, m)));
+    events.sort_by_key(|e| e.t());
+    Some(RoundData { market_id: r["market_id"].as_u64()?, start_ms: t0, end_ms: t1, payout_up: r["payout_up"].as_f64(), strike: r["start_price"].as_f64(), events })
 }
 
 fn main() -> anyhow::Result<()> {
     let a = Args::parse();
+    let perp = match &a.perp {
+        Some(p) => load_perp(p)?,
+        None => vec![],
+    };
+    if a.mode == "v7" && perp.is_empty() {
+        anyhow::bail!("v7 需要 --perp 永续数据");
+    }
     let rounds: Vec<Value> = serde_json::from_reader(std::fs::File::open(a.data.join("rounds.json"))?)?;
     let sel: Vec<&Value> = rounds
         .iter()
@@ -99,6 +128,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let params = Params {
         aligned: a.mode == "aligned",
+        v7: a.mode == "v7",
         reprice_min_age_ms: a.reprice_min_age_ms,
         inventory_cap_usd: a.inventory_cap_usd,
         gross_cap_usd: a.gross_cap_usd,
@@ -129,7 +159,7 @@ fn main() -> anyhow::Result<()> {
     }
     let mut all: Vec<RoundResult> = vec![];
     for g in segs {
-        let data: Vec<RoundData> = g.iter().filter_map(|r| load_round(&a.data, r)).collect();
+        let data: Vec<RoundData> = g.iter().filter_map(|r| load_round(&a.data, r, &perp)).collect();
         all.extend(Engine::new(params.clone(), cfg.clone()).run(data));
     }
     let mut w: Box<dyn Write> = match &a.out {
