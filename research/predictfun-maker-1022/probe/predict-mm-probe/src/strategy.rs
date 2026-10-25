@@ -259,6 +259,11 @@ pub struct Strategy {
     basis: Option<(i64, f64)>,
     /// v7:每侧"按规则可挂且安全"连续成立的起点(mono_ns,0 = 不成立)
     safe_since: [u64; 2],
+    /// v7:safe_since 以来安全线的最小值(分);挂单价不得高于 floor(它) − 1(R7 严格口径)
+    safe_min: [f64; 2],
+    /// 诊断计数(回测报告用):限速推迟的挂单次数、R8 一张小单上限被突破的次数
+    pub rl_deferred: u64,
+    pub r8_violations: u64,
 }
 
 impl Strategy {
@@ -294,6 +299,9 @@ impl Strategy {
             perp_mid: None,
             basis: None,
             safe_since: [0, 0],
+            safe_min: [f64::INFINITY, f64::INFINITY],
+            rl_deferred: 0,
+            r8_violations: 0,
         }
     }
 
@@ -576,6 +584,16 @@ impl Strategy {
         }
         self.ledger.apply_fill(market_id, qside.outcome(), delta, price as f64 / 100.0);
         self.ledger_dirty = true;
+        if self.p.v7 {
+            // R8:没配上的股数超过一张最小单的股数(按这一侧成交价算)→ 记一次违规
+            if let Some((h, sh, avg)) = self.imbalance() {
+                let one = self.min_shares(((avg * 100.0).round() as u32).max(1)) as f64;
+                if sh > one + 1e-6 {
+                    self.r8_violations += 1;
+                    let _ = h;
+                }
+            }
+        }
         (delta, self.decide(now, rl))
     }
 
@@ -1038,9 +1056,14 @@ impl Strategy {
                 if target.is_some() {
                     if self.safe_since[i] == 0 {
                         self.safe_since[i] = now.mono_ns.max(1);
+                        self.safe_min[i] = f64::INFINITY;
+                    }
+                    if let Some(sl) = self.v7_safe_line(side, now) {
+                        self.safe_min[i] = self.safe_min[i].min(sl);
                     }
                 } else {
                     self.safe_since[i] = 0;
+                    self.safe_min[i] = f64::INFINITY;
                 }
             }
             if let Slot::Live { cid, order_id, price, placed_ns, want_cancel, .. } = self.slots[i].clone() {
@@ -1072,6 +1095,11 @@ impl Strategy {
                     None
                 };
                 if let Some(r) = reason {
+                    if self.p.v7 {
+                        // R7:任何撤单后重新计"连续 500ms 安全"
+                        self.safe_since[i] = 0;
+                        self.safe_min[i] = f64::INFINITY;
+                    }
                     acts.extend(self.issue_cancel(now, cid, side, order_id, r, rl));
                 }
             }
@@ -1095,7 +1123,15 @@ impl Strategy {
                 acts.extend(self.note(side, b, now));
                 continue;
             }
-            let price = target.unwrap();
+            let mut price = target.unwrap();
+            if self.p.v7 && self.safe_min[i].is_finite() {
+                let cap = (self.safe_min[i] + 1e-9).floor() as i64 - 1;
+                if cap < 1 {
+                    acts.extend(self.note(side, "v7 500ms 内最低安全线太低".into(), now));
+                    continue;
+                }
+                price = price.min(cap as u32);
+            }
             let shares = if self.p.v7 || !self.p.aligned {
                 self.min_shares(price)
             } else if let Some((_, sh, _)) = imb {
@@ -1114,6 +1150,7 @@ impl Strategy {
                 continue;
             }
             if !rl.try_acquire(now.mono_ns, Priority::Place) {
+                self.rl_deferred += 1;
                 acts.extend(self.note(side, "限额预算不足,暂缓新挂".into(), now));
                 continue;
             }

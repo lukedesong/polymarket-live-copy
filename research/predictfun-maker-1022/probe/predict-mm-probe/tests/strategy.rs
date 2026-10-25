@@ -908,3 +908,27 @@ fn v7_no_quote_without_strike_or_sigma() {
     sim.advance(600);
     assert!(places(&sim.tick()).is_empty());
 }
+
+#[test]
+fn v7_no_repost_within_500ms_after_unsafe_cancel() {
+    let (mut sim, _) = v7_ready();
+    let now = sim.now;
+    let a = sim.s.on_perp(now, 80000.0 * (1.0 - 2.5e-4), &mut sim.rl);
+    assert!(cancels(&a).iter().any(|x| x.0 == QSide::UpBid), "{a:?}");
+    sim.advance(30);
+    let b = sim.ack_all(&a);
+    assert!(places(&b).iter().all(|x| x.0 != QSide::UpBid), "撤单回报后不应立刻重挂: {b:?}");
+    for _ in 0..4 {
+        sim.advance(100);
+        let now = sim.now;
+        let a = sim.s.on_perp(now, 80000.0 * (1.0 - 2.5e-4), &mut sim.rl);
+        assert!(places(&a).iter().all(|x| x.0 != QSide::UpBid), "500ms 内不应重挂: {a:?}");
+    }
+    sim.advance(200);
+    let a = sim.tick();
+    if let Some(p) = places(&a).iter().find(|x| x.0 == QSide::UpBid) {
+        let now = sim.now;
+        let sl = sim.s.v7_safe_line(QSide::UpBid, now).unwrap();
+        assert!((p.1 as f64) <= sl - 1.0 + 1e-9, "重挂价在安全线以下: {p:?} {sl}");
+    }
+}

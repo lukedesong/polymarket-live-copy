@@ -104,6 +104,20 @@ fn load_round(dir: &std::path::Path, r: &Value, perp: &[(i64, f64)]) -> Option<R
     let (t0, t1) = (s * 1000, (s + 300) * 1000);
     let i0 = perp.partition_point(|x| x.0 < t0);
     let i1 = perp.partition_point(|x| x.0 < t1);
+    // 永续覆盖检查:有永续数据时,本轮内最大空档 > 10 秒(含开盘/收盘两端)就跳过这一轮并报出(不悄悄退回只用现货)
+    if !perp.is_empty() {
+        let mut last = t0;
+        let mut gap = 0;
+        for &(t, _) in &perp[i0..i1] {
+            gap = gap.max(t - last);
+            last = t;
+        }
+        gap = gap.max(t1 - last);
+        if gap > 10_000 {
+            eprintln!("跳过 {s}:永续最大空档 {gap}ms");
+            return None;
+        }
+    }
     events.extend(perp[i0..i1].iter().map(|&(t, m)| DataEv::Perp(t, m)));
     events.sort_by_key(|e| e.t());
     Some(RoundData { market_id: r["market_id"].as_u64()?, start_ms: t0, end_ms: t1, payout_up: r["payout_up"].as_f64(), strike: r["start_price"].as_f64(), events })
@@ -166,11 +180,11 @@ fn main() -> anyhow::Result<()> {
         Some(p) => Box::new(std::fs::File::create(p)?),
         None => Box::new(std::io::sink()),
     };
-    writeln!(w, "start_s\tmarket_id\tpayout_up\tplaces\tcancels\trejects\tfills\tup_shares\tdown_shares\tcost\tpairs\tpair_cost\tunpaired\tpnl\thalted")?;
+    writeln!(w, "start_s\tmarket_id\tpayout_up\tplaces\tcancels\trejects\tfills\tup_shares\tdown_shares\tcost\tpairs\tpair_cost\tunpaired\tpnl\thalted\trl_deferred_cum\tr8_violations_cum")?;
     for r in &all {
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
             r.start_ms / 1000,
             r.market_id,
             r.payout_up.map_or(String::new(), |x| x.to_string()),
@@ -185,7 +199,9 @@ fn main() -> anyhow::Result<()> {
             r.pair_cost.map_or(String::new(), |x| format!("{x:.4}")),
             r.unpaired,
             r.pnl.map_or(String::new(), |x| format!("{x:.4}")),
-            r.halted.clone().unwrap_or_default()
+            r.halted.clone().unwrap_or_default(),
+            r.rl_deferred_cum,
+            r.r8_violations_cum
         )?;
         println!(
             "{} 挂 {:4} 撤 {:4} 拒 {:3} 成交 {:4} 笔 Up {:7.2} Down {:7.2} 成本 {:7.2} 配对 {:7.2}(每对 {}) 没配上 {:6.2} 盈亏 {}",

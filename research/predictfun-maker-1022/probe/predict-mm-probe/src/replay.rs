@@ -112,6 +112,9 @@ pub struct RoundResult {
     pub unpaired: f64,
     pub pnl: Option<f64>,
     pub halted: Option<String>,
+    /// 收盘时策略的累计计数(跨轮累计,取差得到每轮):限速推迟挂单、R8 违规
+    pub rl_deferred_cum: u64,
+    pub r8_violations_cum: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +249,10 @@ impl Engine {
     }
 
     fn finish(mut self) -> Vec<RoundResult> {
+        if let Some(last) = self.cur_round {
+            self.results[last].rl_deferred_cum = self.strat.rl_deferred;
+            self.results[last].r8_violations_cum = self.strat.r8_violations;
+        }
         for (i, r) in self.results.iter_mut().enumerate() {
             let m = self.rounds[i].market_id;
             let fills = self.our_fills.remove(&m).unwrap_or_default();
@@ -306,6 +313,10 @@ impl Engine {
     }
 
     fn switch_round(&mut self) {
+        if let Some(prev) = self.cur_round {
+            self.results[prev].rl_deferred_cum = self.strat.rl_deferred;
+            self.results[prev].r8_violations_cum = self.strat.r8_violations;
+        }
         let k = self.cur_round.map_or(0, |k| k + 1);
         self.cur_round = Some(k);
         let (m, s, e) = (self.rounds[k].market_id, self.rounds[k].start_ms, self.rounds[k].end_ms);
